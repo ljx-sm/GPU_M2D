@@ -1,0 +1,3 @@
+[submodule "third_party/radiation-error-emulator"]
+	path = third_party/radiation-error-emulator
+	url = https://github.com/joannahuadu/radiation-error-emulator.git
