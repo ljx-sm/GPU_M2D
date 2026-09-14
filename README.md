@@ -9,6 +9,7 @@ strictly scoped foundation:
 
 ```text
 Tensor / Element / Bit <-> GPU Virtual Address -> CUDA XOR bit flip
+Allocation ID / Byte Offset / Bit <-> Active GPU Virtual Address
 ```
 
 G1 does **not** claim that a CUDA device pointer is a GPU physical address or
@@ -52,7 +53,10 @@ RESISC45 split can be reused without copying large assets:
 scripts/run_g1_5_validation.sh
 ```
 
-This registers the public TensorRT I/O bindings, injects one selected input
-Tensor bit, verifies the complete device buffer, runs clean/injected inference,
-and inventories TensorRT-owned allocations as `TENSORRT_INTERNAL_UNKNOWN`.
+This registers both the public TensorRT I/O bindings and TensorRT-owned device
+allocations in a lifetime-aware allocation registry, injects one selected input
+Tensor bit, verifies the complete device buffer, and runs clean/injected
+inference. Internal allocations remain semantically labeled
+`TENSORRT_INTERNAL_UNKNOWN`, but are still exactly addressable by allocation ID,
+byte offset, and bit while active.
 See [docs/G1_5_VALIDATION.md](docs/G1_5_VALIDATION.md).

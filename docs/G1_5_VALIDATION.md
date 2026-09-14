@@ -24,20 +24,39 @@ address, size, allocation phase, and active state are recorded, but their
 semantic label remains `TENSORRT_INTERNAL_UNKNOWN`. No unsupported layer or
 weight attribution is made.
 
+All observed device allocations now share one run-scoped `AllocationRegistry`.
+It provides the allocation-level invariant needed by the later physical-address
+stage:
+
+```text
+(device, allocation ID, byte offset, bit) <-> (device, active GPU VA, bit)
+```
+
+The registry requires nonzero bounded ranges and unique lifetime-stable IDs,
+rejects overlapping active ranges on the same GPU, qualifies reverse lookup by
+CUDA device, and excludes inactive allocations. A numerical VA may be reused
+only after the previous allocation is deactivated and receives a new allocation
+ID. Therefore semantic knowledge is optional for physical fault injection, but
+allocation ownership, bounds, device, and lifetime are not.
+
 ## Injection protocol
 
 For each GPU:
 
 1. Deserialize the clean engine and create its execution context.
-2. Allocate and register all three binding buffers in a new mapping snapshot.
-3. Run clean inference on evaluation sample 0.
-4. Restore the complete input buffer.
-5. Map `data` element 0, bit 0 to its process-visible GPU VA.
-6. XOR that bit with the CUDA injector.
-7. Copy back and compare the entire input allocation against the one-bit
+2. Register the four observed TensorRT allocations and all three binding buffers
+   in one lifetime-aware allocation registry.
+3. Validate first/last-byte allocation-to-VA and VA-to-allocation round trips
+   for every active allocation.
+4. Run clean inference on evaluation sample 0.
+5. Restore the complete input buffer.
+6. Map `data` element 0, bit 0 to its process-visible GPU VA.
+7. Reverse-check that VA against its active allocation ID and byte offset, then
+   XOR that bit with the CUDA injector.
+8. Copy back and compare the entire input allocation against the one-bit
    expected buffer.
-8. Reverse-map the injected GPU VA/bit to the original Tensor element/bit.
-9. Run injected inference and classify the top-1 result.
+9. Reverse-map the injected GPU VA/bit to the original Tensor element/bit.
+10. Run injected inference and classify the top-1 result.
 
 Runtime CSV artifacts are written under `artifacts/g1_5/` and intentionally
 excluded from Git because GPU VAs are allocation-specific.
@@ -88,8 +107,15 @@ sizes and phases were identical across the three GPUs:
 ```
 
 All four were active at injection time and remain classified as
-`TENSORRT_INTERNAL_UNKNOWN`. This inventory is not treated as a serialized
-engine offset map or a Tensor element map.
+`TENSORRT_INTERNAL_UNKNOWN`. Together with the three exact public bindings, the
+runtime registry contained seven active, non-overlapping allocations on each
+GPU. This inventory is not treated as a serialized engine offset map or a
+Tensor element map.
+
+The allocation registry unit test covers first/last-bit round trips, exact and
+unknown semantic labels, invalid offsets/bits, unregistered addresses,
+same-device overlap rejection, cross-device VA disambiguation, stale-address
+rejection after deallocation, and safe VA reuse under a new allocation ID.
 
 CUDA Compute Sanitizer `memcheck` reported zero errors for the complete G1.5
 runner on each of the three devices. The original G1 unit/integration tests

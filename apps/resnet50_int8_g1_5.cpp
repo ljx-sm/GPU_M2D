@@ -1,3 +1,4 @@
+#include "gpu_m2d/allocation_registry.hpp"
 #include "gpu_m2d/device_bit_injector.hpp"
 #include "gpu_m2d/tensor_mapping.hpp"
 
@@ -51,30 +52,26 @@ struct TrtDeleter {
     }
 };
 
-struct AllocationRecord {
-    std::size_t id{0};
+struct TrackedAllocation {
     std::uintptr_t gpu_va{0};
-    std::uint64_t size_bytes{0};
-    std::uint64_t alignment{0};
-    std::string allocation_phase;
+    std::string allocation_id;
     bool active{false};
 };
 
 class TrackingGpuAllocator final : public nvinfer1::IGpuAllocator {
 public:
+    TrackingGpuAllocator(gpu_m2d::AllocationRegistry& registry, int device_id)
+        : registry_(registry), device_id_(device_id) {}
+
     void set_phase(std::string phase) {
         std::lock_guard<std::mutex> lock(mutex_);
         phase_ = std::move(phase);
     }
 
-    std::vector<AllocationRecord> snapshot() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return records_;
-    }
-
     void* allocate(std::uint64_t size, std::uint64_t alignment,
                    nvinfer1::AllocatorFlags) noexcept override {
-        if (size == 0 || size > std::numeric_limits<std::size_t>::max()) {
+        if (size == 0 || size > std::numeric_limits<std::size_t>::max() ||
+            alignment > std::numeric_limits<std::size_t>::max()) {
             return nullptr;
         }
 
@@ -83,12 +80,35 @@ public:
             return nullptr;
         }
 
+        std::string allocation_id;
+        std::string phase;
         try {
             std::lock_guard<std::mutex> lock(mutex_);
-            records_.push_back(AllocationRecord{
-                next_id_++, reinterpret_cast<std::uintptr_t>(memory), size,
-                alignment, phase_, true});
+            allocation_id = "trt-internal-" + std::to_string(next_id_++);
+            phase = phase_;
         } catch (...) {
+            cudaFree(memory);
+            return nullptr;
+        }
+
+        try {
+            registry_.add_allocation(gpu_m2d::AllocationDescriptor{
+                allocation_id,
+                device_id_,
+                reinterpret_cast<std::uintptr_t>(memory),
+                static_cast<std::size_t>(size),
+                static_cast<std::size_t>(alignment),
+                "TensorRT IGpuAllocator",
+                "TENSORRT_INTERNAL_UNKNOWN",
+                phase,
+                "TensorRT allocate callback to matching deallocate callback",
+                true,
+            });
+            std::lock_guard<std::mutex> lock(mutex_);
+            records_.push_back(TrackedAllocation{
+                reinterpret_cast<std::uintptr_t>(memory), allocation_id, true});
+        } catch (...) {
+            static_cast<void>(registry_.deactivate_allocation(allocation_id));
             cudaFree(memory);
             return nullptr;
         }
@@ -103,63 +123,85 @@ public:
         if (memory == nullptr) {
             return true;
         }
-        if (cudaFree(memory) != cudaSuccess) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(memory);
+        auto record = std::find_if(
+            records_.rbegin(), records_.rend(),
+            [address](const TrackedAllocation& candidate) {
+                return candidate.gpu_va == address && candidate.active;
+            });
+        if (record == records_.rend() || cudaFree(memory) != cudaSuccess) {
             return false;
         }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(memory);
-            auto record = std::find_if(
-                records_.rbegin(), records_.rend(),
-                [address](const AllocationRecord& candidate) {
-                    return candidate.gpu_va == address && candidate.active;
-                });
-            if (record != records_.rend()) {
-                record->active = false;
-            }
-        }
+        record->active = false;
+        static_cast<void>(registry_.deactivate_allocation(record->allocation_id));
         return true;
     }
 
 private:
+    gpu_m2d::AllocationRegistry& registry_;
+    int device_id_{-1};
     mutable std::mutex mutex_;
-    std::vector<AllocationRecord> records_;
+    std::vector<TrackedAllocation> records_;
     std::string phase_{"runtime_setup"};
     std::size_t next_id_{0};
 };
 
 class DeviceBuffer {
 public:
-    DeviceBuffer() = default;
-
-    explicit DeviceBuffer(std::size_t size_bytes) : size_bytes_(size_bytes) {
+    DeviceBuffer(std::size_t size_bytes,
+                 gpu_m2d::AllocationRegistry& registry,
+                 std::string allocation_id,
+                 int device_id,
+                 std::string semantic_label)
+        : size_bytes_(size_bytes), registry_(&registry),
+          allocation_id_(std::move(allocation_id)) {
         check_cuda(cudaMalloc(&pointer_, size_bytes_), "cudaMalloc binding");
+        try {
+            registry_->add_allocation(gpu_m2d::AllocationDescriptor{
+                allocation_id_,
+                device_id,
+                reinterpret_cast<std::uintptr_t>(pointer_),
+                size_bytes_,
+                0,
+                "G1.5 runner",
+                std::move(semantic_label),
+                "allocate_bindings",
+                "runner cudaMalloc to runner cudaFree",
+                true,
+            });
+        } catch (...) {
+            cudaFree(pointer_);
+            pointer_ = nullptr;
+            throw;
+        }
     }
 
     ~DeviceBuffer() {
-        if (pointer_ != nullptr) {
-            cudaFree(pointer_);
-        }
+        release();
     }
 
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
     DeviceBuffer(DeviceBuffer&& other) noexcept
-        : pointer_(other.pointer_), size_bytes_(other.size_bytes_) {
+        : pointer_(other.pointer_), size_bytes_(other.size_bytes_),
+          registry_(other.registry_), allocation_id_(std::move(other.allocation_id_)) {
         other.pointer_ = nullptr;
         other.size_bytes_ = 0;
+        other.registry_ = nullptr;
     }
 
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
         if (this != &other) {
-            if (pointer_ != nullptr) {
-                cudaFree(pointer_);
-            }
+            release();
             pointer_ = other.pointer_;
             size_bytes_ = other.size_bytes_;
+            registry_ = other.registry_;
+            allocation_id_ = std::move(other.allocation_id_);
             other.pointer_ = nullptr;
             other.size_bytes_ = 0;
+            other.registry_ = nullptr;
         }
         return *this;
     }
@@ -168,6 +210,16 @@ public:
     std::size_t size_bytes() const noexcept { return size_bytes_; }
 
 private:
+    void release() noexcept {
+        if (pointer_ != nullptr && cudaFree(pointer_) == cudaSuccess &&
+            registry_ != nullptr) {
+            static_cast<void>(registry_->deactivate_allocation(allocation_id_));
+        }
+        pointer_ = nullptr;
+        size_bytes_ = 0;
+        registry_ = nullptr;
+    }
+
     static void check_cuda(cudaError_t status, const char* operation) {
         if (status != cudaSuccess) {
             throw std::runtime_error(std::string(operation) + " failed: " +
@@ -177,6 +229,8 @@ private:
 
     void* pointer_{nullptr};
     std::size_t size_bytes_{0};
+    gpu_m2d::AllocationRegistry* registry_{nullptr};
+    std::string allocation_id_;
 };
 
 class CudaStream {
@@ -511,20 +565,47 @@ void write_mapping_snapshot(const std::string& path,
     }
 }
 
-void write_internal_allocations(const std::string& path,
-                                const std::vector<AllocationRecord>& records,
-                                int device) {
+void validate_registry_round_trips(
+    const gpu_m2d::AllocationRegistry& registry) {
+    for (const auto& allocation : registry.allocations()) {
+        if (!allocation.active) {
+            continue;
+        }
+        const std::array<std::size_t, 2> offsets{
+            0, allocation.size_bytes - 1};
+        const std::array<std::uint8_t, 2> bits{0, 7};
+        for (std::size_t index = 0; index < offsets.size(); ++index) {
+            const auto forward = registry.allocation_bit_to_gpu_va(
+                allocation.allocation_id, offsets[index], bits[index]);
+            const auto reverse = registry.gpu_va_to_allocation_bit(
+                allocation.device_id, forward.gpu_va, forward.bit_in_byte);
+            if (reverse.allocation_id != allocation.allocation_id ||
+                reverse.byte_offset != offsets[index] ||
+                reverse.bit_in_byte != bits[index]) {
+                throw std::runtime_error(
+                    "allocation registry forward/reverse mismatch");
+            }
+        }
+    }
+}
+
+void write_allocation_registry(
+    const std::string& path,
+    const gpu_m2d::AllocationRegistry& registry) {
     std::ofstream output(path);
     if (!output) {
-        throw std::runtime_error("cannot write TensorRT allocation inventory: " + path);
+        throw std::runtime_error("cannot write allocation registry: " + path);
     }
-    output << "allocation_id,device,allocation_phase,gpu_va,size_bytes,alignment,"
-              "active_at_injection,semantic_label\n";
-    for (const auto& record : records) {
-        output << "trt-internal-" << record.id << ',' << device << ','
-               << record.allocation_phase << ',' << hex_address(record.gpu_va) << ','
-               << record.size_bytes << ',' << record.alignment << ','
-               << (record.active ? 1 : 0) << ",TENSORRT_INTERNAL_UNKNOWN\n";
+    output << "run_id,allocation_id,device,gpu_va,size_bytes,alignment_bytes,owner,"
+              "allocation_phase,lifetime,active_at_injection,semantic_label\n";
+    for (const auto& allocation : registry.allocations()) {
+        output << registry.run_id() << ',' << allocation.allocation_id << ','
+               << allocation.device_id << ','
+               << hex_address(allocation.base_gpu_va) << ','
+               << allocation.size_bytes << ',' << allocation.alignment_bytes << ','
+               << allocation.owner << ',' << allocation.allocation_phase << ','
+               << allocation.lifetime << ',' << (allocation.active ? 1 : 0) << ','
+               << allocation.semantic_label << '\n';
     }
 }
 
@@ -586,9 +667,15 @@ int main(int argc, char** argv) {
         const Sample sample = read_sample(options.sample_csv, options.sample_index);
         const std::vector<float> input = preprocess(sample.path);
         const std::vector<char> engine_bytes = read_binary_file(options.engine_path);
+        const std::string run_id =
+            "g1_5-gpu" + std::to_string(options.device) + "-sample" +
+            std::to_string(options.sample_index) + "-element" +
+            std::to_string(options.element_index) + "-bit" +
+            std::to_string(options.element_bit_index);
 
         TrtLogger logger;
-        TrackingGpuAllocator allocator;
+        gpu_m2d::AllocationRegistry allocation_registry(run_id);
+        TrackingGpuAllocator allocator(allocation_registry, options.device);
         std::unique_ptr<nvinfer1::IRuntime, TrtDeleter<nvinfer1::IRuntime>> runtime(
             nvinfer1::createInferRuntime(logger));
         if (!runtime) {
@@ -627,13 +714,14 @@ int main(int argc, char** argv) {
         std::vector<DeviceBuffer> buffers;
         buffers.reserve(binding_info.size());
         std::vector<void*> binding_pointers(binding_info.size(), nullptr);
-        gpu_m2d::MappingSnapshot mapping(
-            "g1_5-gpu" + std::to_string(options.device) + "-sample" +
-            std::to_string(options.sample_index) + "-element" +
-            std::to_string(options.element_index) + "-bit" +
-            std::to_string(options.element_bit_index));
+        gpu_m2d::MappingSnapshot mapping(run_id);
         for (const BindingInfo& binding : binding_info) {
-            buffers.emplace_back(binding.size_bytes);
+            const std::string allocation_id =
+                "trt-binding-" + binding.name + "-gpu-" +
+                std::to_string(options.device);
+            buffers.emplace_back(binding.size_bytes, allocation_registry,
+                                 allocation_id, options.device,
+                                 "TENSOR:" + binding.name);
             binding_pointers[static_cast<std::size_t>(binding.index)] =
                 buffers.back().get();
             const auto pointer = gpu_m2d::inspect_device_pointer(
@@ -643,6 +731,7 @@ int main(int argc, char** argv) {
             }
             mapping.add_tensor(make_descriptor(binding, pointer, options.device));
         }
+        validate_registry_round_trips(allocation_registry);
 
         write_mapping_snapshot(options.output_prefix + "_mapping.csv", mapping,
                                options.device);
@@ -687,15 +776,33 @@ int main(int argc, char** argv) {
             reversed.element_bit_index != options.element_bit_index) {
             throw std::runtime_error("real TensorRT input reverse mapping mismatch");
         }
+        const auto allocation_reversed =
+            allocation_registry.gpu_va_to_allocation_bit(
+                options.device, flip.gpu_va, flip.bit_in_byte);
+        const std::string input_allocation_id =
+            "trt-binding-" + input_binding.name + "-gpu-" +
+            std::to_string(options.device);
+        if (allocation_reversed.allocation_id != input_allocation_id ||
+            allocation_reversed.byte_offset != mapped.byte_offset ||
+            allocation_reversed.bit_in_byte != mapped.bit_in_byte) {
+            throw std::runtime_error(
+                "real TensorRT input allocation reverse mapping mismatch");
+        }
+        const auto allocation_forward =
+            allocation_registry.allocation_bit_to_gpu_va(
+                input_allocation_id, mapped.byte_offset, mapped.bit_in_byte);
+        if (allocation_forward.gpu_va != flip.gpu_va) {
+            throw std::runtime_error(
+                "real TensorRT input allocation forward mapping mismatch");
+        }
 
         const Prediction injected = run_inference(
             *context, binding_pointers, probability_binding.index,
             class_binding.index, stream);
-        const std::string run_id = mapping.run_id();
         write_result(options.output_prefix + "_result.csv", options, sample, run_id,
                      mapped, flip, clean, injected);
-        write_internal_allocations(options.output_prefix + "_internal_allocations.csv",
-                                   allocator.snapshot(), options.device);
+        write_allocation_registry(options.output_prefix + "_allocations.csv",
+                                  allocation_registry);
 
         const bool top1_changed = clean.class_index != injected.class_index;
         const bool numeric_changed = top1_changed ||
