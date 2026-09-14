@@ -1,0 +1,14 @@
+/build/
+/build-*/
+/artifacts/*
+!/artifacts/.gitignore
+
+*.log
+*.engine
+*.onnx
+*.wts
+
+.cache/
+.venv/
+__pycache__/
+*.pyc
