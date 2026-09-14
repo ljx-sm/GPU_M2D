@@ -16,6 +16,8 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 option(GPU_M2D_BUILD_TESTS "Build GPU_M2D validation tests" ON)
+option(GPU_M2D_BUILD_TENSORRT_RUNNER
+       "Build the optional ResNet-50 TensorRT G1.5 runner" OFF)
 
 add_library(gpu_m2d_semantic STATIC
     src/semantic/tensor_mapping.cpp
@@ -49,4 +51,42 @@ if(GPU_M2D_BUILD_TESTS)
         CUDA::cudart
     )
     add_test(NAME cuda_injector_device0 COMMAND test_cuda_injector --device 0)
+endif()
+
+if(GPU_M2D_BUILD_TENSORRT_RUNNER)
+    set(GPU_M2D_TENSORRT_ROOT "" CACHE PATH
+        "TensorRT root containing include/NvInfer.h")
+    set(GPU_M2D_TENSORRT_LIBRARY_DIR "" CACHE PATH
+        "Directory containing libnvinfer")
+
+    find_path(GPU_M2D_TENSORRT_INCLUDE_DIR
+        NvInfer.h
+        HINTS "${GPU_M2D_TENSORRT_ROOT}/include"
+        REQUIRED
+    )
+    find_library(GPU_M2D_TENSORRT_LIBRARY
+        nvinfer
+        HINTS "${GPU_M2D_TENSORRT_LIBRARY_DIR}"
+        REQUIRED
+    )
+    find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
+
+    add_executable(gpu_m2d_resnet50_int8_g1_5
+        apps/resnet50_int8_g1_5.cpp
+    )
+    target_include_directories(gpu_m2d_resnet50_int8_g1_5 PRIVATE include)
+    target_include_directories(gpu_m2d_resnet50_int8_g1_5 SYSTEM PRIVATE
+        "${GPU_M2D_TENSORRT_INCLUDE_DIR}"
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(gpu_m2d_resnet50_int8_g1_5 PRIVATE
+        gpu_m2d_semantic
+        gpu_m2d_injector
+        CUDA::cudart
+        "${GPU_M2D_TENSORRT_LIBRARY}"
+        ${OpenCV_LIBS}
+    )
+    target_compile_options(gpu_m2d_resnet50_int8_g1_5 PRIVATE
+        -Wall -Wextra -Wpedantic -Wno-deprecated-declarations
+    )
 endif()

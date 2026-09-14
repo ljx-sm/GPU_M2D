@@ -56,9 +56,11 @@ void run_tests() {
     snapshot.add_tensor(int8_tensor);
     snapshot.add_tensor(make_tensor("layer2.weight", DType::kFloat32, {2},
                                     0x200000, 8));
+    snapshot.add_tensor(make_tensor("output.index", DType::kInt32, {1},
+                                    0x300000, 4));
 
     require(snapshot.run_id() == "g1-unit-run", "run_id was not preserved");
-    require(snapshot.tensors().size() == 2, "tensor registry size mismatch");
+    require(snapshot.tensors().size() == 3, "tensor registry size mismatch");
     require(gpu_m2d::tensor_element_count(int8_tensor) == 4,
             "INT8 element count mismatch");
     require(gpu_m2d::tensor_required_bytes(int8_tensor) == 4,
@@ -95,6 +97,16 @@ void run_tests() {
     require(fp32_reverse.element_bit_index == 31,
             "FP32 reverse element bit mismatch");
 
+    const auto int32_forward =
+        snapshot.tensor_bit_to_gpu_va("output.index", 0, 30);
+    require(int32_forward.gpu_va == 0x300003, "INT32 forward GPU VA mismatch");
+    require(int32_forward.bit_in_byte == 6, "INT32 byte bit mismatch");
+    const auto int32_reverse = snapshot.gpu_va_to_tensor_bit(
+        int32_forward.gpu_va, int32_forward.bit_in_byte);
+    require(int32_reverse.element_index == 0 &&
+                int32_reverse.element_bit_index == 30,
+            "INT32 reverse mapping mismatch");
+
     require_throws<std::out_of_range>(
         [&] { snapshot.tensor_bit_to_gpu_va("missing", 0, 0); },
         "unknown tensor was accepted");
@@ -105,7 +117,7 @@ void run_tests() {
         [&] { snapshot.tensor_bit_to_gpu_va("layer1.weight", 0, 8); },
         "out-of-range INT8 bit was accepted");
     require_throws<std::out_of_range>(
-        [&] { snapshot.gpu_va_to_tensor_bit(0x300000, 0); },
+        [&] { snapshot.gpu_va_to_tensor_bit(0x900000, 0); },
         "unknown GPU VA was accepted");
     require_throws<std::out_of_range>(
         [&] { snapshot.gpu_va_to_tensor_bit(0x100000, 8); },

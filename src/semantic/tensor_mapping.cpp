@@ -48,6 +48,8 @@ std::string_view dtype_name(DType dtype) {
             return "int8";
         case DType::kFloat32:
             return "float32";
+        case DType::kInt32:
+            return "int32";
     }
     throw std::invalid_argument("unsupported dtype");
 }
@@ -58,6 +60,7 @@ std::size_t dtype_size_bytes(DType dtype) {
         case DType::kInt8:
             return 1;
         case DType::kFloat32:
+        case DType::kInt32:
             return 4;
     }
     throw std::invalid_argument("unsupported dtype");

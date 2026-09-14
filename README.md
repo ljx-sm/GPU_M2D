@@ -42,3 +42,17 @@ git clone --recurse-submodules https://github.com/ljx-sm/GPU_M2D.git
 See [GPU_SIDE_REMU_RESEARCH_PLAN.md](GPU_SIDE_REMU_RESEARCH_PLAN.md) for the
 full research plan and [docs/G1_VALIDATION.md](docs/G1_VALIDATION.md) for the
 current milestone status.
+
+## Run the optional ResNet-50 INT8 G1.5 integration
+
+On the reference host, the existing TensorRT/OpenCV environment, engine, and
+RESISC45 split can be reused without copying large assets:
+
+```bash
+scripts/run_g1_5_validation.sh
+```
+
+This registers the public TensorRT I/O bindings, injects one selected input
+Tensor bit, verifies the complete device buffer, runs clean/injected inference,
+and inventories TensorRT-owned allocations as `TENSORRT_INTERNAL_UNKNOWN`.
+See [docs/G1_5_VALIDATION.md](docs/G1_5_VALIDATION.md).

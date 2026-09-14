@@ -13,6 +13,7 @@ enum class DType {
     kUInt8,
     kInt8,
     kFloat32,
+    kInt32,
 };
 
 std::string_view dtype_name(DType dtype);
