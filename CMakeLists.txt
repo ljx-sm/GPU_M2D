@@ -19,6 +19,17 @@ option(GPU_M2D_BUILD_TESTS "Build GPU_M2D validation tests" ON)
 option(GPU_M2D_BUILD_TENSORRT_RUNNER
        "Build the optional ResNet-50 TensorRT G1.5 runner" OFF)
 
+add_executable(gpu_m2d_g2_capability_probe
+    apps/g2_capability_probe.cpp
+)
+target_link_libraries(gpu_m2d_g2_capability_probe PRIVATE
+    CUDA::cuda_driver
+    CUDA::cudart
+)
+target_compile_options(gpu_m2d_g2_capability_probe PRIVATE
+    -Wall -Wextra -Wpedantic
+)
+
 add_library(gpu_m2d_semantic STATIC
     src/semantic/allocation_registry.cpp
     src/semantic/tensor_mapping.cpp

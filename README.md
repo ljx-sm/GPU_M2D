@@ -44,6 +44,16 @@ See [GPU_SIDE_REMU_RESEARCH_PLAN.md](GPU_SIDE_REMU_RESEARCH_PLAN.md) for the
 full research plan and [docs/G1_VALIDATION.md](docs/G1_VALIDATION.md) for the
 current milestone status.
 
+## Audit the G2 public address interfaces
+
+```bash
+scripts/run_g2_capability_probe.sh
+```
+
+This records CUDA VMM, GPUDirect RDMA, DMA-BUF, allocation range, and buffer-ID
+capabilities without treating an opaque handle or CUDA pointer as a physical
+address. See [docs/G2_PLATFORM_AUDIT.md](docs/G2_PLATFORM_AUDIT.md).
+
 ## Run the optional ResNet-50 INT8 G1.5 integration
 
 On the reference host, the existing TensorRT/OpenCV environment, engine, and
