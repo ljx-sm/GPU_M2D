@@ -74,8 +74,11 @@ Root is needed only to attach the read-only probes; the CUDA child runs as
 the invoking user and no other GPU process is touched. The tensorrt mode
 maps every active G1.5 allocation page-by-page and regenerates
 `artifacts/g2/gpu_va_pa_map.csv` after all GPUs pass. Run artifacts are
-written under `artifacts/g2/observer/` and excluded from Git. See
-[tools/g2_observer/README.md](tools/g2_observer/README.md).
+written under `artifacts/g2/observer/` and excluded from Git. G2 passed on
+all three GPUs on 2026-09-15 (scratch, VMM alias, and TensorRT workload
+map); see [docs/G2_VALIDATION.md](docs/G2_VALIDATION.md) and
+[tools/g2_observer/README.md](tools/g2_observer/README.md). Lookups and
+their rejection cases: `tools/g2_observer/va_pa_lookup.py --self-test`.
 
 ## Run the optional ResNet-50 INT8 G1.5 integration
 

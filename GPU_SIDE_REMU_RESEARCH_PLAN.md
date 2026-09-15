@@ -530,6 +530,10 @@ GPU VA
 
 ### G2：GPU Virtual-to-Physical Mapping
 
+Status（2026-09-15）：**PASS**（三卡全部通过 scratch device/VMM、VMM alias
+double-mapping、TensorRT 全工作负载三层验证；`gpu_va_pa_map.csv` 已生成）。
+详见 `docs/G2_VALIDATION.md`。
+
 目标：
 
 ```text

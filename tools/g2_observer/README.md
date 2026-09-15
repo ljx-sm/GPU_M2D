@@ -64,6 +64,7 @@ method achieved, with independent validators:
 | `run_g2_alias_probe.py` | Alias orchestrator: both VA ranges must decode to the same PA pages; reverse mapping must be one-to-many |
 | `aggregate_va_pa_map.py` | Concatenates the newest passing per-GPU TensorRT maps into `artifacts/g2/gpu_va_pa_map.csv` |
 | `replay_trt_run.py` | Replays the full TensorRT-probe validation offline against a captured run's `events.csv`/`harness.log`/registry — verify orchestrator changes without a GPU re-run |
+| `va_pa_lookup.py` | Forward `(GPU, VA) → PA page` / reverse `(GPU, PA page) → VA pages` lookup over the canonical map, with a self-test of accept and rejection cases (wired into `make check`) |
 
 The G1.5 runner (`apps/resnet50_int8_g1_5.cpp`) gained an optional observer
 mode (`--observer-gate PATH --hold-seconds N`): it blocks before creating any
@@ -148,4 +149,7 @@ PAs are allocation-specific.
 - Known-good on GPU 0 under driver 580.95.05. On 2026-09-15 the scratch
   probe passed on all three GPUs for both the device and VMM allocation
   APIs (4/4 PTEs, 5/5 local-VIDEO samples, zero lost events, XOR
-  closeout), so GPU 1/2 are validated for this method as well.
+  closeout), so GPU 1/2 are validated for this method as well. On the
+  same date the alias probe (3/3) and the full TensorRT workload map
+  (3/3, 7/7 allocations with byte-exact local-VIDEO coverage per GPU)
+  also passed; see [docs/G2_VALIDATION.md](../../docs/G2_VALIDATION.md).

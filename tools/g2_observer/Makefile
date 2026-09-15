@@ -20,8 +20,9 @@ g2_alias_harness: g2_alias_harness.cu
 check: all
 	/usr/bin/python3 -m py_compile g2_observer.py pte_decoder.py \
 		run_g2_scratch_probe.py run_g2_tensorrt_probe.py run_g2_alias_probe.py \
-		replay_trt_run.py
+		replay_trt_run.py va_pa_lookup.py
 	/usr/bin/python3 g2_observer.py --self-check
+	/usr/bin/python3 va_pa_lookup.py --self-test
 
 clean:
 	rm -f g2_scratch_harness g2_alias_harness __pycache__/*.pyc
