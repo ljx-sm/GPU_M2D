@@ -136,12 +136,13 @@ def parse_harness_output(text: str) -> tuple[dict[str, str], list[str], dict[int
     samples: dict[int, dict[str, str]] = {}
     xor_closeout: dict[str, str] = {}
     for line in text.splitlines():
-        if line.startswith("GPU_M2D_EVENT,event=ALLOCATED,"):
-            for item in line.split(","):
-                key, _, value = item.partition("=")
-                allocation[key] = value
-        elif line.startswith("GPU_M2D_EVENT,event=") and ",wall_time_ns=" in line:
-            lifecycle.append(line.split("event=", 1)[1].split(",", 1)[0])
+        if line.startswith("GPU_M2D_EVENT,event="):
+            name = line.split("event=", 1)[1].split(",", 1)[0]
+            lifecycle.append(name)
+            if name == "ALLOCATED":
+                for item in line.split(","):
+                    key, _, value = item.partition("=")
+                    allocation[key] = value
         elif line.startswith("GPU_M2D_SAMPLE,"):
             record: dict[str, str] = {}
             for item in line.split(",")[1:]:
