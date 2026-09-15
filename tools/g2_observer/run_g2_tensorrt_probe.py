@@ -192,6 +192,15 @@ def pte_signature(row: dict[str, object]) -> tuple[object, ...]:
             row["query_size"])
 
 
+def normalize_gpu_uuid(value: str) -> str:
+    """The kernel PTE payload carries the bare RM UUID while nvidia-smi
+    prefixes the same value with ``GPU-``; compare the canonical form."""
+    value = value.strip()
+    if value.upper().startswith("GPU-"):
+        value = value[4:]
+    return value.lower()
+
+
 def build_allocation_ledger(rows: list[dict[str, object]],
                             allocation: dict[str, str],
                             allocated_event: dict[str, str],
@@ -515,7 +524,7 @@ def main() -> int:
                            if row["event_type"] == "PTE_HEADER" and row["gpu_uuid"]})
     if len(kernel_uuids) > 1:
         failures.append(f"multiple kernel GPU UUIDs observed: {kernel_uuids}")
-    elif kernel_uuids and kernel_uuids[0] != device_uuid:
+    elif kernel_uuids and normalize_gpu_uuid(kernel_uuids[0]) != normalize_gpu_uuid(device_uuid):
         failures.append(f"kernel GPU UUID {kernel_uuids[0]} != device UUID {device_uuid}")
     if len({str(row["address_space_id"]) for row in observer.rows
             if row["event_type"] in ("MAP_RETURN", "PTE_HEADER")}) > 1:

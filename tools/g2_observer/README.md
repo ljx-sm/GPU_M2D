@@ -63,6 +63,7 @@ method achieved, with independent validators:
 | `g2_alias_harness.cu` | Gated VMM alias harness: one physical allocation mapped at two VAs |
 | `run_g2_alias_probe.py` | Alias orchestrator: both VA ranges must decode to the same PA pages; reverse mapping must be one-to-many |
 | `aggregate_va_pa_map.py` | Concatenates the newest passing per-GPU TensorRT maps into `artifacts/g2/gpu_va_pa_map.csv` |
+| `replay_trt_run.py` | Replays the full TensorRT-probe validation offline against a captured run's `events.csv`/`harness.log`/registry — verify orchestrator changes without a GPU re-run |
 
 The G1.5 runner (`apps/resnet50_int8_g1_5.cpp`) gained an optional observer
 mode (`--observer-gate PATH --hold-seconds N`): it blocks before creating any
