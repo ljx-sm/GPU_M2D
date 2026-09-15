@@ -97,5 +97,7 @@ PAs are allocation-specific.
   are observed. Managed-memory migrations are out of scope for G2.
 - The PA is claimed only together with its GPU UUID, aperture, page
   size, PTE flags, and mapping epoch; it is never a bare number.
-- Known-good on GPU 0 under driver 580.95.05; GPU 1/2 validation is part
-  of the G2 acceptance run in this repository.
+- Known-good on GPU 0 under driver 580.95.05. On 2026-09-15 the scratch
+  probe passed on all three GPUs for both the device and VMM allocation
+  APIs (4/4 PTEs, 5/5 local-VIDEO samples, zero lost events, XOR
+  closeout), so GPU 1/2 are validated for this method as well.
