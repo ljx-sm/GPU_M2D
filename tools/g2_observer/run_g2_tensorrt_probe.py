@@ -322,6 +322,9 @@ def main() -> int:
 
     run_dir = args.output_root / f"run_trt_gpu{args.device}_{time.time_ns()}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    # The runner child is dropped to the invoking user and writes its
+    # output-prefix CSVs directly into this directory.
+    os.chown(run_dir, uid, gid)
     event_output = run_dir / "events.csv"
     map_output = run_dir / "gpu_va_pa_map.csv"
     summary_output = run_dir / "summary.json"
