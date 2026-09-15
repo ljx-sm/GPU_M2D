@@ -1,0 +1,107 @@
+{
+  "architecture": "x86_64",
+  "driver_version": "580.95.05",
+  "kernel_release": "6.8.0-136-generic",
+  "nvidia_module_path": "/lib/modules/6.8.0-136-generic/updates/dkms/nvidia.ko",
+  "nvidia_module_sha256": "405e427de7f54a924544f6c2ed3f27cec7a4a276aada650b95af70c5f1f000c3",
+  "nvidia_uvm_module_path": "/lib/modules/6.8.0-136-generic/updates/dkms/nvidia-uvm.ko",
+  "nvidia_uvm_module_sha256": "442e53a93b5755e5b396b89f40e4d1622d3ebc5744f86dbc7f786ad956f7e4e9",
+  "open_kernel_source_commit": "2b436058a616676ec888ef3814d1db6b2220f2eb",
+  "open_kernel_source_tag": "580.95.05",
+  "provenance": {
+    "derived_from": "/data1/luojx/REMU/gpu_va_pa_mapping/02_ebpf/candidate_c_payload_contract.json",
+    "upstream_schema": "remu.gpu-va-pa.candidate-c-payload-contract.v1",
+    "note": "PTE format, probe symbols, struct layouts, and module hashes are copied verbatim from the REMU contract frozen on 2026-09-08. Any driver or kernel change invalidates this contract and requires re-derivation against the exact installed module SHA-256 and source tag."
+  },
+  "probe_symbols": [
+    {
+      "entry_fn": "trace_map_entry",
+      "module": "nvidia_uvm",
+      "name": "uvm_api_map_external_allocation",
+      "return_fn": "trace_map_return"
+    },
+    {
+      "entry_fn": "trace_pte_entry",
+      "module": "nvidia",
+      "name": "nvUvmInterfaceGetExternalAllocPtes",
+      "return_fn": "trace_pte_return"
+    },
+    {
+      "entry_fn": "trace_free_entry",
+      "module": "nvidia_uvm",
+      "name": "uvm_api_free",
+      "return_fn": "trace_free_return"
+    }
+  ],
+  "pte_format": {
+    "address_shift": 12,
+    "aperture_labels": {
+      "0": "VIDEO",
+      "1": "PEER",
+      "2": "SYS_COHERENT",
+      "3": "SYS_NONCOHERENT"
+    },
+    "aperture_lsb": 1,
+    "aperture_width": 2,
+    "format": "NVIDIA_GMMU_VERSION_2_AD102_GA10X_INHERITED",
+    "kind_lsb": 56,
+    "kind_width": 8,
+    "pte_payload_bits": 64,
+    "supported_entry_sizes_bytes": [8, 16],
+    "sixteen_byte_entry_high_word": "MUST_BE_ZERO_FOR_LOCAL_PA_CLASSIFICATION",
+    "system_address_lsb": 8,
+    "system_address_width": 46,
+    "valid_lsb": 0,
+    "video_address_lsb": 8,
+    "video_address_width": 25
+  },
+  "source_hashes": {
+    "/usr/src/nvidia-580.95.05/nvidia-uvm/uvm_ioctl.h": "937a3fe1c0b2f4d8cfc18443d41ad10ee85c4445f954cc5c67b460ded2dd4916",
+    "/usr/src/nvidia-580.95.05/nvidia-uvm/uvm_map_external.c": "63532607fb2273ec2e28e344c38049635cbf274caec03f121b8ae3507d9eab92",
+    "/usr/src/nvidia-580.95.05/nvidia-uvm/uvm_pte_batch.c": "30589fc78423a572bc03ab1dd51d1c2c807403b665bc6c2bafcb102cc7eea8c0",
+    "/usr/src/nvidia-580.95.05/nvidia-uvm/uvm_va_block.c": "a9d219c0909246e680e33f4201823717a6383972adf92a79df28e43782ad66f5",
+    "/usr/src/nvidia-580.95.05/nvidia-uvm/uvm_va_range.c": "d4f3a1c2f266aa1d4d48f54312f59cfd51e7f33f8b2a941eb8360e2e5acba5e4",
+    "/data1/luojx/REMU/GPU_GDDR_addressing_reference/nvidia-open-gpu-kernel-modules-580.95.05/kernel-open/common/inc/nv_uvm_types.h": "96d35419aa7d3795d130b39d9d8aab975f04ef22ac1924e71fd59372bf1ca98e",
+    "/data1/luojx/REMU/GPU_GDDR_addressing_reference/nvidia-open-gpu-kernel-modules-580.95.05/src/common/inc/swref/published/pascal/gp100/dev_mmu.h": "c51856ed94e967236abd5c7fe0baecdcd3cd4ff096498d7df54d6fcb716e2808",
+    "/data1/luojx/REMU/GPU_GDDR_addressing_reference/nvidia-open-gpu-kernel-modules-580.95.05/src/nvidia/generated/g_kern_gmmu_nvoc.c": "69f99676e8c054ec669959936dce078ffdd839c1afcbf517231c364db3cf5312",
+    "/data1/luojx/REMU/GPU_GDDR_addressing_reference/nvidia-open-gpu-kernel-modules-580.95.05/src/nvidia/src/kernel/gpu/mmu/arch/ampere/kern_gmmu_fmt_ga10x.c": "6a7d8a171fae00993dc19a210ddd9ba439e9db4fc8d92f3d50d7cdf6eff219de",
+    "/data1/luojx/REMU/GPU_GDDR_addressing_reference/nvidia-open-gpu-kernel-modules-580.95.05/src/nvidia/src/kernel/gpu/mmu/arch/maxwell/kern_gmmu_fmt_gm10x.c": "159f9013242451151f22c76cd890ebed781406da562d2e0ab65fa53f6b6c7226",
+    "/data1/luojx/REMU/GPU_GDDR_addressing_reference/nvidia-open-gpu-kernel-modules-580.95.05/src/nvidia/src/kernel/gpu/mmu/arch/pascal/kern_gmmu_fmt_gp10x.c": "bf5ca4b2b7ccaed15add468ab14c30a79cd0592c43849fa55bccead7ca8d24f3"
+  },
+  "struct_layout": {
+    "UVM_FREE_PARAMS": {
+      "base": 0,
+      "length": 8,
+      "rmStatus": 16,
+      "sizeof": 24
+    },
+    "UVM_MAP_EXTERNAL_ALLOCATION_PARAMS": {
+      "base": 0,
+      "first_gpu_caching_type": 44,
+      "first_gpu_compression_type": 56,
+      "first_gpu_element_bits": 52,
+      "first_gpu_format_type": 48,
+      "first_gpu_mapping_type": 40,
+      "first_gpu_uuid": 24,
+      "length": 8,
+      "offset": 16
+    },
+    "UvmGpuExternalMappingInfo": {
+      "bNeedL2InvalidateAtUnmap": 68,
+      "cachingType": 0,
+      "compressionType": 16,
+      "elementBits": 12,
+      "formatType": 8,
+      "mappingPageSize": 32,
+      "mappingType": 4,
+      "numRemainingPtes": 56,
+      "numWrittenPtes": 48,
+      "pteBuffer": 40,
+      "pteBufferSize": 24,
+      "pteSize": 64,
+      "sizeof": 72
+    }
+  },
+  "status": "OFFLINE_SOURCE_SYMBOL_LAYOUT_AND_PTE_FORMAT_CONTRACT",
+  "schema_version": "gpu-m2d.g2-observer.pte-contract.v1"
+}

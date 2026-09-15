@@ -54,6 +54,22 @@ This records CUDA VMM, GPUDirect RDMA, DMA-BUF, allocation range, and buffer-ID
 capabilities without treating an opaque handle or CUDA pointer as a physical
 address. See [docs/G2_PLATFORM_AUDIT.md](docs/G2_PLATFORM_AUDIT.md).
 
+## Map GPU VA to local framebuffer PA with the G2 observer
+
+The G2 primary route is a read-only eBPF observer over the unmodified NVIDIA
+modules; it records the PTE payload RM hands to UVM at CUDA allocation map
+time and decodes it under a version-pinned AD102 GMMU v2 contract:
+
+```bash
+make -C tools/g2_observer all check
+sudo scripts/run_g2_observer_probe.sh --api device   # or --api vmm
+```
+
+Root is needed only to attach the read-only probes; the CUDA child runs as
+the invoking user and no other GPU process is touched. Run artifacts are
+written under `artifacts/g2/observer/` and excluded from Git. See
+[tools/g2_observer/README.md](tools/g2_observer/README.md).
+
 ## Run the optional ResNet-50 INT8 G1.5 integration
 
 On the reference host, the existing TensorRT/OpenCV environment, engine, and

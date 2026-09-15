@@ -56,6 +56,19 @@ CUDA VMM will be retained for controlled alias validation: two VAs mapped to
 one opaque physical allocation must translate to the same framebuffer page.
 The opaque handle itself is not a numeric PA.
 
-The primary G2 implementation must instead use a read-only Ada GMMU page-table
-walker. That component will be isolated from the inference runner and will
-return an aperture-qualified framebuffer address, page size, and PTE metadata.
+Original decision (2026-09-14): build a read-only Ada GMMU page-table walker,
+with the `gpu-tlb` dumper/extractor as the dump-based vehicle. That route
+requires patching and reloading `nvidia_uvm` and full/partial VRAM dumps.
+
+Revised decision (2026-09-15): the primary G2 implementation is the read-only
+eBPF PTE observer in `tools/g2_observer/`. It kprobes
+`uvm_api_map_external_allocation`, `nvUvmInterfaceGetExternalAllocPtes`, and
+`uvm_api_free` on the already-loaded, unmodified modules, records the
+complete PTE payload RM hands to UVM (definition-level GMMU ground truth),
+and decodes it under the frozen AD102 GMMU v2 contract. The capability
+results above remain the recorded evidence that no public CUDA interface
+provides a PA. A GMMU page-table dump/walker is retained only as the
+independent cross-check method. The observer is a port of the validated
+REMU `gpu_va_pa_mapping` work, which achieved full local-VIDEO PTE coverage
+for cudaMalloc, CUDA VMM, and 7/7 TensorRT runtime allocations on GPU 0
+under the same driver and kernel.
