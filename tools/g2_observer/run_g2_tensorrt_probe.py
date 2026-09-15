@@ -208,15 +208,20 @@ def build_allocation_ledger(rows: list[dict[str, object]],
     size = int(allocation["size_bytes"])
     end = base + size
 
+    # RM packs sibling cudaMalloc allocations into one external allocation
+    # that UVM maps as a whole, so an allocation can sit anywhere inside the
+    # mapped range, not at its base (the REMU probe only ever validated the
+    # single allocation that owned the map base). Match by containment.
+    def covers(row: dict[str, object]) -> bool:
+        range_base = int(str(row["map_base"]), 16)
+        return range_base <= base and range_base + int(row["map_length"]) >= end
+
     maps = [row for row in rows if row["event_type"] == "MAP_RETURN"
-            and row["map_base"]
-            and int(str(row["map_base"]), 16) == base]
+            and row["map_base"] and covers(row)]
     headers = [row for row in rows if row["event_type"] == "PTE_HEADER"
-               and row["map_base"]
-               and int(str(row["map_base"]), 16) == base]
+               and row["map_base"] and covers(row)]
     frees = [row for row in rows if row["event_type"] == "FREE_RETURN"
-             and row["map_base"]
-             and int(str(row["map_base"]), 16) == base]
+             and row["map_base"] and covers(row)]
     if len(maps) != 1:
         failures.append(f"{allocation_id}: expected one MAP_RETURN, got {len(maps)}")
     if not headers:
@@ -454,15 +459,15 @@ def main() -> int:
 
     map_rows: list[dict[str, object]] = []
     per_allocation_status: dict[str, str] = {}
-    active_at_snapshot: dict[str, bool] = {row["allocation_id"]: row["active"] == "1"
-                                           for row in registry}
+    active_at_snapshot: dict[str, bool] = {
+        row["allocation_id"]: row["active_at_injection"] == "1" for row in registry}
     g1_5_run_id = registry[0]["run_id"] if registry else ""
     for row in registry:
         record = allocated_by_id.get(row["allocation_id"], {})
         segments, ledger_failures = build_allocation_ledger(
             observer.rows, row, record, teardown_end_ns)
         failures.extend(ledger_failures)
-        if row["active"] == "1" and args.hold_seconds > 0 and segments:
+        if row["active_at_injection"] == "1" and args.hold_seconds > 0 and segments:
             unmapped = int(segments[0]["unmapped_at_ns"])
             if not (snapshot_ns and hold_begin_ns and hold_end_ns
                     and segments[0]["mapped_at_ns"] < snapshot_ns
@@ -484,7 +489,9 @@ def main() -> int:
                 "allocation_phase": row["allocation_phase"],
                 "active_at_snapshot": str(active_at_snapshot.get(row["allocation_id"], False)).lower(),
                 "va_page_base": f"0x{int(segment['va_page_base']):x}",
-                "va_page_end_exclusive": f"0x{int(segment['covered_va_end_exclusive']):x}",
+                # The PTE maps the whole GMMU page; sibling allocations
+                # packed into the same RM page share this page extent.
+                "va_page_end_exclusive": f"0x{int(segment['va_page_base']) + int(segment['page_size']):x}",
                 "fb_pa_page_base": f"0x{int(segment['physical_page_base']):x}",
                 "page_size": segment["page_size"],
                 "aperture": segment["aperture"],
