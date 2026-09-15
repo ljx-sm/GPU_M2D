@@ -793,13 +793,16 @@ int main(int argc, char** argv) {
             std::to_string(options.element_index) + "-bit" +
             std::to_string(options.element_bit_index);
 
+        // The stale-gate check must run before WAIT_PRE_ALLOC_GATE is
+        // printed: the orchestrator creates the gate as soon as it sees
+        // that marker, so checking afterwards races with it.
+        if (observer.enabled && access(observer.gate_file.c_str(), F_OK) == 0) {
+            throw std::runtime_error("observer gate already exists: " +
+                                     observer.gate_file);
+        }
         observer.event("PROCESS_READY");
         observer.event("WAIT_PRE_ALLOC_GATE");
         if (observer.enabled) {
-            if (access(observer.gate_file.c_str(), F_OK) == 0) {
-                throw std::runtime_error("observer gate already exists: " +
-                                         observer.gate_file);
-            }
             std::fflush(stdout);
             if (!observer.wait_for_gate()) {
                 throw std::runtime_error("observer pre-allocation gate timed out");
