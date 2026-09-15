@@ -9,14 +9,18 @@ CUDA_ARCH ?= 89
 
 .PHONY: all clean check
 
-all: g2_scratch_harness
+all: g2_scratch_harness g2_alias_harness
 
 g2_scratch_harness: g2_scratch_harness.cu
 	$(NVCC) -std=c++17 -arch=sm_$(CUDA_ARCH) -O2 -o $@ $< -lcuda
 
+g2_alias_harness: g2_alias_harness.cu
+	$(NVCC) -std=c++17 -arch=sm_$(CUDA_ARCH) -O2 -o $@ $< -lcuda
+
 check: all
-	/usr/bin/python3 -m py_compile g2_observer.py pte_decoder.py run_g2_scratch_probe.py
+	/usr/bin/python3 -m py_compile g2_observer.py pte_decoder.py \
+		run_g2_scratch_probe.py run_g2_tensorrt_probe.py run_g2_alias_probe.py
 	/usr/bin/python3 g2_observer.py --self-check
 
 clean:
-	rm -f g2_scratch_harness __pycache__/*.pyc
+	rm -f g2_scratch_harness g2_alias_harness __pycache__/*.pyc

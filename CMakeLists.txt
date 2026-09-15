@@ -98,6 +98,7 @@ if(GPU_M2D_BUILD_TENSORRT_RUNNER)
     target_link_libraries(gpu_m2d_resnet50_int8_g1_5 PRIVATE
         gpu_m2d_semantic
         gpu_m2d_injector
+        CUDA::cuda_driver
         CUDA::cudart
         "${GPU_M2D_TENSORRT_LIBRARY}"
         ${OpenCV_LIBS}

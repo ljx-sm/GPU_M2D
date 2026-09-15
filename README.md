@@ -62,11 +62,18 @@ time and decodes it under a version-pinned AD102 GMMU v2 contract:
 
 ```bash
 make -C tools/g2_observer all check
-sudo scripts/run_g2_observer_probe.sh --api device   # or --api vmm
+scripts/run_g1_5_validation.sh                       # prebuild the TensorRT runner
+
+sudo scripts/run_g2_observer_probe.sh --api device   # cudaMalloc scratch
+sudo scripts/run_g2_observer_probe.sh --api vmm      # CUDA VMM scratch
+sudo scripts/run_g2_observer_probe.sh --api alias    # VMM alias double-mapping
+sudo scripts/run_g2_observer_probe.sh --api tensorrt # full G1.5 workload map
 ```
 
 Root is needed only to attach the read-only probes; the CUDA child runs as
-the invoking user and no other GPU process is touched. Run artifacts are
+the invoking user and no other GPU process is touched. The tensorrt mode
+maps every active G1.5 allocation page-by-page and regenerates
+`artifacts/g2/gpu_va_pa_map.csv` after all GPUs pass. Run artifacts are
 written under `artifacts/g2/observer/` and excluded from Git. See
 [tools/g2_observer/README.md](tools/g2_observer/README.md).
 

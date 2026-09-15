@@ -3,13 +3,19 @@
 #include "gpu_m2d/tensor_mapping.hpp"
 
 #include <NvInfer.h>
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <opencv2/opencv.hpp>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -20,6 +26,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -52,6 +59,85 @@ struct TrtDeleter {
     }
 };
 
+// Optional G2 observer instrumentation. When a gate file is configured the
+// runner blocks before creating any CUDA context (the eBPF probes attach in
+// that window), then reports every AllocationRegistry lifetime transition as
+// a GPU_M2D_EVENT line so the orchestrator can correlate user-space
+// allocations with kernel MAP/PTE/FREE events. The registry behavior is
+// identical with and without the observer.
+struct ObserverEmitter {
+    bool enabled{false};
+    std::string gate_file;
+    int hold_seconds{0};
+    int gate_timeout_seconds{30};
+
+    static std::uint64_t wall_time_ns() {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+    }
+
+    static std::uint64_t monotonic_time_ns() {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
+    bool wait_for_gate() const {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(gate_timeout_seconds);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (access(gate_file.c_str(), F_OK) == 0) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        return false;
+    }
+
+    void event(const char* name) const {
+        if (!enabled) {
+            return;
+        }
+        std::printf("GPU_M2D_EVENT,event=%s,pid=%d,tgid=%d,wall_time_ns=%" PRIu64
+                    ",monotonic_ns=%" PRIu64 "\n",
+                    name, static_cast<int>(getpid()), static_cast<int>(getpid()),
+                    wall_time_ns(), monotonic_time_ns());
+        std::fflush(stdout);
+    }
+
+    void allocated(const std::string& allocation_id, const char* allocation_api,
+                   std::uintptr_t base_va, std::size_t size_bytes,
+                   const std::string& allocation_phase,
+                   const std::string& semantic_label,
+                   const std::string& cuda_buffer_id) const {
+        if (!enabled) {
+            return;
+        }
+        std::printf("GPU_M2D_EVENT,event=ALLOCATED,allocation_api=%s,pid=%d,tgid=%d,"
+                    "allocation_id=%s,base_va=0x%" PRIxPTR ",size_bytes=%zu,"
+                    "allocation_phase=%s,semantic_label=%s,cuda_buffer_id=%s,"
+                    "wall_time_ns=%" PRIu64 ",monotonic_ns=%" PRIu64 "\n",
+                    allocation_api, static_cast<int>(getpid()), static_cast<int>(getpid()),
+                    allocation_id.c_str(), base_va, size_bytes, allocation_phase.c_str(),
+                    semantic_label.c_str(), cuda_buffer_id.c_str(), wall_time_ns(),
+                    monotonic_time_ns());
+        std::fflush(stdout);
+    }
+
+    void freed(const std::string& allocation_id) const {
+        if (!enabled) {
+            return;
+        }
+        std::printf("GPU_M2D_EVENT,event=FREE,allocation_id=%s,wall_time_ns=%" PRIu64
+                    ",monotonic_ns=%" PRIu64 "\n",
+                    allocation_id.c_str(), wall_time_ns(), monotonic_time_ns());
+        std::fflush(stdout);
+    }
+};
+
 struct TrackedAllocation {
     std::uintptr_t gpu_va{0};
     std::string allocation_id;
@@ -60,8 +146,9 @@ struct TrackedAllocation {
 
 class TrackingGpuAllocator final : public nvinfer1::IGpuAllocator {
 public:
-    TrackingGpuAllocator(gpu_m2d::AllocationRegistry& registry, int device_id)
-        : registry_(registry), device_id_(device_id) {}
+    TrackingGpuAllocator(gpu_m2d::AllocationRegistry& registry, int device_id,
+                         const ObserverEmitter* observer = nullptr)
+        : registry_(registry), device_id_(device_id), observer_(observer) {}
 
     void set_phase(std::string phase) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -107,6 +194,12 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             records_.push_back(TrackedAllocation{
                 reinterpret_cast<std::uintptr_t>(memory), allocation_id, true});
+            if (observer_ != nullptr) {
+                observer_->allocated(allocation_id, "tensorrt-igpu-allocator",
+                                     reinterpret_cast<std::uintptr_t>(memory),
+                                     static_cast<std::size_t>(size), phase,
+                                     "TENSORRT_INTERNAL_UNKNOWN", "");
+            }
         } catch (...) {
             static_cast<void>(registry_.deactivate_allocation(allocation_id));
             cudaFree(memory);
@@ -135,12 +228,16 @@ public:
         }
         record->active = false;
         static_cast<void>(registry_.deactivate_allocation(record->allocation_id));
+        if (observer_ != nullptr) {
+            observer_->freed(record->allocation_id);
+        }
         return true;
     }
 
 private:
     gpu_m2d::AllocationRegistry& registry_;
     int device_id_{-1};
+    const ObserverEmitter* observer_{nullptr};
     mutable std::mutex mutex_;
     std::vector<TrackedAllocation> records_;
     std::string phase_{"runtime_setup"};
@@ -208,6 +305,7 @@ public:
 
     void* get() const noexcept { return pointer_; }
     std::size_t size_bytes() const noexcept { return size_bytes_; }
+    const std::string& allocation_id() const noexcept { return allocation_id_; }
 
 private:
     void release() noexcept {
@@ -269,6 +367,9 @@ struct Options {
     std::size_t element_index{0};
     std::size_t element_bit_index{0};
     int device{0};
+    std::string observer_gate;
+    int hold_seconds{0};
+    int gate_timeout_seconds{30};
 };
 
 struct Sample {
@@ -299,6 +400,16 @@ void check_cuda(cudaError_t status, const char* operation) {
     }
 }
 
+std::string query_buffer_id(const void* pointer) {
+    unsigned long long buffer_id = 0;
+    if (cuPointerGetAttribute(&buffer_id, CU_POINTER_ATTRIBUTE_BUFFER_ID,
+                              reinterpret_cast<CUdeviceptr>(pointer)) == CUDA_SUCCESS &&
+        buffer_id != 0) {
+        return std::to_string(buffer_id);
+    }
+    return "";
+}
+
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
@@ -319,6 +430,18 @@ Options parse_options(int argc, char** argv) {
             options.element_index = std::stoull(value);
         } else if (key == "--bit") {
             options.element_bit_index = std::stoull(value);
+        } else if (key == "--observer-gate") {
+            options.observer_gate = value;
+        } else if (key == "--hold-seconds") {
+            options.hold_seconds = std::stoi(value);
+            if (options.hold_seconds < 0) {
+                throw std::invalid_argument("--hold-seconds must be >= 0");
+            }
+        } else if (key == "--gate-timeout-seconds") {
+            options.gate_timeout_seconds = std::stoi(value);
+            if (options.gate_timeout_seconds <= 0) {
+                throw std::invalid_argument("--gate-timeout-seconds must be > 0");
+            }
         } else if (key == "--output-prefix") {
             options.output_prefix = value;
         } else {
@@ -330,7 +453,8 @@ Options parse_options(int argc, char** argv) {
         options.output_prefix.empty()) {
         throw std::invalid_argument(
             "required arguments: --engine PATH --sample-csv PATH "
-            "--output-prefix PATH [--sample-index N --device N --element N --bit N]");
+            "--output-prefix PATH [--sample-index N --device N --element N --bit N] "
+            "[--observer-gate PATH --hold-seconds N --gate-timeout-seconds N]");
     }
     return options;
 }
@@ -649,7 +773,41 @@ void write_result(const std::string& path,
 
 int main(int argc, char** argv) {
     try {
+        std::setvbuf(stdout, nullptr, _IOLBF, 0);
         const Options options = parse_options(argc, argv);
+
+        ObserverEmitter observer;
+        observer.enabled = !options.observer_gate.empty();
+        observer.gate_file = options.observer_gate;
+        observer.hold_seconds = options.hold_seconds;
+        observer.gate_timeout_seconds = options.gate_timeout_seconds;
+
+        // CPU-only preparation happens before the gate so the gated window
+        // contains nothing but CUDA work.
+        const Sample sample = read_sample(options.sample_csv, options.sample_index);
+        const std::vector<float> input = preprocess(sample.path);
+        const std::vector<char> engine_bytes = read_binary_file(options.engine_path);
+        const std::string run_id =
+            "g1_5-gpu" + std::to_string(options.device) + "-sample" +
+            std::to_string(options.sample_index) + "-element" +
+            std::to_string(options.element_index) + "-bit" +
+            std::to_string(options.element_bit_index);
+
+        observer.event("PROCESS_READY");
+        observer.event("WAIT_PRE_ALLOC_GATE");
+        if (observer.enabled) {
+            if (access(observer.gate_file.c_str(), F_OK) == 0) {
+                throw std::runtime_error("observer gate already exists: " +
+                                         observer.gate_file);
+            }
+            std::fflush(stdout);
+            if (!observer.wait_for_gate()) {
+                throw std::runtime_error("observer pre-allocation gate timed out");
+            }
+        }
+        observer.event("PRE_ALLOC_GATE_OPEN");
+
+        observer.event("CONTEXT_BEGIN");
         int device_count = 0;
         check_cuda(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
         if (options.device < 0 || options.device >= device_count) {
@@ -663,19 +821,12 @@ int main(int argc, char** argv) {
         char pci_bus_id[32]{};
         check_cuda(cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), options.device),
                    "cudaDeviceGetPCIBusId");
+        observer.event("CONTEXT_READY");
 
-        const Sample sample = read_sample(options.sample_csv, options.sample_index);
-        const std::vector<float> input = preprocess(sample.path);
-        const std::vector<char> engine_bytes = read_binary_file(options.engine_path);
-        const std::string run_id =
-            "g1_5-gpu" + std::to_string(options.device) + "-sample" +
-            std::to_string(options.sample_index) + "-element" +
-            std::to_string(options.element_index) + "-bit" +
-            std::to_string(options.element_bit_index);
-
+        observer.event("RUNTIME_BEGIN");
         TrtLogger logger;
         gpu_m2d::AllocationRegistry allocation_registry(run_id);
-        TrackingGpuAllocator allocator(allocation_registry, options.device);
+        TrackingGpuAllocator allocator(allocation_registry, options.device, &observer);
         std::unique_ptr<nvinfer1::IRuntime, TrtDeleter<nvinfer1::IRuntime>> runtime(
             nvinfer1::createInferRuntime(logger));
         if (!runtime) {
@@ -730,22 +881,31 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("TensorRT binding allocated on unexpected GPU");
             }
             mapping.add_tensor(make_descriptor(binding, pointer, options.device));
+            observer.allocated(allocation_id, "cudaMalloc-binding",
+                               reinterpret_cast<std::uintptr_t>(buffers.back().get()),
+                               buffers.back().size_bytes(), "allocate_bindings",
+                               "TENSOR:" + binding.name,
+                               query_buffer_id(buffers.back().get()));
         }
         validate_registry_round_trips(allocation_registry);
 
         write_mapping_snapshot(options.output_prefix + "_mapping.csv", mapping,
                                options.device);
+        observer.event("BINDINGS_READY");
 
         CudaStream stream;
         allocator.set_phase("clean_inference");
+        observer.event("CLEAN_INFERENCE_BEGIN");
         check_cuda(cudaMemcpy(binding_pointers[input_binding.index], input.data(),
                               input_binding.size_bytes, cudaMemcpyHostToDevice),
                    "copy clean input to device");
         const Prediction clean = run_inference(
             *context, binding_pointers, probability_binding.index,
             class_binding.index, stream);
+        observer.event("CLEAN_INFERENCE_END");
 
         allocator.set_phase("injected_inference");
+        observer.event("INJECTED_INFERENCE_BEGIN");
         check_cuda(cudaMemcpy(binding_pointers[input_binding.index], input.data(),
                               input_binding.size_bytes, cudaMemcpyHostToDevice),
                    "reset input before injection");
@@ -799,10 +959,12 @@ int main(int argc, char** argv) {
         const Prediction injected = run_inference(
             *context, binding_pointers, probability_binding.index,
             class_binding.index, stream);
+        observer.event("INJECTED_INFERENCE_END");
         write_result(options.output_prefix + "_result.csv", options, sample, run_id,
                      mapped, flip, clean, injected);
         write_allocation_registry(options.output_prefix + "_allocations.csv",
                                   allocation_registry);
+        observer.event("SNAPSHOT_READY");
 
         const bool top1_changed = clean.class_index != injected.class_index;
         const bool numeric_changed = top1_changed ||
@@ -825,6 +987,32 @@ int main(int argc, char** argv) {
                   << '\n';
 
         allocator.set_phase("destroy_runtime_objects");
+        if (observer.enabled && options.hold_seconds > 0) {
+            observer.event("HOLD_BEGIN");
+            std::this_thread::sleep_for(std::chrono::seconds(options.hold_seconds));
+            observer.event("HOLD_END");
+        }
+        observer.event("TEARDOWN_BEGIN");
+        // Explicit teardown in the natural destruction order so the observer
+        // sees every allocation free before PROCESS_END. The binding FREE
+        // events are emitted here because DeviceBuffer destruction goes
+        // through no observer hook.
+        for (const BindingInfo& binding : binding_info) {
+            const std::string allocation_id =
+                "trt-binding-" + binding.name + "-gpu-" +
+                std::to_string(options.device);
+            if (std::any_of(buffers.begin(), buffers.end(),
+                            [&allocation_id](const DeviceBuffer& buffer) {
+                                return buffer.allocation_id() == allocation_id;
+                            })) {
+                observer.freed(allocation_id);
+            }
+        }
+        buffers.clear();
+        context.reset();
+        engine.reset();
+        runtime.reset();
+        observer.event("PROCESS_END");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "GPU_M2D_G1_5_FAIL: " << error.what() << '\n';

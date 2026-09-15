@@ -58,7 +58,54 @@ method achieved, with independent validators:
 | `pte_decoder.py` | Fail-closed PTE decoder (unknown sizes/high words never yield local PA) |
 | `g2_observer.py` | BCC tracer: 3 kprobe/kretprobe pairs, full PTE capture (<=64 per query batch) |
 | `g2_scratch_harness.cu` | Gated scratch allocation harness (device/VMM) with XOR closeout |
-| `run_g2_scratch_probe.py` | Orchestrator: contract check, gate protocol, coverage/lifetime validation |
+| `run_g2_scratch_probe.py` | Scratch orchestrator: contract check, gate protocol, coverage/lifetime validation |
+| `run_g2_tensorrt_probe.py` | TensorRT orchestrator: observes the full G1.5 runner in `--observer-gate` mode and emits the page-level `gpu_va_pa_map.csv` for every registered allocation |
+| `g2_alias_harness.cu` | Gated VMM alias harness: one physical allocation mapped at two VAs |
+| `run_g2_alias_probe.py` | Alias orchestrator: both VA ranges must decode to the same PA pages; reverse mapping must be one-to-many |
+| `aggregate_va_pa_map.py` | Concatenates the newest passing per-GPU TensorRT maps into `artifacts/g2/gpu_va_pa_map.csv` |
+
+The G1.5 runner (`apps/resnet50_int8_g1_5.cpp`) gained an optional observer
+mode (`--observer-gate PATH --hold-seconds N`): it blocks before creating any
+CUDA context, then reports every AllocationRegistry lifetime transition
+(`ALLOCATED`/`FREE` per allocation, phase markers around runtime setup,
+clean/injected inference, snapshot, hold, and teardown). Registry behavior
+and the default mode are unchanged (verified: default mode emits zero
+`GPU_M2D_EVENT` lines and the same `GPU_M2D_G1_5_PASS` line).
+
+## TensorRT integration and the G2 map
+
+The TensorRT probe wraps the whole G1.5 workload:
+
+```bash
+scripts/run_g1_5_validation.sh          # builds build-g1.5/... (as normal user)
+sudo scripts/run_g2_observer_probe.sh --api tensorrt
+```
+
+Every allocation registered by the G1.5 AllocationRegistry (TensorRT
+IGpuAllocator internals plus the binding buffers, with their CUDA buffer
+IDs) must be covered by a complete, contiguous, valid, local-VIDEO PTE
+payload — gaps, non-local pages, truncated payloads, ordering violations,
+or lost events fail the run closed. The per-run page-level map is written
+under `artifacts/g2/observer/trt/run_*/gpu_va_pa_map.csv` (schema
+`gpu-m2d.g2-observer.tensorrt-probe.v1`), and after all GPUs pass, the
+wrapper regenerates the canonical `artifacts/g2/gpu_va_pa_map.csv` from
+the newest passing run of each device. Mappings are never reused across
+runs.
+
+## VMM alias double-mapping
+
+```bash
+sudo scripts/run_g2_observer_probe.sh --api alias
+```
+
+One CUDA VMM physical allocation is mapped at two reserved VA ranges. The
+observer must capture complete PTE payloads for both mappings, every page
+offset must decode to the same framebuffer PA page under both VAs, and
+the reverse mapping must be one-to-many (two VA pages per PA page). The
+harness also proves the alias semantically: a device-side pattern write
+through the primary VA is read back bit-identically through the secondary
+VA, and a one-bit XOR applied through the primary VA is observed and
+restored through the secondary VA.
 
 ## Contract discipline
 
@@ -72,7 +119,7 @@ source before observing.
 ## Usage
 
 ```bash
-make -C tools/g2_observer all check   # build harness + self-check
+make -C tools/g2_observer all check   # build harnesses + self-check
 
 # one GPU, one API (needs sudo for kprobe attach only)
 sudo /usr/bin/python3 tools/g2_observer/run_g2_scratch_probe.py --api device --device 0
