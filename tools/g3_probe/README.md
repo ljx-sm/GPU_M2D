@@ -303,6 +303,47 @@ degree ≥3" and "bank coverage gap". The saved models and this diagnosis
 are the honest S4 output; S5 prediction validation stays blocked on a
 model that passes the gate.
 
+## S4b-0 result on GPU 0 (2026-09-16): local recalibration + lambda fingerprint
+
+`analyze_local_recal.py` (pure offline, zero new collection) reclassifies
+both runs against a per-page baseline and mines the address-dependent
+latency fingerprint:
+
+- **The lambda fingerprint is real.** The per-page low-pair latency spans
+  1011-1063 cycles (~50 cyc ≈ 19 ns at 2676 MHz), reproducible within a
+  page (median within-page spread 7-9 cyc, far below the global spread),
+  with no single page-level PA bit explaining more than ~2 cyc — hash-like
+  positional variation, consistent with channel/L2-slice path
+  differences. No discrete ~12-band structure is resolvable from pair
+  data (a pair's single scalar mixes both endpoints; the harness records
+  one value per pair — `cycles_a == cycles_b` in every row).
+- **The local rule is asymmetric, and that is a measured fact.** The first
+  symmetric version (shift both band edges by the page lambda) relabeled
+  134 of 139 S3 conflicts to mid — rejected: conflict values sit 30-60
+  cycles BELOW lambda+amplitude (conflict-minus-amplitude lands at
+  981-1001 while the lambda range is 1011-1063), so the row-conflict
+  penalty does not ride on the low-path baseline. The final rule
+  localizes only the low/mid boundary (low iff value < max(lambda_a,
+  lambda_b) + 0.35*amplitude); the conflict gate stays global — S3b's
+  fresh votes had reproduced S3's conflict labels (5/5, 6/6), so
+  destroying them is wrong by construction.
+- **Outcome**: mids 556 -> 257 (-54%), all 395 conflicts kept (134 S3 +
+  139 S3b sit below their own local conflict threshold — flagged as S4b-1
+  re-probe candidates, not relabeled), 11 marginal lows corrected to mid.
+  The 257 residual mids are saved per run as same-channel candidates
+  (`same_channel_candidates.csv`): intra-channel bank-group pipelining
+  pays a partial penalty while a cross-channel pair has nothing to pay,
+  so a residual mid is positive same-channel evidence.
+- **Solver impact**: holdout 0.758 -> 0.809 on the recalibrated labels
+  (`mapping_model_local_d2.json`). Real progress, still FAIL against the
+  0.95 gate — label quality was a blocker, but the degree-2/weight-4
+  model-class insufficiency stands, exactly as the S4 diagnosis predicted.
+- **The channel partition is not resolvable offline.** The same-channel
+  graph (conflict + residual-mid edges over pages) has 147 small
+  components (largest 22 pages): no contradiction with ~12 channels, but
+  this edge density cannot merge each channel's ~170 pages. Deciding the
+  channel hypothesis needs the S4b-1 per-page census.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the
