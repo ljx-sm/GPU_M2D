@@ -80,6 +80,13 @@ map); see [docs/G2_VALIDATION.md](docs/G2_VALIDATION.md) and
 [tools/g2_observer/README.md](tools/g2_observer/README.md). Lookups and
 their rejection cases: `tools/g2_observer/va_pa_lookup.py --self-test`.
 
+## Survey the G3 PA-to-GDDR landscape
+
+S0 of the G3 plan audited the open timing-side-channel tooling (GPUHammer,
+GDDRHammer — pinned by commit, study-only, both unlicensed) and collected the
+verified RTX 4090 / GDDR6X platform facts and measured A6000 priors that our
+own probe will be calibrated against; see [docs/G3_SURVEY.md](docs/G3_SURVEY.md).
+
 ## Run the optional ResNet-50 INT8 G1.5 integration
 
 On the reference host, the existing TensorRT/OpenCV environment, engine, and

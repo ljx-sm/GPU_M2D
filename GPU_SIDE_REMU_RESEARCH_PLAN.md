@@ -558,6 +558,10 @@ gpu_va_pa_map.csv
 
 ### G3：GPU PA-to-GDDR Mapping
 
+Status（2026-09-15）：S0 尽调完成——参考工具（GPUHammer/GDDRHammer，仅研读
+不拷贝）与 AD102/GDDR6X 已验证平台事实见 `docs/G3_SURVEY.md`；映射规则本体
+尚未开始测量。
+
 目标：
 
 ```text
