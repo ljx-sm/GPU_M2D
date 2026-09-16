@@ -23,6 +23,7 @@ check: all
 		run_g3_pool_probe.py replay_trt_run.py va_pa_lookup.py
 	/usr/bin/python3 g2_observer.py --self-check
 	/usr/bin/python3 va_pa_lookup.py --self-test
+	/usr/bin/python3 run_g3_pool_probe.py --self-test
 
 clean:
 	rm -f g2_scratch_harness g2_alias_harness __pycache__/*.pyc

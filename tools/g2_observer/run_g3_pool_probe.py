@@ -158,6 +158,8 @@ def drain_until_marker(process: subprocess.Popen[bytes], observer: G2Observer,
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the offline ledger/result-parsing tests and exit")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--chunks", type=int, default=64)
     parser.add_argument("--chunk-mib", type=int, default=8)
@@ -263,10 +265,12 @@ def read_result_csv(path: Path, expected_queries: int) -> list[dict[str, str]]:
     if not path.is_file():
         raise RuntimeError(f"result CSV missing: {path}")
     with path.open(encoding="utf-8", newline="") as source:
-        reader = csv.DictReader(source)
-        if reader.fieldnames != RESULT_FIELDS:
-            raise RuntimeError(f"unexpected result header: {reader.fieldnames}")
-        rows = list(reader)
+        # The harness prefixes a '# ...' provenance comment line.
+        lines = [line for line in source if not line.startswith("#")]
+    reader = csv.DictReader(lines)
+    if reader.fieldnames != RESULT_FIELDS:
+        raise RuntimeError(f"unexpected result header: {reader.fieldnames}")
+    rows = list(reader)
     if len(rows) != expected_queries:
         raise RuntimeError(f"expected {expected_queries} result rows, got {len(rows)}")
     if {int(row["query_id"]) for row in rows} != set(range(expected_queries)):
@@ -364,8 +368,132 @@ def finalize(failures: list[str], run_dir: Path, summary_output: Path,
     return 2 if failures else 0
 
 
+def _synthetic_rows(map_base: int, n_pages: int, free_at: int | None = None) \
+        -> list[dict[str, object]]:
+    """Observer-schema rows for one allocation covering n_pages x 2 MiB."""
+    page = 2 * 1024 * 1024
+
+    def row(**over):
+        base = dict(timestamp_ns=0, pid=1, tgid=1, event_type="", status=0,
+                    address_space_id="uvmfile-x", rm_va_space_id="rmvas-x",
+                    map_base="", map_length=0, map_offset=0, gpu_uuid="GPU-abc",
+                    query_offset=0, query_size=0, mapping_page_size=0,
+                    num_written=0, num_remaining=0, pte_size=8, pte_index="",
+                    payload_complete="false", raw_pte_lo="", raw_pte_hi="",
+                    raw_entry="", high_word_zero="", valid="", aperture="",
+                    physical_page_base="", gpu_local_pa="false",
+                    need_l2_invalidate="false", contract_sha256="x")
+        base.update(over)
+        return base
+
+    rows = [row(event_type="MAP_RETURN", map_base=f"0x{map_base:x}",
+                map_length=n_pages * page, timestamp_ns=1000),
+            row(event_type="PTE_HEADER", map_base=f"0x{map_base:x}",
+                map_length=n_pages * page, map_offset=0, query_offset=0,
+                query_size=n_pages * page, mapping_page_size=page,
+                num_written=n_pages, num_remaining=0,
+                payload_complete="true", timestamp_ns=1001)]
+    for index in range(n_pages):
+        rows.append(row(event_type="PTE_ENTRY", map_base=f"0x{map_base:x}",
+                        map_length=n_pages * page, map_offset=0, query_offset=0,
+                        query_size=n_pages * page, pte_index=index,
+                        valid="true", aperture="VIDEO", high_word_zero="true",
+                        physical_page_base=f"0x{0x120000000 + index * page:x}",
+                        raw_pte_lo="0x1", raw_pte_hi="0x0", timestamp_ns=1001))
+    if free_at is not None:
+        rows.append(row(event_type="FREE_RETURN", map_base=f"0x{map_base:x}",
+                        map_length=n_pages * page, timestamp_ns=free_at))
+    return rows
+
+
+class _FakeObserver:
+    def __init__(self, rows: list[dict[str, object]]):
+        self.rows = rows
+        self.lost_event_count = 0
+
+
+def _synthetic_allocated(base: int, size: int, chunk: int = 0) -> list[dict[str, str]]:
+    return [{"allocation_id": f"chunk{chunk}", "base_va": hex(base),
+             "size_bytes": str(size), "chunk_index": str(chunk),
+             "monotonic_ns": "1002"}]
+
+
+def self_test() -> int:
+    """Offline tests of the ledger wrappers and result parsing (no root,
+    no GPU, no live observer): what `make -C tools/g2_observer check` runs."""
+    page = 2 * 1024 * 1024
+    alloc_base = 0x100000000
+
+    # Pre-pass (no kernel FREE yet): only the expected pending-free notice.
+    pages, failures = build_pool_ledger(
+        _FakeObserver(_synthetic_rows(alloc_base, 4)), _synthetic_allocated(alloc_base, 4 * page),
+        OPEN_TEARDOWN_NS, allow_pending_free=True)
+    assert failures == [], failures
+    assert len(pages) == 4 and pages[0]["fb_pa_page_base"] == 0x120000000
+
+    # Strict pass with the FREE inside the teardown window: clean, and the
+    # unmapped timestamp is recorded.
+    pages, failures = build_pool_ledger(
+        _FakeObserver(_synthetic_rows(alloc_base, 4, free_at=5000)),
+        _synthetic_allocated(alloc_base, 4 * page), 9000, allow_pending_free=False)
+    assert failures == [] and pages[0]["unmapped_at_ns"] == 5000, (pages, failures)
+
+    # FREE landing after the teardown window fails closed.
+    _, failures = build_pool_ledger(
+        _FakeObserver(_synthetic_rows(alloc_base, 4, free_at=9500)),
+        _synthetic_allocated(alloc_base, 4 * page), 9000, allow_pending_free=False)
+    assert any("outlived the teardown window" in failure for failure in failures)
+
+    # A non-local page is fatal even during the pre-pass.
+    rows = _synthetic_rows(alloc_base, 4)
+    for row in rows:
+        if row["event_type"] == "PTE_ENTRY" and row["pte_index"] == 1:
+            row["aperture"] = "SYSMEM"
+    _, failures = build_pool_ledger(
+        _FakeObserver(rows), _synthetic_allocated(alloc_base, 4 * page),
+        OPEN_TEARDOWN_NS, allow_pending_free=True)
+    assert any("non-local" in failure for failure in failures)
+
+    # An allocation interior to a bigger map: clipped segments collapse
+    # into full-page rows (RM packing).
+    map_base = 0x200000000
+    interior = map_base + 2 * page
+    pages, failures = build_pool_ledger(
+        _FakeObserver(_synthetic_rows(map_base, 4)),
+        _synthetic_allocated(interior, 2 * page, chunk=7),
+        OPEN_TEARDOWN_NS, allow_pending_free=True)
+    assert failures == [] and len(pages) == 2
+    assert pages[0]["va_page_base"] == interior
+    assert pages[0]["fb_pa_page_base"] == 0x120000000 + 2 * page
+
+    # Result parsing tolerates the harness's '# ...' provenance comment and
+    # rejects wrong counts / ids (this is the bug the first sudo run hit).
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
+        handle.write("# g3 pool query results: cycles are the minimum over 10 launches, modifier=.volatile\n")
+        handle.write("query_id,chunk_a,ofs_a,chunk_b,ofs_b,cycles_a,cycles_b\n")
+        handle.write("0,0,0,0,0,1010,1010\n")
+        handle.write("1,0,0,0,8192,1023,1023\n")
+        path = Path(handle.name)
+    try:
+        rows = read_result_csv(path, 2)
+        assert rows[1]["cycles_b"] == "1023"
+        try:
+            read_result_csv(path, 3)
+            raise AssertionError("wrong row count must fail")
+        except RuntimeError:
+            pass
+    finally:
+        path.unlink(missing_ok=True)
+
+    print("g3 pool probe self-test: PASS")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.self_test:
+        return self_test()
     if os.geteuid() != 0:
         raise PermissionError("run through sudo; the CUDA child is dropped back to the invoking user")
     uid, gid = drop_to_invoking_user()
@@ -578,9 +706,8 @@ def main() -> int:
                 process.kill()
                 process.wait(timeout=2)
         observer.close()
-        output_text = captured.decode("utf-8", errors="replace")
-        if test_log.exists():
-            test_log.write_text(output_text, encoding="utf-8")
+        test_log.write_text(captured.decode("utf-8", errors="replace"),
+                            encoding="utf-8")
 
     return finalize(failures, run_dir, summary_output, pool_map_output,
                     work_output, result_output, test_log, event_output,
