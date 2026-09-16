@@ -559,8 +559,10 @@ gpu_va_pa_map.csv
 ### G3：GPU PA-to-GDDR Mapping
 
 Status（2026-09-15）：S0 尽调完成——参考工具（GPUHammer/GDDRHammer，仅研读
-不拷贝）与 AD102/GDDR6X 已验证平台事实见 `docs/G3_SURVEY.md`；映射规则本体
-尚未开始测量。
+不拷贝）与 AD102/GDDR6X 已验证平台事实见 `docs/G3_SURVEY.md`。
+Status（2026-09-16）：S1 标定 **PASS**（GPU0）——GDDR6X row-conflict 延迟差
+≈39 ns（98 cyc @2520 MHz），冲突簇紧致（4.4 cyc），与 0 冲突的页内偏移与
+GA102/A6000 公开结果一致；工具 `tools/g3_probe/`。映射规则求解尚未开始。
 
 目标：
 

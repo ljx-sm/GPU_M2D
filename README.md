@@ -87,6 +87,19 @@ GDDRHammer — pinned by commit, study-only, both unlicensed) and collected the
 verified RTX 4090 / GDDR6X platform facts and measured A6000 priors that our
 own probe will be calibrated against; see [docs/G3_SURVEY.md](docs/G3_SURVEY.md).
 
+## Calibrate the G3 timing channel (S1)
+
+```bash
+make -C tools/g3_probe all check
+CUDA_VISIBLE_DEVICES=0 tools/g3_probe/g3_timing_probe scan --file /tmp/s1.csv
+python3 tools/g3_probe/analyze_scan.py /tmp/s1.csv --mhz 2520
+```
+
+S1 passed on GPU 0 on 2026-09-16: the GDDR6X row-conflict delta is ~39 ns
+(98 cycles at a self-boosted, stable 2520 MHz), the conflict cluster is
+tight (4.4 cycles spread), and the in-page conflict offsets match the ones
+published for GA102; see [tools/g3_probe/README.md](tools/g3_probe/README.md).
+
 ## Run the optional ResNet-50 INT8 G1.5 integration
 
 On the reference host, the existing TensorRT/OpenCV environment, engine, and
