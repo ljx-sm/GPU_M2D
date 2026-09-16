@@ -223,6 +223,44 @@ hole as S3; calibration floor/baseline/conflict = 1028/1020/1143, amplitude
   S4 solver input: bank = degree-≤2 GF(2) hash with seeded terms, row
   support learned jointly, mid votes kept soft.
 
+## S4 solver — fit the bank/row model to the pair constraints
+
+`solve_mapping.py` consumes the S3 `constraints.csv` and S3b
+`pair_constraints.csv` (run directories or CSV paths — to the solver both
+are just (pa_a, pa_b, class) triples) and fits the two functions the
+timing primitive measured:
+
+    conflict(x, y)  <=>  same_bank(x, y) AND row(x) != row(y)
+
+with bank(x) one degree-≤2 GF(2) polynomial per bank output bit (the
+linearized form of a row-seeded hash: a quadratic term `pa_i*pa_k` is
+exactly "seed bit i × flipped bit k") and the row difference the pair xor
+touching a learned row support R. Conflicts give homogeneous equations —
+every bank functional must vanish on their feature difference; lows whose
+xor touches R must be fired by at least one functional. Valid functionals
+(those vanishing on all conflicts, an XOR-closed set) are enumerated
+exactly up to weight 3 via conflict signatures — equal-signature pairs and
+signature-completing triples — then grown by beam XOR; R is re-solved as
+monotone clauses (hit every conflict xor) plus units (avoid every
+same-bank low xor) with violation counting. The stages alternate; mid
+pairs are never fitted, only scored.
+
+    python3 tools/g3_probe/solve_mapping.py \
+        artifacts/g3/pool/<s3_run> artifacts/g3/pool/<s3b_run> \
+        [--degree {1,2}] [--holdout 0.2] [--seed N]
+    python3 tools/g3_probe/solve_mapping.py --predict <model.json> \
+        0xPA_A 0xPA_B
+
+Output: per-bank-bit term lists (`pa8`, `pa16*pa24`, ...), the row
+support, residual (unseparable low) and row-violation counts, train and
+holdout accuracy with the ≥95% holdout gate (the S5 preview), and
+`mapping_model_d{1,2}.json` for the prediction API. Residuals are the
+honest measure of what the model class cannot express; `--degree 1`
+quantifies the linear baseline S3/S3b ruled out. `--self-test` pins the
+pipeline on a synthetic seeded truth: degree 2 must hit zero residuals and
+violations with ≥99% holdout accuracy (the true functionals live at
+weight 2–3), and degree 1 must report the insufficiency.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the
