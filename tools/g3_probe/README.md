@@ -7,6 +7,9 @@ starts. The method and its provenance are cataloged in
 [docs/G3_SURVEY.md](../../docs/G3_SURVEY.md); the pinned reference
 repositories are unlicensed, so this is an independent implementation.
 
+S2 adds the PA-annotated timing pool in this directory plus the orchestrator
+`tools/g2_observer/run_g3_pool_probe.py` — see "S2 pool" below.
+
 ## Method
 
 One warp, two threads; both time one address each in the same warp
@@ -63,6 +66,43 @@ in-page scan, `.volatile`, unlocked clocks self-boosted and stable at
   with a third need not conflict with each other ((852224,866304)=1044);
   that structure is S3 material, not an S1 anomaly.
 
+## S2 pool — PA-annotated timing harness
+
+Files: `g3_timing_kernels.cuh` (shared kernels), `g3_pool_harness.cu`
+(gated child), `g3_pool.py` (PA query selector), and the orchestrator
+`tools/g2_observer/run_g3_pool_probe.py` + `--api g3pool` in
+`scripts/run_g2_observer_probe.sh`.
+
+The reference tooling times a VA-only black box; our pool is PA-annotated.
+The G2 observer watches the pool allocations, so every 2 MiB GMMU page of
+every chunk gets its framebuffer PA **before any timing runs**: the
+orchestrator builds the per-chunk ledger with the validated G2 code
+(containment matching, complete valid local-VIDEO PTE payloads, gapless
+tiling) and only then writes the work CSV and opens the release gate. The
+harness warms up (DVFS) while waiting, times the requested pairs, and
+writes `result.csv`; after teardown the strict ledger re-runs and
+`pool_map.csv` records one row per page (VA page extent ↔ fb PA base).
+
+Because in-page offsets translate 1:1 into PA (G2 finding), `g3_pool.py`
+turns page selection into PA-bit steering: PA bits [0:21) via the in-page
+offset, bits 21+ via page choice. `select_sanity_queries` emits the
+S1-verified in-page triple plus cross-page pairs spread over the observed
+PA range; `select_single_bit_pairs` (S3) emits pairs whose PAs differ in
+exactly one chosen bit. `g3_pool.py --self-test` pins the arithmetic.
+
+Run (GPU must be idle; the orchestrator refuses co-tenant compute):
+
+```bash
+make -C tools/g3_probe all check && make -C tools/g2_observer check
+sudo scripts/run_g2_observer_probe.sh --api g3pool --device 0
+# artifacts land in artifacts/g3/pool/run_pool_gpu0_*/:
+#   pool_map.csv  work.csv  result.csv  events.csv  summary.json
+```
+
+Standalone smoke (no observer, no sudo — manual gate/release files) passed
+on GPU 0 (2026-09-16): floor/baseline/in-page-conflict = 1010/1010/1122
+cycles, cross-chunk pairs 1017/1035, 2520.3 MHz — consistent with S1.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the
@@ -73,3 +113,7 @@ in-page scan, `.volatile`, unlocked clocks self-boosted and stable at
   (check `nvidia-smi` first; the probe prints pool/device state).
 - `discard.global.L2` destroys pool contents by design; never point this
   tool at buffers whose contents matter.
+- S2 timing numbers in `summary.json` are informational: S2 proves the
+  pool map and the gated timing path, not mapping rules. The PA in
+  `pool_map.csv` is the G2-observed page-table claim for that run only —
+  never reused across runs.

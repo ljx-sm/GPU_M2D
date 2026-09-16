@@ -1,3 +1,4 @@
 g3_timing_probe
 __pycache__/
 *.pyc
+g3_pool_harness

@@ -31,6 +31,8 @@
 
 #include <cuda_runtime.h>
 
+#include "g3_timing_kernels.cuh"
+
 #define CHECK_CUDA(expr)                                                     \
   do                                                                         \
     {                                                                        \
@@ -47,93 +49,7 @@
 namespace
 {
 
-// Load-modifier numbering kept identical to the reference tooling so results
-// are comparable: 0 plain, 1 .ca, 2 .cg, 3 .cs, 4 .cv, 5 .volatile.
-const char *kModifierNames[6] = { "plain", ".ca", ".cg", ".cs", ".cv",
-                                  ".volatile" };
-
-__forceinline__ __device__ uint64_t
-read_clock64 ()
-{
-  uint64_t c;
-  asm volatile ("mov.u64 %0, %%clock64;" : "=l" (c));
-  return c;
-}
-
-__forceinline__ __device__ uint64_t
-read_globaltimer ()
-{
-  uint64_t g;
-  asm volatile ("mov.u64 %0, %%globaltimer;" : "=l" (g));
-  return g;
-}
-
-// One timed GDDR access of `addr`. discard -> syncwarp -> clock -> load ->
-// clock. Everything between the clock reads is hand-written PTX marked
-// volatile so ptxas cannot elide or reorder it; the build additionally uses
-// -Xcicc -O0 -Xptxas -O0.
-__forceinline__ __device__ uint64_t
-timed_load (const uint8_t *addr, int modifier)
-{
-  uint64_t temp, c0, c1;
-  asm volatile ("discard.global.L2 [%0], 128;" ::"l" (addr) : "memory");
-  __syncwarp ();
-  c0 = read_clock64 ();
-  switch (modifier)
-    {
-    case 0:
-      asm volatile ("ld.global.u8 %0, [%1];" : "=l" (temp) : "l" (addr) : "memory");
-      break;
-    case 1:
-      asm volatile ("ld.global.ca.u8 %0, [%1];" : "=l" (temp) : "l" (addr) : "memory");
-      break;
-    case 2:
-      asm volatile ("ld.global.cg.u8 %0, [%1];" : "=l" (temp) : "l" (addr) : "memory");
-      break;
-    case 3:
-      asm volatile ("ld.global.cs.u8 %0, [%1];" : "=l" (temp) : "l" (addr) : "memory");
-      break;
-    case 4:
-      asm volatile ("ld.global.cv.u8 %0, [%1];" : "=l" (temp) : "l" (addr) : "memory");
-      break;
-    default:
-      asm volatile ("ld.volatile.global.u8 %0, [%1];" : "=l" (temp) : "l" (addr) : "memory");
-      break;
-    }
-  c1 = read_clock64 ();
-  /* Consume the loaded value in a provably-almost-dead branch so it cannot
-     be folded away without touching memory. */
-  if (temp == 0xDEADBEEFu)
-    asm volatile ("" ::: "memory");
-  return c1 - c0;
-}
-
-// Thread 0 times pool+ofs_a, thread 1 times pool+ofs_b. times[r*2+tid].
-__global__ void time_pair_kernel (const uint8_t *__restrict__ pool,
-                                  uint64_t ofs_a, uint64_t ofs_b,
-                                  uint64_t *__restrict__ times, int modifier)
-{
-  const uint8_t *addr
-      = (threadIdx.x == 0) ? pool + ofs_a : pool + ofs_b;
-  times[threadIdx.x] = timed_load (addr, modifier);
-}
-
-// Derives the effective SM clock: spins ~2M cycles and compares the
-// clock64 delta against the nanosecond %globaltimer delta.
-__global__ void clock_rate_kernel (uint64_t *__restrict__ out)
-{
-  uint64_t c0 = read_clock64 ();
-  uint64_t g0 = read_globaltimer ();
-  uint64_t c1;
-  do
-    {
-      c1 = read_clock64 ();
-    }
-  while (c1 - c0 < 2000000ull);
-  uint64_t g1 = read_globaltimer ();
-  out[0] = c1 - c0;
-  out[1] = g1 - g0;
-}
+using g3_probe::kModifierNames;
 
 struct Options
 {
@@ -215,7 +131,7 @@ public:
     uint64_t *d_out;
     CHECK_CUDA (cudaMalloc (&d_out, sizeof (out)));
     CHECK_CUDA (cudaMemset (d_out, 0, sizeof (out)));
-    clock_rate_kernel<<<1, 1>>> (d_out);
+    g3_probe::clock_rate_kernel<<<1, 1>>> (d_out);
     CHECK_CUDA (cudaGetLastError ());
     CHECK_CUDA (cudaDeviceSynchronize ());
     CHECK_CUDA (cudaMemcpy (out, d_out, sizeof (out), cudaMemcpyDeviceToHost));
@@ -227,9 +143,10 @@ public:
   void
   warm_up ()
   {
+    const uint8_t *anchor = mp_pool + m_opt.anchor;
     for (uint64_t i = 0; i < m_opt.warmup; i++)
-      time_pair_kernel<<<1, 2>>> (mp_pool, m_opt.anchor, m_opt.anchor,
-                                  mp_times, m_opt.modifier);
+      g3_probe::time_pair_addrs_kernel<<<1, 2>>> (anchor, anchor,
+                                                  mp_times, m_opt.modifier);
     CHECK_CUDA (cudaDeviceSynchronize ());
   }
 
@@ -237,9 +154,11 @@ public:
   std::pair<uint64_t, uint64_t>
   run_pair (uint64_t ofs_a, uint64_t ofs_b)
   {
+    const uint8_t *a = mp_pool + ofs_a;
+    const uint8_t *b = mp_pool + ofs_b;
     for (uint64_t r = 0; r < m_opt.iters; r++)
-      time_pair_kernel<<<1, 2>>> (mp_pool, ofs_a, ofs_b,
-                                  mp_times + 2 * r, m_opt.modifier);
+      g3_probe::time_pair_addrs_kernel<<<1, 2>>> (a, b,
+                                                  mp_times + 2 * r, m_opt.modifier);
     CHECK_CUDA (cudaGetLastError ());
     CHECK_CUDA (cudaDeviceSynchronize ());
     CHECK_CUDA (cudaMemcpy (m_h.data (), mp_times,

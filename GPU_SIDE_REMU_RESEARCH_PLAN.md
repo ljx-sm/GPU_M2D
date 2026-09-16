@@ -563,6 +563,10 @@ Status（2026-09-15）：S0 尽调完成——参考工具（GPUHammer/GDDRHamme
 Status（2026-09-16）：S1 标定 **PASS**（GPU0）——GDDR6X row-conflict 延迟差
 ≈39 ns（98 cyc @2520 MHz），冲突簇紧致（4.4 cyc），与 0 冲突的页内偏移与
 GA102/A6000 公开结果一致；工具 `tools/g3_probe/`。映射规则求解尚未开始。
+Status（2026-09-16）：S2 基础设施就绪——PA 标注计时池（门控 harness +
+编排器 + PA 查询选择器，复用 G2 观察器与台账校验），子进程烟囱测试通过
+（floor/baseline/conflict = 1010/1010/1122 cyc），待 sudo 观察运行产出
+`pool_map.csv` 后 S2 收口。
 
 目标：
 
