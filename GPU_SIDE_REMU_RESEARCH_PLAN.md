@@ -573,6 +573,16 @@ Status（2026-09-16）：S3 工具链就绪——`--work-mode bit-scan`（校准
 每 PA 位一组单 bit 差分对，页内 4 基页投票、页级按池覆盖到 bit 31）与
 `analyze_bit_scan.py`（low/mid/conflict 三态分类 + 逐位投票表 + constraints.csv），
 自测通过并在 S2 真实池图上干跑验证（512MiB 池 599 条查询，bit 0..28 全覆盖）。
+Status（2026-09-16）：S3 采集完成（GPU0，4GiB 池 791 条查询，788 条可用约束，
+0 非对称 0 完整性错误，幅度 124 cyc≈46 ns）。发现：页内 bit 0–9 恒 low（列/
+burst 区候选）；bit 10–20 跨基页 SPLIT 且 bit 10/11/16/19/20 出硬冲突票；
+页级 bit 21–31 每位三态混合（冲突占 13–28%，远超均匀 32 bank 的 ~3%）→ 线性
+bit-slice 映射被排除，bank 选择为非线性（行参与）哈希，且哈希支撑集覆盖整个
+可测 PA 范围。不同池区域基线差达 ~30 cyc（疑 L2 slice 邻近效应），分类余量足够。
+S3b 工具链就绪——`--work-mode pair-scan`（以 S1 冲突锚 0xd0100 做锚定单 bit
+与两位联合探测，区分列位与 bank 位；含锚有效性扫描与页级三联探测，
+真实 4GiB 池图干跑 1587 条）与 `analyze_pair_scan.py`（线性玩具解码器自测
+验证 bank_kept/bank_changed/两位抵消/锚扫描全部解释路径）。
 
 目标：
 

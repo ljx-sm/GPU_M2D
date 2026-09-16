@@ -28,6 +28,10 @@ Modes:
                 spread over the pool. Classifying each pair's timing
                 (analyze_bit_scan.py) decomposes PA bits into bank-hash /
                 row / column roles.
+  pair-scan     S3b workload: anchored and two-bit probes around the S1
+                conflict anchor (a same-bank different-row in-page mask),
+                which separates column bits from bank-hash bits that the
+                single-bit scan cannot tell apart (analyze_pair_scan.py).
 
 Run with --self-test to pin the arithmetic on a synthetic pool map.
 """
@@ -69,6 +73,19 @@ class Query:
     ofs_a: int
     chunk_b: int
     ofs_b: int
+
+
+@dataclass(frozen=True)
+class TypedQuery:
+    """One pair-scan query plus its role in the S3b matrix."""
+    query: Query
+    section: str  # calibration | anchor_base | anchored_bit | pair |
+    #             # anchor_sweep | page_triple
+    bit: int | None = None
+    bit2: int | None = None
+    base_index: int | None = None
+    sample_index: int | None = None
+    role: str | None = None  # page_triple: anchor | single | anchored
 
 
 def parse_int(value: str) -> int:
@@ -211,6 +228,26 @@ def select_single_bit_pairs(pool: PoolMap, bit: int, limit: int = 64) -> list[Qu
     return queries
 
 
+def _base_pages(pool: PoolMap, count: int) -> list[Page]:
+    """`count` base pages spread evenly over the pool's PA pages."""
+    if count <= 1:
+        return [pool.pa_pages[0]]
+    return [pool.pa_pages[min(j * (len(pool.pa_pages) - 1) // (count - 1),
+                              len(pool.pa_pages) - 1)]
+            for j in range(count)]
+
+
+def _page_partners(by_pa: dict[int, Page], mask: int, limit: int) -> list[Page]:
+    """Up to `limit` left pages whose XOR-`mask` partner is also pooled,
+    evenly spread over the available unordered pairs."""
+    partners = [pa for pa in sorted(by_pa)
+                if (pa ^ mask) in by_pa and pa < (pa ^ mask)]
+    if not partners:
+        return []
+    stride = max(1, len(partners) // limit)
+    return [by_pa[pa] for pa in partners[::stride][:limit]]
+
+
 def select_bit_scan_queries(pool: PoolMap, in_page_bases: int = 4,
                             pairs_per_bit: int = 64) -> list[Query]:
     """S3 collection workload.
@@ -236,34 +273,121 @@ def select_bit_scan_queries(pool: PoolMap, in_page_bases: int = 4,
         chunk, offset = page_offset(first, 0)
         queries.append(Query(chunk, offset, chunk, offset + candidate))
 
-    base_pages = [pool.pa_pages[min(j * (len(pool.pa_pages) - 1)
-                                     // max(1, in_page_bases - 1),
-                                     len(pool.pa_pages) - 1)]
-                  for j in range(in_page_bases)]
     for bit in range(page_size.bit_length() - 1):
         mask = 1 << bit
         if mask >= page_size:
             continue
-        for page in base_pages:
+        for page in _base_pages(pool, in_page_bases):
             chunk, offset = page_offset(page, 0)
             queries.append(Query(chunk, offset, chunk, offset + mask))
 
     by_pa = {page.fb_pa_page_base: page for page in pool.pa_pages}
     top_bit = max(by_pa).bit_length() - 1
     for bit in range(page_size.bit_length() - 1, top_bit + 1):
-        mask = 1 << bit
-        partners = [pa for pa in sorted(by_pa)
-                    if (pa ^ mask) in by_pa and pa < (pa ^ mask)]
-        if not partners:
-            continue
-        stride = max(1, len(partners) // pairs_per_bit)
-        for pa in partners[::stride][:pairs_per_bit]:
-            left_page, right_page = by_pa[pa], by_pa[pa ^ mask]
-            queries.append(Query(page_offset(left_page, 0)[0],
-                                 page_offset(left_page, 0)[1],
-                                 page_offset(right_page, 0)[0],
-                                 page_offset(right_page, 0)[1]))
+        for left in _page_partners(by_pa, 1 << bit, pairs_per_bit):
+            right = by_pa[left.fb_pa_page_base ^ (1 << bit)]
+            queries.append(Query(page_offset(left, 0)[0],
+                                 page_offset(left, 0)[1],
+                                 page_offset(right, 0)[0],
+                                 page_offset(right, 0)[1]))
     return queries
+
+
+# S3b anchor: the S1-verified in-page row-conflict offset (0xd0100).
+# Pairs differing by exactly this mask are same-bank different-row, so
+# XOR-ing it into any pair makes the row differ unconditionally.
+PAIR_SCAN_ANCHOR = S1_IN_PAGE_CANDIDATES[2]
+
+
+def plan_pair_scan_queries(pool: PoolMap, in_page_bases: int = 4,
+                           page_samples: int = 16,
+                           anchor_samples: int = 128) -> list[TypedQuery]:
+    """S3b collection plan (pair-scan workload).
+
+    The single-bit scan cannot separate a column bit (flip keeps bank and
+    row -> low) from a bank-hash bit (flip leaves the bank -> low). The
+    anchor M solves this: wherever (x, x^M) is verified same-bank, the
+    anchored probe (x, x^M^(1<<b)) conflicts exactly when flipping b kept
+    the bank, so column bits stay conflict while bank bits drop to low.
+    Section order is contractual for analyze_pair_scan.py:
+
+      calibration   ids 0..2: floor / different-bank / anchor conflict
+      anchor_base   (base, base^M) per in-page base page -- anchor validity
+      anchored_bit  (base, base^M^(1<<b)) per in-page bit x base
+      pair          (base, base^(1<<b1)^(1<<b2)) per in-page bit pair x
+                    base -- two bank bits cancel under a linear hash and
+                    the pair returns to conflict
+      anchor_sweep  (p, p^M) over evenly sampled pool pages -- where the
+                    anchor keeps the bank across the PA range
+      page_triple   per page-level bit and sampled partner x:
+                    (x, x^M) anchor validity, (x, x^(1<<b)) a fresh
+                    single-bit vote, (x, x^(1<<b)^M) the anchored vote
+    """
+    anchor = PAIR_SCAN_ANCHOR
+    low_bits = pool.pages[0].page_size.bit_length() - 1
+
+    def page_query(page: Page, low_a: int, low_b: int) -> Query:
+        offset = page.va_page_base - pool.chunk_base_va(page.chunk_index)
+        return Query(page.chunk_index, offset + low_a,
+                     page.chunk_index, offset + low_b)
+
+    plan: list[TypedQuery] = []
+    first = pool.pa_pages[0]
+    for index, candidate in enumerate(S1_IN_PAGE_CANDIDATES):
+        plan.append(TypedQuery(page_query(first, 0, candidate), "calibration",
+                               role=("floor", "baseline", "conflict")[index]))
+
+    bases = _base_pages(pool, in_page_bases)
+    for index, page in enumerate(bases):
+        plan.append(TypedQuery(page_query(page, 0, anchor), "anchor_base",
+                               base_index=index))
+    for bit in range(low_bits):
+        for index, page in enumerate(bases):
+            plan.append(TypedQuery(page_query(page, 0, anchor ^ (1 << bit)),
+                                   "anchored_bit", bit=bit, base_index=index))
+    for b1 in range(low_bits):
+        for b2 in range(b1 + 1, low_bits):
+            for index, page in enumerate(bases):
+                plan.append(TypedQuery(page_query(page, 0, (1 << b1) | (1 << b2)),
+                                       "pair", bit=b1, bit2=b2,
+                                       base_index=index))
+
+    if anchor_samples > 0:
+        step = max(1, len(pool.pa_pages) // anchor_samples)
+        for index, page in enumerate(pool.pa_pages[::step][:anchor_samples]):
+            plan.append(TypedQuery(page_query(page, 0, anchor),
+                                   "anchor_sweep", sample_index=index))
+
+    by_pa = {page.fb_pa_page_base: page for page in pool.pa_pages}
+    top_bit = max(by_pa).bit_length() - 1
+    for bit in range(low_bits, top_bit + 1):
+        for index, left in enumerate(_page_partners(by_pa, 1 << bit,
+                                                    page_samples)):
+            right = by_pa[left.fb_pa_page_base ^ (1 << bit)]
+            offset_l = left.va_page_base - pool.chunk_base_va(left.chunk_index)
+            offset_r = right.va_page_base - pool.chunk_base_va(right.chunk_index)
+            plan.append(TypedQuery(Query(left.chunk_index, offset_l,
+                                         left.chunk_index, offset_l + anchor),
+                                   "page_triple", bit=bit, sample_index=index,
+                                   role="anchor"))
+            plan.append(TypedQuery(Query(left.chunk_index, offset_l,
+                                         right.chunk_index, offset_r),
+                                   "page_triple", bit=bit, sample_index=index,
+                                   role="single"))
+            plan.append(TypedQuery(Query(left.chunk_index, offset_l,
+                                         right.chunk_index, offset_r + anchor),
+                                   "page_triple", bit=bit, sample_index=index,
+                                   role="anchored"))
+    return plan
+
+
+def select_pair_scan_queries(pool: PoolMap, in_page_bases: int = 4,
+                             page_samples: int = 16,
+                             anchor_samples: int = 128) -> list[Query]:
+    return [typed.query for typed in
+            plan_pair_scan_queries(pool, in_page_bases=in_page_bases,
+                                   page_samples=page_samples,
+                                   anchor_samples=anchor_samples)]
 
 
 def write_work_csv(path: Path | None, queries: list[Query],
@@ -365,6 +489,40 @@ def self_test() -> int:
         assert xor in (1 << 21, 1 << 22), hex(xor)
         assert query.chunk_a != query.chunk_b or query.ofs_a != query.ofs_b
 
+    # Pair-scan: calibration triple first, then the anchored sections; the
+    # anchored-bit xors carry the anchor mask, page triples come in
+    # anchor/single/anchored order with the anchor folded into the offsets.
+    plan = plan_pair_scan_queries(pool, in_page_bases=2, page_samples=2,
+                                  anchor_samples=4)
+    pscan = [typed.query for typed in plan]
+    assert pscan[:3] == sanity[:3], "pair-scan must open with the calibration triple"
+    sections = [typed.section for typed in plan]
+    assert sections.count("anchor_base") == 2
+    assert sections.count("anchored_bit") == 21 * 2
+    assert sections.count("pair") == 210 * 2
+    assert sections.count("anchor_sweep") == 4  # fixture has 4 PA pages
+    assert sections.count("page_triple") == 2 * 2 * 3  # bits 21/22, 2 partners
+    for typed in plan:
+        pa_a, pa_b = pool.query_pa(typed.query)
+        xor = pa_a ^ pa_b
+        if typed.section in ("anchor_base", "anchor_sweep"):
+            assert xor == PAIR_SCAN_ANCHOR, hex(xor)
+        elif typed.section == "anchored_bit":
+            assert xor == (PAIR_SCAN_ANCHOR ^ (1 << typed.bit)), hex(xor)
+        elif typed.section == "pair":
+            assert xor == ((1 << typed.bit) | (1 << typed.bit2)), hex(xor)
+        elif typed.section == "page_triple":
+            if typed.role == "anchor":
+                assert xor == PAIR_SCAN_ANCHOR
+            elif typed.role == "single":
+                assert xor == (1 << typed.bit)
+            else:
+                assert xor == ((1 << typed.bit) | PAIR_SCAN_ANCHOR)
+    triples = [typed for typed in plan if typed.section == "page_triple"]
+    for bit in (21, 22):
+        roles = [typed.role for typed in triples if typed.bit == bit]
+        assert roles == ["anchor", "single", "anchored"] * 2, roles
+
     print("g3_pool self-test: PASS")
     return 0
 
@@ -373,13 +531,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pool-map", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--mode", choices=("sanity", "single-bit", "bit-scan"),
+    parser.add_argument("--mode",
+                        choices=("sanity", "single-bit", "bit-scan", "pair-scan"),
                         default="sanity")
     parser.add_argument("--bit", type=int)
     parser.add_argument("--cross-page", type=int, default=8)
     parser.add_argument("--limit", type=int, default=64)
     parser.add_argument("--in-page-bases", type=int, default=4)
     parser.add_argument("--pairs-per-bit", type=int, default=64)
+    parser.add_argument("--page-samples", type=int, default=16,
+                        help="pair-scan mode: page-level partners per bit")
+    parser.add_argument("--anchor-samples", type=int, default=128,
+                        help="pair-scan mode: anchor-validity sweep pages")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -392,6 +555,10 @@ def main() -> int:
     elif args.mode == "bit-scan":
         queries = select_bit_scan_queries(pool, in_page_bases=args.in_page_bases,
                                           pairs_per_bit=args.pairs_per_bit)
+    elif args.mode == "pair-scan":
+        queries = select_pair_scan_queries(pool, in_page_bases=args.in_page_bases,
+                                           page_samples=args.page_samples,
+                                           anchor_samples=args.anchor_samples)
     else:
         if args.bit is None or not 0 <= args.bit < 40:
             parser.error("--bit must be in [0, 40)")

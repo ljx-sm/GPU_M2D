@@ -154,6 +154,35 @@ bit against the pool map, and prints the per-bit vote table (SPLIT marks
 bits whose votes disagree across bases). `constraints.csv` is the input
 for the S4 solver.
 
+## S3b pair-scan — anchored and two-bit probes
+
+The single-bit scan cannot tell a column bit (flip keeps bank and row)
+from a bank-hash bit (flip leaves the bank): both time low. S3b fixes
+this with the S1 conflict anchor `0xd0100` — an in-page mask whose pairs
+are same-bank different-row, so XOR-ing it into any pair makes the row
+differ unconditionally. Where the anchor is verified to hold at x, the
+anchored probe `(x, x^M^(1<<b))` conflicts exactly when flipping b kept
+the bank: column bits stay conflict on every base, bank bits drop to
+low, mixed votes across bases are nonlinear-hash evidence. Two-bit pairs
+`(x, x^(1<<b1)^(1<<b2))` test additivity (under a linear hash two bank
+bits cancel back to conflict).
+
+```bash
+sudo scripts/run_g2_observer_probe.sh --api g3pool --device 0 \
+    --work-mode pair-scan --chunks 512        # 4 GiB pool, ~1600 queries
+python3 tools/g3_probe/analyze_pair_scan.py \
+    artifacts/g3/pool/<run_dir>               # writes pair_constraints.csv
+```
+
+The analyzer regenerates the query plan from the run's own pool map and
+the recorded selection parameters, checks every work.csv row against it,
+then prints: the per-in-page-bit anchored vote table
+(bank_kept/bank_changed — the column-vs-bank split), the two-bit pair
+class summary, the anchor sweep coverage (where `0xd0100` keeps the bank
+across the PA range — seed structure), and per page-level bit the
+anchored votes plus fresh single-bit votes (a stability check on S3
+without a separate run).
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the
