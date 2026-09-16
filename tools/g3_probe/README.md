@@ -103,6 +103,30 @@ Standalone smoke (no observer, no sudo — manual gate/release files) passed
 on GPU 0 (2026-09-16): floor/baseline/in-page-conflict = 1010/1010/1122
 cycles, cross-chunk pairs 1017/1035, 2520.3 MHz — consistent with S1.
 
+## S2 result on GPU 0 (2026-09-16)
+
+Gate **S2: PASS** (`artifacts/g3/pool/run_pool_gpu0_1789545813750322478`,
+64 chunks x 8 MiB, status `G3_POOL_PA_MAP_COMPLETE_OBSERVED`, 0 lost
+events, 0 failures):
+
+- `pool_map.csv`: 256 pages, every one valid local-VIDEO, gapless tiling
+  per chunk; all 256 framebuffer PAs distinct, forming one **fully
+  contiguous 512 MiB PA block** (0x1ee00000..0x3ec00000, every sorted
+  step exactly 2 MiB).
+- Within every chunk the 4 pages are PA-contiguous, and chunk PA bases
+  step exactly 8 MiB in **allocation order** — but chunk **VA** order is
+  scrambled (cudaMalloc hands out VAs unordered), so VA→PA is *not*
+  monotone: observed PTEs are mandatory, VA arithmetic would mislabel
+  pages. This is the premise S3 relies on.
+- Timing (min over 10 launches, `.volatile`, 2675.7 MHz): floor 1023 /
+  different-bank baseline 1014 / in-page row-conflict 1140 cyc — conflict
+  amplitude 126 cyc ≈ 47 ns, consistent with S1's 39 ns at a lower boost
+  clock; the in-page conflict offset is again 852224 (0xd0100).
+- All 7 cross-page pairs (PA deltas 72–510 MiB) land at 1038–1098 cyc,
+  between baseline and conflict — a spread of regimes exactly as
+  expected when PA-distant pages sometimes share a bank. These are
+  sanity/informational numbers; systematic collection is S3.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the
