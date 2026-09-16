@@ -1,6 +1,6 @@
 # G3 Probe — S1 timing-channel calibration
 
-Implements step S1 of the G3 plan (`G3_PA→GDDR_PLAN.md`): prove that the
+Implements step S1 of the G3 plan (`G3_PA_TO_GDDR_PLAN.md`): prove that the
 row-buffer hit / different-bank / row-conflict latency regimes are
 statistically separable on this GPU, before any address-mapping collection
 starts. The method and its provenance are cataloged in

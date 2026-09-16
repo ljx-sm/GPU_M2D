@@ -1,7 +1,7 @@
 # G3 Survey — Prior Art and Platform Facts (S0)
 
 Status: **complete** on 2026-09-15. This is the S0 deliverable of the G3
-execution plan (`G3_PA→GDDR_PLAN.md`): what the open timing-side-channel
+execution plan (`G3_PA_TO_GDDR_PLAN.md`): what the open timing-side-channel
 tooling actually contains, which techniques we port into our own probe, the
 verified platform facts about RTX 4090 / GDDR6X, and the unknowns that S1+
 must measure. Nothing here claims a mapping rule; every rule must come from
