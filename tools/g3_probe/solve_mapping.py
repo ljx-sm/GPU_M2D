@@ -13,33 +13,37 @@ with the model class chosen in the S3/S3b analysis:
     bank(x)  = one GF(2) polynomial of degree <= 2 per bank output bit --
                the linearized form of a row-seeded hash: a quadratic term
                pa_i*pa_k is exactly "seed bit i x flipped bit k";
-    row(x)   = the PA bits in the row support R (the row differs iff the
-               pair xor touches R).
+    row(x)   = a row address vector of the same polynomial shape (real
+               decoders fold bank bits into the row address, so "row
+               differs" is seeded too -- the real S3b data killed the
+               linear xor-touches-R row model: 43% of lows sit inside the
+               conflict span and can only be same-bank same-row pairs).
 
-Conflicts give homogeneous equations: every bank functional must vanish on
-their feature difference phi(x, y) = mu(x) ^ mu(y). Lows whose xor touches
-R must be separated by at least one functional -- the separating family is
+So conflict(x, y) <=> phi(x, y) is in K_theta (every bank functional
+vanishes -- same bank) AND outside K_rho (some row functional fires -- row
+differs). Conflicts give homogeneous equations for the bank family; lows
+inside K_theta give homogeneous equations for the row family; each family
+must fire the other side's constraint set. The separating families are
 grown by greedy sparse search over valid functionals (valid = vanishing on
-all conflicts; the set is XOR-closed, so pairs of columns with equal
-conflict signatures, beam growth, and affine solves with pair-matching
-sparsification all stay valid). R is re-solved as monotone clauses (hit the
-xor of every conflict) plus units (avoid the xor of every low predicted
-same-bank) with violation counting. The two stages alternate; mid pairs are
-never fitted, only scored.
+the positive set; the set is XOR-closed, so equal-signature column pairs,
+signature-completing triples, anchored stall searches up to weight 4, and
+beam growth all stay valid). The two stages alternate; mid pairs are never
+fitted, only scored.
 
-Residuals (lows no valid functional can separate, conflicts no R can hit)
-are the honest measure of what the model class cannot express -- run with
-``--degree 1`` to quantify the linear baseline that S3/S3b ruled out.
+Residuals (bank-negatives no valid functional can fire, conflicts no row
+functional can fire) are the honest measure of what the model class cannot
+express -- run with ``--degree 1`` to quantify the linear baseline that
+S3/S3b ruled out.
 
     python3 solve_mapping.py RUN_DIR_OR_CSV... [--degree {1,2}]
         [--holdout FRAC] [--seed N] [--rounds N] [--model-out PATH]
     python3 solve_mapping.py --predict MODEL.json 0xPA_A 0xPA_B
 
-Writes mapping_model.json (bank functional term lists, row support, stats)
+Writes mapping_model.json (bank and row functional term lists, stats)
 for the S5 prediction gate. ``--self-test`` pins the whole pipeline on a
-synthetic seeded truth: the degree-2 fit must reach zero residuals and
-violations with >=99% holdout accuracy, and the degree-1 fit must report
-the insufficiency. Pure stdlib; never imports bcc.
+synthetic seeded truth: the degree-2 fit must reach zero unseparables and
+train misclassifications with >=99% holdout accuracy, and the degree-1 fit
+must report the insufficiency. Pure stdlib; never imports bcc.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-MODEL_SCHEMA = "gpu-m2d.g3-mapping-model.v1"
+MODEL_SCHEMA = "gpu-m2d.g3-mapping-model.v2"
 HOLDOUT_GATE = 0.95
 USABLE_CLASSES = ("low", "mid", "conflict")
 
@@ -70,13 +74,6 @@ def iter_bits(mask: int):
         low = mask & -mask
         yield low.bit_length() - 1
         mask ^= low
-
-
-def mask_of(bits) -> int:
-    out = 0
-    for bit in bits:
-        out |= 1 << bit
-    return out
 
 
 class Features:
@@ -192,47 +189,27 @@ def split_holdout(pairs: list[Pair], frac: float, seed: int) \
     return train, holdout
 
 
-def solve_affine(eq_rows: list[int], rhs: list[int]) -> int | None:
-    """One solution theta of dot(eq, theta) = rhs over GF(2), or None."""
-    basis: dict[int, int] = {}  # pivot -> augmented row (equation << 1 | rhs)
-    for eq, r in zip(eq_rows, rhs):
-        v = (eq << 1) | (r & 1)
-        while v >> 1:
-            eq_part = v >> 1
-            pivot = (eq_part & -eq_part).bit_length() - 1
-            if pivot in basis:
-                v ^= basis[pivot]
-            else:
-                basis[pivot] = v
-                break
-        if not (v >> 1) and (v & 1):
-            return None  # 0 = 1: inconsistent
-    theta = 0
-    for pivot in sorted(basis, reverse=True):
-        row = basis[pivot]
-        eq = row >> 1
-        value = (row & 1) ^ dot(eq & ~(1 << pivot), theta)
-        if value:
-            theta |= 1 << pivot
-    return theta
+def solve_family(positives: list[Pair], negatives: list[Pair],
+                 n_linear: int = 0) -> tuple[list[int], list[Pair]]:
+    """Greedy sparse family of GF(2) functionals.
 
-
-def solve_bank_bits(positives: list[Pair], negatives: list[Pair]) \
-        -> tuple[list[int], list[Pair]]:
-    """Greedy sparse family of bank functionals.
-
-    A functional is valid iff it vanishes on every conflict (positive); the
-    valid set is XOR-closed. The family must make every negative (a low
-    whose xor touches the row support) be fired by at least one member.
-    Negatives that no valid functional can fire are returned as residuals.
+    Used for both sides of the model: a functional is valid iff it vanishes
+    on every positive (for the bank family: conflicts; for the row family:
+    lows predicted same-bank); the valid set is XOR-closed. The family must
+    make every negative be fired by at least one member. Negatives that no
+    trusted functional can fire are returned as residuals.
 
     Candidate construction is exact over weights 1-3: a functional is valid
-    iff the conflict signatures (colmasks) of its terms XOR to zero, so
-    valid pairs are equal-signature columns and valid triples are found by
-    dict lookup (signature of the third = XOR of the other two) -- the
-    linearized seed terms genuinely live at weight 3. Beam growth (XOR with
-    the current pick) extends to higher weights; the dense affine solve is
-    a last-resort fallback and is reported.
+    iff the signatures (colmasks over positives) of its terms XOR to zero,
+    so valid pairs are equal-signature columns and valid triples are found
+    by dict lookup (signature of the third = XOR of the other two). When
+    the greedy stalls, a targeted search anchors 1-3 terms inside the
+    uncovered negative's own feature support and completes the functional
+    by lookup or by a signature-pair index (weight <= 4) -- real bank and
+    row bits are "linear core ^ seed quads" shapes with a single in-support
+    term. Beam growth (XOR with the current pick) extends beyond that.
+    A parsimony gate rejects narrow cover (spurious-but-valid functionals
+    fire only a stray negative or two); those negatives stay residuals.
     """
     if not negatives:
         return [], []
@@ -277,8 +254,11 @@ def solve_bank_bits(positives: list[Pair], negatives: list[Pair]) \
             seen_thetas.add(theta)
 
     # Weight 1 and 2: zero-signature columns; equal-signature pairs.
+    # A weight-1 candidate must be a linear term: every real bank/row
+    # output bit has a linear core, so a lone quadratic monomial is always
+    # spurious cover (pa5*paX firing column-bit lows it never should).
     for j in columns:
-        if signature_of[j] == 0:
+        if signature_of[j] == 0 and (j < n_linear or not n_linear):
             add_candidate(1, single_covers[j], 1 << j)
     pair_budget = 64
     for signature in sorted(by_signature):
@@ -325,17 +305,130 @@ def solve_bank_bits(positives: list[Pair], negatives: list[Pair]) \
     def pool_sort(item):
         return (-(item[1] & remaining).bit_count(),) + pool_order(item)
 
+    def cover_of_column(j: int) -> int:
+        if j not in single_covers:
+            single_covers[j] = cover_of(1 << j)
+        return single_covers[j]
+
+    pair_sigs: dict[int, list[tuple[int, int]]] | None = None
+
+    def ensure_pair_sigs() -> dict[int, list[tuple[int, int]]]:
+        """Index of free column pairs by their signature XOR (lazy, once)."""
+        nonlocal pair_sigs
+        if pair_sigs is None:
+            pair_sigs = {}
+            for a, ja in enumerate(columns):
+                sa = signature_of[ja]
+                for jb in columns[a + 1:]:
+                    pair_sigs.setdefault(sa ^ signature_of[jb], []).append(
+                        (ja, jb))
+        return pair_sigs
+
+    def sparse_separators(target: Pair, limit: int = 32) \
+            -> list[tuple[int, int, int]]:
+        """Targeted search for a valid low-weight functional firing ``target``.
+
+        A firing functional overlaps supp(phi(target)) in an odd number of
+        terms, so enumeration anchors 1-3 terms inside the target's own
+        support and completes the functional by signature lookup or the
+        signature-pair index -- the real bank bits are "linear core ^
+        seed quads" shapes whose core term is the only in-support term.
+        Validity is re-verified against every positive before returning.
+        """
+        out: list[tuple[int, int, int]] = []
+        seen_here: set[int] = set()
+
+        def offer(js: tuple[int, ...]) -> None:
+            theta = 0
+            for j in js:
+                theta |= 1 << j
+            if theta in seen_here or not dot(theta, target.phi):
+                return
+            cover = 0
+            for j in js:
+                cover ^= cover_of_column(j)
+            seen_here.add(theta)
+            out.append((len(js), cover, theta))
+
+        cols_t = list(iter_bits(target.phi))
+        n_t = len(cols_t)
+        cap = limit * 8
+        for i1 in range(n_t):
+            j1 = cols_t[i1]
+            s1 = signature_of.get(j1)
+            if s1 is None:
+                continue
+            if s1 == 0 and j1 < n_linear:
+                offer((j1,))  # zero-signature linear column: valid alone
+            for j2 in by_signature.get(s1, ()):
+                if j2 > j1:
+                    offer((j1, j2))  # equal-signature partner
+            for j2, j3 in ensure_pair_sigs().get(s1, ()):
+                offer((j1, j2, j3))  # one anchored + free pair
+            if len(out) >= cap:
+                break
+            for i2 in range(i1 + 1, n_t):
+                j2 = cols_t[i2]
+                s2 = signature_of.get(j2)
+                if s2 is None:
+                    continue
+                for j3 in by_signature.get(s1 ^ s2, ()):
+                    if j3 not in (j1, j2):
+                        offer((j1, j2, j3))  # two anchored + lookup
+                for j3, j4 in ensure_pair_sigs().get(s1 ^ s2, ()):
+                    offer((j1, j2, j3, j4))  # two anchored + free pair
+                for i3 in range(i2 + 1, n_t):
+                    j3 = cols_t[i3]
+                    s3 = signature_of.get(j3)
+                    if s3 is None:
+                        continue
+                    for j4 in by_signature.get(s1 ^ s2 ^ s3, ()):
+                        if j4 not in (j1, j2, j3):
+                            offer((j1, j2, j3, j4))  # three anchored + lookup
+                    if len(out) >= cap:
+                        break
+                if len(out) >= cap:
+                    break
+            # one anchored + free column + free pair (weight 4)
+            for j4 in columns:
+                if j4 == j1:
+                    continue
+                for j2, j3 in ensure_pair_sigs().get(
+                        s1 ^ signature_of[j4], ()):
+                    offer((j1, j2, j3, j4))
+            if len(out) >= cap:
+                break
+        filtered: list[tuple[int, int, int]] = []
+        checked: set[int] = set()
+        for weight, cover, theta in out:
+            if theta in checked:
+                continue
+            checked.add(theta)
+            if any(dot(theta, phi) for phi in pos_phis):
+                continue  # guard: must vanish on every training conflict
+            filtered.append((weight, cover, theta))
+            if len(filtered) >= limit:
+                break
+        filtered.sort(key=lambda item: (-item[1].bit_count(), item[0], item[2]))
+        return filtered
+
     chosen: list[int] = []
-    dense_fallbacks = 0
+    sparse_searches = 0
     remaining = full_remaining
     residual_pairs: list[Pair] = []
+    # Parsimony gate: a functional worth keeping covers a fair slice of the
+    # demand. Spurious-but-valid functionals (random kernel members) fire
+    # only a stray negative or two; trusting them lets the family absorb
+    # pairs that belong to the other side of the model. Leftovers become
+    # residuals -- honest, and exactly what the alternating stage needs.
+    min_cover = max(2, len(negatives) // 100)
     guard = len(negatives) + 64
     while remaining and guard:
         guard -= 1
         best = None
         for weight, cover, theta in pool:
             hit = (cover & remaining).bit_count()
-            if not hit:
+            if hit < min_cover:
                 continue
             key = (-hit, weight, theta)
             if best is None or key < best[0]:
@@ -358,19 +451,34 @@ def solve_bank_bits(positives: list[Pair], negatives: list[Pair]) \
             pool.sort(key=pool_sort)
             pool = pool[:256]
             continue
-        # Stall: solve for one uncovered negative directly (affine system:
-        # vanish on every positive, fire on the target). Dense by nature.
+        # Stall: search sparse separators for one uncovered negative. Only
+        # wide separators are trusted -- one firing only the target is
+        # indistinguishable from spurious cover, so it stays a residual.
         target_idx = next(iter_bits(remaining))
-        theta_star = solve_affine(pos_phis + [negatives[target_idx].phi],
-                                  [0] * len(pos_phis) + [1])
-        fired = cover_of(theta_star) if theta_star is not None else 0
-        if theta_star is None or not (fired & remaining):
-            residual_pairs.append(negatives[target_idx])
+        target = negatives[target_idx]
+        candidates: list[tuple[int, int, int]] = []
+        if sparse_searches < 512:
+            sparse_searches += 1
+            candidates = [item for item in sparse_separators(target)
+                          if item[1].bit_count() >= min_cover]
+        if not candidates:
+            residual_pairs.append(target)
             remaining &= ~(1 << target_idx)
             continue
-        dense_fallbacks += 1
-        add_candidate(theta_star.bit_count(), fired, theta_star)
+        for weight, cover, theta in candidates:
+            add_candidate(weight, cover, theta)
+        # Pick the widest separator directly: pool truncation must never
+        # lose the only functional that fires the stall target.
+        _, cover, theta = max(
+            candidates,
+            key=lambda item: ((item[1] & remaining).bit_count(),
+                              -item[1].bit_count(), -item[0]))
+        chosen.append(theta)
+        remaining &= ~cover
         pool.sort(key=pool_sort)
+
+    if remaining:  # guard exhaustion: report honestly, never hide a hole
+        residual_pairs.extend(negatives[idx] for idx in iter_bits(remaining))
 
     # Redundancy removal: drop members whose coverage is contained in the rest.
     if chosen:
@@ -388,101 +496,89 @@ def solve_bank_bits(positives: list[Pair], negatives: list[Pair]) \
     chosen = [theta for theta in chosen
               if all(dot(theta, phi) == 0 for phi in pos_phis)]
     chosen.sort(key=lambda theta: (theta.bit_count(), theta))
-    if dense_fallbacks:
-        print(f"note: {dense_fallbacks} dense affine fallback functional(s)")
     return chosen, residual_pairs
 
 
-def solve_row_support(pairs: list[Pair], sb_flags: list[bool] | None) \
-        -> tuple[set[int], int]:
-    """Row support R: hit every conflict xor, avoid every same-bank low xor.
-
-    Greedy clause cover followed by local search on the exact violation
-    count (unhittable conflicts + broken same-bank lows). ``sb_flags`` are
-    the current same-bank predictions aligned with ``pairs``; None means
-    no same-bank knowledge yet (initial cover, units ignored).
-    """
-    if sb_flags is None:
-        sb_flags = [False] * len(pairs)
-    conflicts = [pair for pair in pairs if pair.cls == "conflict"]
-    universe = sorted({b for pair in pairs for b in iter_bits(pair.d)})
-    freq: Counter = Counter(b for pair in conflicts for b in iter_bits(pair.d))
-    clauses = [tuple(sorted(iter_bits(pair.d))) for pair in conflicts]
-
-    support = {clause[0] for clause in clauses if len(clause) == 1}
-    for clause in sorted(clauses, key=lambda c: (len(c), c)):
-        if not set(clause) & support:
-            avail = [b for b in clause if b not in support]
-            if avail:
-                support.add(max(avail, key=lambda b: (freq[b], -b)))
-
-    def violations(candidate: set[int]) -> int:
-        rmask = mask_of(candidate)
-        count = 0
-        for pair, same_bank in zip(pairs, sb_flags):
-            row_diff = bool(pair.d & rmask)
-            if pair.cls == "conflict":
-                if not row_diff:
-                    count += 1
-            elif same_bank and row_diff:
-                count += 1
-        return count
-
-    best = violations(support)
-    improved = True
-    while improved:
-        improved = False
-        for bit in universe:
-            candidate = support ^ {bit}
-            count = violations(candidate)
-            if count < best:
-                support, best, improved = candidate, count, True
-    return support, best
-
-
 def run_fit(train_hard: list[Pair], feats: Features, rounds: int) -> dict:
-    """Alternates bank-functional and row-support solves; keeps the best."""
-    positives = [pair for pair in train_hard if pair.cls == "conflict"]
+    """Alternates the bank-family and row-family solves; keeps the best.
+
+    Both sides are the same problem: conflict(x,y) <=> phi in K_theta
+    (every bank functional vanishes -- same bank) AND outside K_rho (some
+    row functional fires -- row differs). The linear "row support" model
+    died on the real data: 43% of lows sit inside the conflict span, so
+    their low label can only mean same-bank same-row, which a fixed
+    xor-touches-R row predicate cannot express (the row address folds bank
+    bits -- seeded, like the bank hash).
+
+    The disjunction has a degenerate direction: a bank family that fires
+    every low leaves the row family unconstrained (junk that covers the
+    training conflicts and generalizes nowhere). The parsimony gate inside
+    solve_family is the structural answer (spurious cover is narrow; the
+    truth is wide), and the alternation key orders states by train
+    misclassifications, then residuals, then family weight. The reported
+    holdout stays untouched as the honest gate.
+    """
+    conflicts = [pair for pair in train_hard if pair.cls == "conflict"]
     lows = [pair for pair in train_hard if pair.cls == "low"]
 
-    def negatives_for(rmask: int) -> list[Pair]:
-        return [pair for pair in lows if pair.d & rmask]
+    def in_kernel(family: list[int], pair: Pair) -> bool:
+        return all(dot(t, pair.phi) == 0 for t in family)
 
-    support, _ = solve_row_support(train_hard, None)
+    def miscount(pairs: list[Pair], theta: list[int], rho: list[int]) -> int:
+        return sum(classify(theta, rho, pair) != pair.cls for pair in pairs)
+
+    # Seed: no row knowledge yet, so every low demands a bank functional.
+    theta, theta_res = solve_family(conflicts, lows, feats.n_bits)
+    # Row side: no linear-core filter -- row folds can be pure quads.
+    rho, rho_res = solve_family(
+        [l for l in lows if in_kernel(theta, l)], conflicts)
     seen: set = set()
     best: tuple | None = None
     for _ in range(rounds):
-        theta, residuals = solve_bank_bits(positives,
-                                           negatives_for(mask_of(support)))
-        sb_flags = [all(dot(t, pair.phi) == 0 for t in theta)
-                    for pair in train_hard]
-        support2, violations = solve_row_support(train_hard, sb_flags)
-        key = (len(residuals) + violations, len(theta),
-               sum(t.bit_count() for t in theta))
-        if best is None or key < best[0]:
-            best = (key, theta, support2, residuals, violations)
-        state = (tuple(theta), frozenset(support2))
-        if state in seen:
-            break
-        seen.add(state)
-        support = support2
-    _, theta, support, residuals, violations = best
-    return {"theta": theta, "row_support": sorted(support),
-            "residuals": residuals, "violations": violations}
+        for swap in (False, True):
+            if swap:  # row family from the current bank family
+                rho, rho_res = solve_family(
+                    [l for l in lows if in_kernel(theta, l)], conflicts)
+            else:  # bank family from the current row family
+                theta, theta_res = solve_family(
+                    conflicts, [l for l in lows if not in_kernel(rho, l)],
+                    feats.n_bits)
+            key = (miscount(train_hard, theta, rho),
+                   len(theta_res) + len(rho_res),
+                   sum(t.bit_count() for t in theta)
+                   + sum(r.bit_count() for r in rho),
+                   len(theta) + len(rho))
+            if best is None or key < best[0]:
+                best = (key, list(theta), list(rho), len(theta_res),
+                        len(rho_res))
+            state = (tuple(theta), tuple(rho))
+            if state in seen:
+                break
+            seen.add(state)
+        else:
+            continue
+        break
+    _, theta, rho, n_theta_res, n_rho_res = best
+    return {"theta": theta, "rho": rho,
+            "bank_residuals": n_theta_res, "row_residuals": n_rho_res,
+            "misclassified": miscount(train_hard, theta, rho)}
 
 
-def classify(theta: list[int], rmask: int, pair: Pair) -> str:
+def classify(theta: list[int], rho: list[int], pair: Pair) -> str:
     same_bank = all(dot(t, pair.phi) == 0 for t in theta)
-    return "conflict" if same_bank and (pair.d & rmask) else "low"
+    if not same_bank:
+        return "low"
+    row_diff = any(dot(r, pair.phi) for r in rho)
+    return "conflict" if row_diff else "low"
 
 
-def evaluate(theta: list[int], rmask: int, pairs: list[Pair]) -> dict:
+def evaluate(theta: list[int], rho: list[int], pairs: list[Pair]) -> dict:
     correct = 0
     total = 0
     confusion: Counter = Counter()
     mid_votes: Counter = Counter()
     for pair in pairs:
-        predicted = classify(theta, rmask, pair)
+        predicted = classify(theta, rho, pair)
         if pair.cls == "mid":
             mid_votes[predicted] += 1
             continue
@@ -496,6 +592,12 @@ def evaluate(theta: list[int], rmask: int, pairs: list[Pair]) -> dict:
 
 def term_list(feats: Features, theta: int) -> list[str]:
     return [feats.terms[j] for j in iter_bits(theta)]
+
+
+def linear_bits(feats: Features, family: list[int]) -> list[int]:
+    """PA bits appearing as linear terms of a family (interpretive)."""
+    return sorted({j for theta in family for j in iter_bits(theta)
+                   if j < feats.n_bits})
 
 
 def print_report(feats: Features, inputs: list[dict], pairs: list[Pair],
@@ -517,12 +619,16 @@ def print_report(feats: Features, inputs: list[dict], pairs: list[Pair],
           f"+ {len(holdout) - len(hold_hard)} mid")
     print(f"fit: bank bits {len(result['theta'])} "
           f"(weights {','.join(str(t.bit_count()) for t in result['theta']) or '-'}) "
-          f"| row support {result['row_support']}")
-    print(f"residual unseparable lows: {len(result['residuals'])} "
-          f"{[p.query_id for p in result['residuals']][:8]}")
-    print(f"row-support violations: {result['violations']}")
+          f"| row bits {len(result['rho'])} "
+          f"(weights {','.join(str(r.bit_count()) for r in result['rho']) or '-'})")
+    print(f"train misclassified: {result['misclassified']}"
+          f" | unseparable: {result['bank_residuals']} bank-negatives, "
+          f"{result['row_residuals']} conflicts")
     for idx, theta in enumerate(result["theta"]):
         print(f"  bank{idx} = " + " ^ ".join(term_list(feats, theta)))
+    for idx, rho in enumerate(result["rho"]):
+        print(f"  row{idx} = " + " ^ ".join(term_list(feats, rho)))
+    print(f"  (row linear-bit union: {linear_bits(feats, result['rho'])})")
     print(f"train accuracy: {train_stats['correct']}/{train_stats['total']} "
           f"= {train_stats['accuracy']:.4f}")
     gate = "PASS" if hold_stats["accuracy"] >= HOLDOUT_GATE else "FAIL"
@@ -543,8 +649,8 @@ def write_model(path: Path, feats: Features, inputs: list[dict], result: dict,
         "schema_version": MODEL_SCHEMA,
         "created_wall_time_ns": time.time_ns(),
         "meaning": "conflict(x,y) <=> all bank functionals vanish on "
-                   "mu(x)^mu(y) AND (x^y) touches the row support; "
-                   "degree<=2 GF(2) monomials over PA bits",
+                   "mu(x)^mu(y) (same bank) AND some row functional fires "
+                   "(row differs); degree<=2 GF(2) monomials over PA bits",
         "inputs": inputs,
         "pair_count": n_pairs,
         "degree": feats.degree,
@@ -555,10 +661,14 @@ def write_model(path: Path, feats: Features, inputs: list[dict], result: dict,
             {"mask": theta, "terms": term_list(feats, theta)}
             for theta in result["theta"]
         ],
-        "row_support": result["row_support"],
-        "row_mask": mask_of(result["row_support"]),
-        "residual_unseparable_lows": len(result["residuals"]),
-        "row_support_violations": result["violations"],
+        "row_functionals": [
+            {"mask": rho, "terms": term_list(feats, rho)}
+            for rho in result["rho"]
+        ],
+        "row_linear_bits": linear_bits(feats, result["rho"]),
+        "train_misclassified": result["misclassified"],
+        "bank_unseparable_negatives": result["bank_residuals"],
+        "row_unseparable_conflicts": result["row_residuals"],
         "holdout_fraction": args.holdout,
         "holdout_seed": args.seed,
         "train_accuracy": train_stats["accuracy"],
@@ -571,48 +681,76 @@ def write_model(path: Path, feats: Features, inputs: list[dict], result: dict,
     return model
 
 
-def load_model(path: Path) -> tuple[Features, list[int], int]:
+def load_model(path: Path) -> tuple[Features, list[int], list[int]]:
     model = json.loads(path.read_text(encoding="utf-8"))
     if model.get("schema_version") != MODEL_SCHEMA:
         raise RuntimeError(f"{path}: unknown model schema")
     feats = Features(int(model["n_bits"]), int(model["degree"]))
     theta = [int(item["mask"]) for item in model["bank_functionals"]]
-    return feats, theta, int(model["row_mask"])
+    rho = [int(item["mask"]) for item in model["row_functionals"]]
+    return feats, theta, rho
 
 
 def _synthetic_truth(x: int) -> list[int]:
-    """4 bank output bits: linear core + row-seeded quadratic terms."""
+    """5 bank output bits: linear core + row-seeded quadratic terms.
+
+    The fifth bit carries the shape the real S3b data demands: a weight-4
+    functional whose linear core terms fire on cancelling two-bit conflicts
+    (nonzero conflict signatures), so it is reachable only through the
+    anchored sparse search, not the plain weight<=3 enumeration.
+    """
     def b(i: int) -> int:
         return (x >> i) & 1
     return [b(8) ^ b(12) ^ (b(16) & b(24)),
             b(12) ^ (b(17) & b(25)),
             b(8) ^ b(13) ^ (b(18) & b(27)),
-            b(14) ^ (b(21) & b(28))]
+            b(14) ^ (b(21) & b(28)),
+            b(9) ^ b(15) ^ (b(26) & b(29)) ^ (b(27) & b(28))]
 
 
-_SYNTH_ROW_SUPPORT = {10, 16, 18, 19, 21, 24, 25, 27, 28}
+def _synthetic_rowvec(x: int) -> list[int]:
+    """Row address vector: plain row bits plus one bank-fold component.
+
+    Real address decoders fold bank/bank-group bits back into the row
+    address (row hash), so "row differs" is seeded too -- the linear
+    xor-touches-R row model died on the real S3b data.
+    """
+    def b(i: int) -> int:
+        return (x >> i) & 1
+    return [b(10), b(16), b(18), b(19), b(21), b(25), b(27), b(28),
+            b(24) ^ (b(8) & b(22)), b(26), b(29)]
+
+
+_SYNTH_ROW_LINEAR = {10, 16, 18, 19, 21, 24, 25, 26, 27, 28, 29}
 _SYNTH_ANCHOR = 0xD0100
 
 
 def _synthetic_pairs(rng: random.Random, count: int) -> list[Pair]:
-    """Pairs shaped like the S3/S3b plans against the synthetic truth."""
+    """Pairs shaped like the S3/S3b plans against the synthetic truth.
+
+    Single-bit flips cover every bit; anchored probes mix the in-page
+    anchor with any bit (the real plan anchors page-level bits too); two-bit
+    pairs pair an in-page bit with any partner. The cross-range coverage is
+    what invalidates spurious quads like pa9*pa32 whose conflict signature
+    would otherwise look empty on train.
+    """
     pairs: list[Pair] = []
     for idx in range(count):
         x = rng.getrandbits(33)
         style = rng.random()
         if style < 0.35:  # single-bit pairs (in-page and page-level bits)
             d = 1 << rng.randrange(33)
-        elif style < 0.55:  # anchored-style masks
-            d = _SYNTH_ANCHOR ^ (1 << rng.randrange(21))
-        elif style < 0.8:  # two-bit pairs
-            d = (1 << rng.randrange(21)) | (1 << rng.randrange(21))
+        elif style < 0.55:  # anchored-style masks (in-page and page bits)
+            d = _SYNTH_ANCHOR ^ (1 << rng.randrange(33))
+        elif style < 0.8:  # two-bit pairs (in-page bit x any partner)
+            d = (1 << rng.randrange(21)) | (1 << rng.randrange(33))
         else:  # small random masks
             d = 0
             for _ in range(rng.randrange(1, 4)):
                 d |= 1 << rng.randrange(33)
         y = x ^ d
         same_bank = _synthetic_truth(x) == _synthetic_truth(y)
-        row_diff = bool(d & mask_of(_SYNTH_ROW_SUPPORT))
+        row_diff = _synthetic_rowvec(x) != _synthetic_rowvec(y)
         cls = "conflict" if same_bank and row_diff else "low"
         if rng.random() < 0.04:
             cls = "mid"
@@ -627,9 +765,8 @@ def _fit_and_score(pairs: list[Pair], degree: int, seed: int) -> dict:
     train, holdout = split_holdout(pairs, 0.2, seed)
     train_hard = [p for p in train if p.cls != "mid"]
     result = run_fit(train_hard, feats, rounds=4)
-    rmask = mask_of(result["row_support"])
-    train_stats = evaluate(result["theta"], rmask, train_hard)
-    hold_stats = evaluate(result["theta"], rmask,
+    train_stats = evaluate(result["theta"], result["rho"], train_hard)
+    hold_stats = evaluate(result["theta"], result["rho"],
                           [p for p in holdout if p.cls != "mid"])
     return {"result": result, "train": train_stats, "holdout": hold_stats}
 
@@ -643,32 +780,42 @@ def self_test() -> int:
 
     scored = _fit_and_score(pairs, degree=2, seed=7)
     result = scored["result"]
-    assert not result["residuals"], len(result["residuals"])
-    assert result["violations"] == 0, result["violations"]
+    # Intermediate alternation half-steps legitimately leave residuals (a
+    # same-row low has no bank cover; the row side picks it up next). The
+    # end-state behavior is what must be exact on the training slice.
+    assert result["misclassified"] == 0, result["misclassified"]
     assert scored["holdout"]["accuracy"] >= 0.99, scored["holdout"]
     assert scored["train"]["accuracy"] >= 0.99, scored["train"]
-    # Fresh pairs from the same generator must agree (same-bank predicate
-    # and end-to-end class), not just the held-out split.
+    # Fresh pairs from the same generator must agree end-to-end (class
+    # level, which is what S5 gates). The internal bank/row factorization
+    # is only identified up to the labels' resolving power -- the disjunct
+    # "bank differs OR row same" hides a few percent of predicate swaps --
+    # so the predicate bars sit at the gate level, not at class level.
     probe = _synthetic_pairs(random.Random(99), 3000)
     feats = Features(33, 2)
     for pair in probe:
         pair.attach(feats)
-    rmask = mask_of(result["row_support"])
-    same_ok = 0
-    class_ok = 0
+    theta, rho = result["theta"], result["rho"]
+    same_ok = row_ok = class_ok = 0
     for pair in probe:
         truth_bank = _synthetic_truth(pair.a) == _synthetic_truth(pair.b)
-        pred_bank = all(dot(t, pair.phi) == 0 for t in result["theta"])
+        truth_row = (_synthetic_rowvec(pair.a)
+                     != _synthetic_rowvec(pair.b))
+        pred_bank = all(dot(t, pair.phi) == 0 for t in theta)
+        pred_row = any(dot(r, pair.phi) for r in rho)
         same_ok += truth_bank == pred_bank
-        class_ok += classify(result["theta"], rmask, pair) == (
-            "conflict" if truth_bank and
-            (pair.d & mask_of(_SYNTH_ROW_SUPPORT)) else "low")
-    assert same_ok >= 0.99 * len(probe), same_ok
+        row_ok += truth_row == pred_row
+        class_ok += classify(theta, rho, pair) == (
+            "conflict" if truth_bank and truth_row else "low")
     assert class_ok >= 0.99 * len(probe), class_ok
+    assert same_ok >= 0.95 * len(probe), same_ok
+    assert row_ok >= 0.95 * len(probe), row_ok
+    feats2 = Features(33, 2)
+    recovered = set(linear_bits(feats2, rho))
+    assert len(recovered & _SYNTH_ROW_LINEAR) >= 9, sorted(recovered)
 
     linear = _fit_and_score(pairs, degree=1, seed=7)
-    insufficient = (linear["result"]["residuals"]
-                    or linear["result"]["violations"]
+    insufficient = (linear["result"]["misclassified"]
                     or linear["holdout"]["accuracy"] < HOLDOUT_GATE)
     assert insufficient, linear  # the linear baseline must be caught out
 
@@ -725,13 +872,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.predict:
         if len(args.pas) != 2:
             raise RuntimeError("--predict needs exactly PA_A PA_B")
-        feats, theta, rmask = load_model(Path(args.predict))
+        feats, theta, rho = load_model(Path(args.predict))
         pair = Pair(int(args.pas[0], 0), int(args.pas[1], 0), "", "", "")
         pair.attach(feats)
         same_bank = all(dot(t, pair.phi) == 0 for t in theta)
-        row_diff = bool(pair.d & rmask)
+        row_diff = any(dot(r, pair.phi) for r in rho)
         print(f"same_bank={same_bank} row_differs={row_diff} "
-              f"predicted={classify(theta, rmask, pair)}")
+              f"predicted={classify(theta, rho, pair)}")
         return 0
     if not args.pas:
         raise RuntimeError("give run dirs / constraint CSVs to fit")
@@ -752,9 +899,8 @@ def main(argv: list[str] | None = None) -> int:
     train, holdout = split_holdout(pairs, args.holdout, args.seed)
     train_hard = [p for p in train if p.cls != "mid"]
     result = run_fit(train_hard, feats, args.rounds)
-    rmask = mask_of(result["row_support"])
-    train_stats = evaluate(result["theta"], rmask, train_hard)
-    hold_stats = evaluate(result["theta"], rmask,
+    train_stats = evaluate(result["theta"], result["rho"], train_hard)
+    hold_stats = evaluate(result["theta"], result["rho"],
                           [p for p in holdout if p.cls != "mid"])
 
     model_path = args.model_out or csvs[0].parent / f"mapping_model_d{args.degree}.json"

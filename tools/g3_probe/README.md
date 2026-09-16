@@ -232,18 +232,24 @@ timing primitive measured:
 
     conflict(x, y)  <=>  same_bank(x, y) AND row(x) != row(y)
 
-with bank(x) one degree-≤2 GF(2) polynomial per bank output bit (the
-linearized form of a row-seeded hash: a quadratic term `pa_i*pa_k` is
-exactly "seed bit i × flipped bit k") and the row difference the pair xor
-touching a learned row support R. Conflicts give homogeneous equations —
-every bank functional must vanish on their feature difference; lows whose
-xor touches R must be fired by at least one functional. Valid functionals
-(those vanishing on all conflicts, an XOR-closed set) are enumerated
-exactly up to weight 3 via conflict signatures — equal-signature pairs and
-signature-completing triples — then grown by beam XOR; R is re-solved as
-monotone clauses (hit every conflict xor) plus units (avoid every
-same-bank low xor) with violation counting. The stages alternate; mid
-pairs are never fitted, only scored.
+Both sides are degree-≤2 GF(2) functional families over the feature
+difference phi = mu(x)^mu(y) (a quadratic term `pa_i*pa_k` is exactly
+"seed bit i × flipped bit k"): **bank** = every bank functional vanishing
+(same bank), **row** = some row functional firing (row differs — real
+decoders fold bank bits into the row address, so the row side is seeded
+too). Conflicts constrain the bank family homogeneously; lows predicted
+same-bank constrain the row family homogeneously; each family must fire
+the other side's set. Valid functionals (vanishing on the positive set,
+an XOR-closed family) are enumerated exactly to weight 3 via conflict
+signatures — equal-signature column pairs, signature-completing triples —
+and to weight 4 at stalls by anchoring 1-3 terms inside the uncovered
+negative's own feature support (real bits are "linear core ^ seed quads",
+often with a single in-support term) completed by signature lookup or a
+signature-pair index. A parsimony gate rejects narrow cover (spurious
+functionals fire only a stray negative; leftovers stay residuals); bank
+weight-1 candidates must be linear terms (output bits have linear cores;
+the row side is exempt — row folds can be pure quads). The two stages
+alternate; mid pairs are never fitted, only scored.
 
     python3 tools/g3_probe/solve_mapping.py \
         artifacts/g3/pool/<s3_run> artifacts/g3/pool/<s3b_run> \
@@ -251,15 +257,51 @@ pairs are never fitted, only scored.
     python3 tools/g3_probe/solve_mapping.py --predict <model.json> \
         0xPA_A 0xPA_B
 
-Output: per-bank-bit term lists (`pa8`, `pa16*pa24`, ...), the row
-support, residual (unseparable low) and row-violation counts, train and
-holdout accuracy with the ≥95% holdout gate (the S5 preview), and
-`mapping_model_d{1,2}.json` for the prediction API. Residuals are the
-honest measure of what the model class cannot express; `--degree 1`
-quantifies the linear baseline S3/S3b ruled out. `--self-test` pins the
-pipeline on a synthetic seeded truth: degree 2 must hit zero residuals and
-violations with ≥99% holdout accuracy (the true functionals live at
-weight 2–3), and degree 1 must report the insufficiency.
+Output: per-bit term lists for both families, train misclassifications and
+unseparable counts, train/holdout accuracy with the ≥95% holdout gate
+(the S5 preview), and `mapping_model_d{1,2}.json` (schema v2) for the
+prediction API. `--self-test` pins the pipeline on a synthetic seeded
+truth whose bank side includes a weight-4 linear-core bit and whose row
+side includes a bank-fold quad: degree 2 must reach zero train
+misclassifications with ≥99% train/holdout/class accuracy on fresh pairs
+(the internal bank/row factorization is only identified up to the labels'
+resolving power — predicate-level bars sit at 95%), and degree 1 must
+report the insufficiency.
+
+## S4 result on GPU 0 (2026-09-16): model class insufficient — gate FAIL
+
+The solver recovers the synthetic truth exactly (self-test), but on the
+real S3+S3b constraints (2375 pairs) **no variant reaches the 95% gate**:
+degree 1 degenerates to the low base rate (0.782 — no structure found),
+degree 2 with a linear row support reaches 0.774, the full two-family
+seeded model 0.758. Diagnosis, in order of discovery:
+
+- **The linear row model is dead by linear algebra**: 43% of lows (619)
+  lie inside the GF(2) span of the conflict feature vectors, and every
+  functional vanishing on all conflicts vanishes on them — their low
+  label can only mean *same bank AND same row*. 216 of them carry
+  exactly the anchor mask bits {8,16,18,19} (the anchor-invalid probes).
+  A fixed "xor touches R" row predicate cannot express that; hence the
+  seeded row family.
+- **The labels are reproducible, not noise** — S3b's fresh single-bit
+  votes reproduce S3's (5/5, 6/6), and low latency shows no clean drift
+  with PA distance from the calibration page.
+- **Weight ≤4 degree-2 functionals cannot separate the anchored
+  structure**: e16/e18/e19 each fire ~130 anchored in-page conflicts but
+  are blocked by ~190 anchor-invalid lows; the strong row bits
+  25/27/28/29 fire ~17 page-level conflicts each but are blocked by
+  23-38 lows predicted same-bank. The seed structure that would split
+  those needs higher weight or degree ≥3 terms.
+- 556 mids (23% of pairs) are excluded from fitting — the shoulder band
+  eats exactly the informative near-threshold pairs.
+
+Next data step (S4b): region-local calibration triples (per-pool-region
+thresholds instead of one global triple) to shrink the mid band, plus
+blocker-targeted probes at anchor-invalid pages (the pairs that block the
+e16/e18/e19 and page-row-bit functionals) to decide between "row fold is
+degree ≥3" and "bank coverage gap". The saved models and this diagnosis
+are the honest S4 output; S5 prediction validation stays blocked on a
+model that passes the gate.
 
 ## Validity boundary
 
