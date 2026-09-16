@@ -22,6 +22,12 @@ Modes:
                 observed PA range (informational outcomes).
   single-bit    S3 workload: for a target PA bit, pairs of addresses whose
                 PAs differ in exactly that bit.
+  bit-scan      S3 collection workload: the calibration triple, then one
+                single-bit pair per PA bit -- in-page bits from several
+                base pages (nonlinear-hash detection), page-level bits
+                spread over the pool. Classifying each pair's timing
+                (analyze_bit_scan.py) decomposes PA bits into bank-hash /
+                row / column roles.
 
 Run with --self-test to pin the arithmetic on a synthetic pool map.
 """
@@ -205,8 +211,64 @@ def select_single_bit_pairs(pool: PoolMap, bit: int, limit: int = 64) -> list[Qu
     return queries
 
 
-def write_work_csv(path: Path | None, queries: list[Query]) -> str:
-    lines = [WORK_HEADER]
+def select_bit_scan_queries(pool: PoolMap, in_page_bases: int = 4,
+                            pairs_per_bit: int = 64) -> list[Query]:
+    """S3 collection workload.
+
+    Query order is contractual for analyze_bit_scan.py: ids 0..2 are the
+    calibration triple (floor / different-bank baseline / in-page
+    row-conflict) on the first PA page, then one single-bit pair per PA
+    bit. In-page bits [0, log2(page_size)) are probed from several base
+    pages (with a linear bank hash the class is base-independent; votes
+    across bases expose nonlinear hashing). Page-level bits from the page
+    shift up to the pool's top PA get up to `pairs_per_bit` pairs each,
+    evenly spread over the available XOR partners.
+    """
+    page_size = pool.pages[0].page_size
+
+    def page_offset(page: Page, low: int) -> tuple[int, int]:
+        return page.chunk_index, \
+            page.va_page_base - pool.chunk_base_va(page.chunk_index) + low
+
+    queries: list[Query] = []
+    first = pool.pa_pages[0]
+    for candidate in S1_IN_PAGE_CANDIDATES:
+        chunk, offset = page_offset(first, 0)
+        queries.append(Query(chunk, offset, chunk, offset + candidate))
+
+    base_pages = [pool.pa_pages[min(j * (len(pool.pa_pages) - 1)
+                                     // max(1, in_page_bases - 1),
+                                     len(pool.pa_pages) - 1)]
+                  for j in range(in_page_bases)]
+    for bit in range(page_size.bit_length() - 1):
+        mask = 1 << bit
+        if mask >= page_size:
+            continue
+        for page in base_pages:
+            chunk, offset = page_offset(page, 0)
+            queries.append(Query(chunk, offset, chunk, offset + mask))
+
+    by_pa = {page.fb_pa_page_base: page for page in pool.pa_pages}
+    top_bit = max(by_pa).bit_length() - 1
+    for bit in range(page_size.bit_length() - 1, top_bit + 1):
+        mask = 1 << bit
+        partners = [pa for pa in sorted(by_pa)
+                    if (pa ^ mask) in by_pa and pa < (pa ^ mask)]
+        if not partners:
+            continue
+        stride = max(1, len(partners) // pairs_per_bit)
+        for pa in partners[::stride][:pairs_per_bit]:
+            left_page, right_page = by_pa[pa], by_pa[pa ^ mask]
+            queries.append(Query(page_offset(left_page, 0)[0],
+                                 page_offset(left_page, 0)[1],
+                                 page_offset(right_page, 0)[0],
+                                 page_offset(right_page, 0)[1]))
+    return queries
+
+
+def write_work_csv(path: Path | None, queries: list[Query],
+                   mode: str = "sanity") -> str:
+    lines = [f"# mode={mode}", WORK_HEADER]
     for index, query in enumerate(queries):
         lines.append(f"{index},{query.chunk_a},{query.ofs_a},"
                      f"{query.chunk_b},{query.ofs_b}")
@@ -287,6 +349,22 @@ def self_test() -> int:
                 int(parts[3]), int(parts[4])) == (
             index, query.chunk_a, query.ofs_a, query.chunk_b, query.ofs_b)
 
+    # Bit-scan: controls first, in-page bits per base page, page-level bits
+    # only where the XOR partner is also in the pool.
+    scan = select_bit_scan_queries(pool, in_page_bases=2, pairs_per_bit=4)
+    assert scan[:3] == sanity[:3], "bit-scan must open with the calibration triple"
+    assert len(scan) == 3 + 21 * 2 + 4, len(scan)  # 21 in-page bits, 2 bases;
+    # the fixture's four fbs differ only in bits 21/22 -> 2 pairs per bit
+    for query in scan[3:3 + 21 * 2]:
+        pa_a, pa_b = pool.query_pa(query)
+        assert query.chunk_a == query.chunk_b
+        assert pa_b - pa_a == (pa_a ^ pa_b) and bin(pa_a ^ pa_b).count("1") == 1
+    for query in scan[3 + 21 * 2:]:
+        pa_a, pa_b = pool.query_pa(query)
+        xor = pa_a ^ pa_b
+        assert xor in (1 << 21, 1 << 22), hex(xor)
+        assert query.chunk_a != query.chunk_b or query.ofs_a != query.ofs_b
+
     print("g3_pool self-test: PASS")
     return 0
 
@@ -295,10 +373,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pool-map", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--mode", choices=("sanity", "single-bit"), default="sanity")
+    parser.add_argument("--mode", choices=("sanity", "single-bit", "bit-scan"),
+                        default="sanity")
     parser.add_argument("--bit", type=int)
     parser.add_argument("--cross-page", type=int, default=8)
     parser.add_argument("--limit", type=int, default=64)
+    parser.add_argument("--in-page-bases", type=int, default=4)
+    parser.add_argument("--pairs-per-bit", type=int, default=64)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -308,11 +389,14 @@ def main() -> int:
     pool = PoolMap(parse_pool_map(args.pool_map.read_text(encoding="utf-8")))
     if args.mode == "sanity":
         queries = select_sanity_queries(pool, cross_page=args.cross_page)
+    elif args.mode == "bit-scan":
+        queries = select_bit_scan_queries(pool, in_page_bases=args.in_page_bases,
+                                          pairs_per_bit=args.pairs_per_bit)
     else:
         if args.bit is None or not 0 <= args.bit < 40:
             parser.error("--bit must be in [0, 40)")
         queries = select_single_bit_pairs(pool, args.bit, limit=args.limit)
-    write_work_csv(args.output, queries)
+    write_work_csv(args.output, queries, mode=args.mode)
     print(f"wrote {len(queries)} queries to {args.output}")
     return 0
 

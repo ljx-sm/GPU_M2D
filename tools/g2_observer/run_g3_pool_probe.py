@@ -75,6 +75,7 @@ from g3_pool import (  # noqa: E402  (path-based import of a sibling tool)
     POOL_MAP_FIELDS,
     PoolMap,
     Page,
+    select_bit_scan_queries,
     select_sanity_queries,
     write_work_csv,
 )
@@ -167,7 +168,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=100000)
     parser.add_argument("--modifier", type=int, default=5)
     parser.add_argument("--cross-page", type=int, default=8,
-                        help="cross-page sanity queries selected from the observed PA range")
+                        help="sanity mode: cross-page queries over the observed PA range")
+    parser.add_argument("--work-mode", choices=("sanity", "bit-scan"), default="sanity",
+                        help="query selection: S2 sanity triple, or the S3 bit-scan matrix")
+    parser.add_argument("--in-page-bases", type=int, default=4,
+                        help="bit-scan mode: base pages voting per in-page bit")
+    parser.add_argument("--pairs-per-bit", type=int, default=64,
+                        help="bit-scan mode: cap on page-level pairs per PA bit")
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
     parser.add_argument("--output-root", type=Path,
@@ -594,15 +601,21 @@ def main() -> int:
                       page_size=int(page["page_size"]))
                  for page in pre_pass_pages]
         pool = PoolMap(pages)
-        queries = select_sanity_queries(pool, cross_page=args.cross_page)
+        if args.work_mode == "bit-scan":
+            queries = select_bit_scan_queries(pool, in_page_bases=args.in_page_bases,
+                                              pairs_per_bit=args.pairs_per_bit)
+        else:
+            queries = select_sanity_queries(pool, cross_page=args.cross_page)
         work = [(index, query.chunk_a, query.ofs_a, query.chunk_b, query.ofs_b)
                 for index, query in enumerate(queries)]
-        write_work_csv(work_output, queries)
+        write_work_csv(work_output, queries, mode=args.work_mode)
         os.chmod(work_output, 0o644)
         extra["query_selection"] = {
-            "mode": "sanity",
+            "mode": args.work_mode,
             "in_page_candidates": [0, 8192, 852224],
             "cross_page": args.cross_page,
+            "in_page_bases": args.in_page_bases,
+            "pairs_per_bit": args.pairs_per_bit,
             "distinct_fb_pages": len(pool.pa_pages),
         }
         release.write_text(f"pool_map_complete target_tgid={process.pid}\n",

@@ -26,7 +26,8 @@
 # G3-pool-only options (timing needs an idle GPU, so the device is explicit
 # instead of looping over all GPUs):
 #   [--device N] [--chunks N] [--chunk-mib N] [--iters N] [--modifier 0-5]
-#   [--cross-page N]
+#   [--cross-page N] [--work-mode sanity|bit-scan]
+#   [--in-page-bases N] [--pairs-per-bit N]
 #
 # The tensorrt mode also regenerates artifacts/g2/gpu_va_pa_map.csv from the
 # newest passing run of each GPU; mappings are never reused across runs.
@@ -46,7 +47,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --api) API="$2"; shift 2 ;;
         --size-mib|--hold-seconds) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
-        --chunks|--chunk-mib|--iters|--modifier|--cross-page) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --chunks|--chunk-mib|--iters|--modifier|--cross-page|\
+        --work-mode|--in-page-bases|--pairs-per-bit) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --device) G3_DEVICE="$2"; shift 2 ;;
         --runner) RUNNER="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;

@@ -569,6 +569,10 @@ chunk 内 PA 连续、按分配序每 chunk 步进 8MiB，但 VA 序乱序（观
 用 VA 算术替代）；计时 floor/baseline/conflict=1023/1014/1140 cyc（≈47 ns），
 跨页对 1038–1098 cyc 分布于中间态。工具 `tools/g3_probe/` +
 `tools/g2_observer/run_g3_pool_probe.py`（`--api g3pool`）。S3 系统采集待启。
+Status（2026-09-16）：S3 工具链就绪——`--work-mode bit-scan`（校准三元组 +
+每 PA 位一组单 bit 差分对，页内 4 基页投票、页级按池覆盖到 bit 31）与
+`analyze_bit_scan.py`（low/mid/conflict 三态分类 + 逐位投票表 + constraints.csv），
+自测通过并在 S2 真实池图上干跑验证（512MiB 池 599 条查询，bit 0..28 全覆盖）。
 
 目标：
 

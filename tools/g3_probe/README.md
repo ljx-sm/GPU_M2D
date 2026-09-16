@@ -127,6 +127,33 @@ events, 0 failures):
   expected when PA-distant pages sometimes share a bank. These are
   sanity/informational numbers; systematic collection is S3.
 
+## S3 bit-scan — single-bit PA pair collection
+
+`--work-mode bit-scan` turns the pool into the S3 measurement matrix:
+after the same gated PA annotation, the work CSV is the calibration triple
+(ids 0..2: floor / different-bank / in-page conflict) followed by one
+single-bit pair per PA bit — in-page bits [0:21) from several base pages
+(votes across bases expose nonlinear hashing), page-level bits from the
+page shift up to the pool's top PA, up to `--pairs-per-bit` pairs each
+evenly spread over available XOR partners. A 512 MiB pool covers bits
+21–28 at page level (599 queries); a 4 GiB pool reaches bit ~31.
+
+```bash
+sudo scripts/run_g2_observer_probe.sh --api g3pool --device 0 \
+    --work-mode bit-scan --chunks 512          # 4 GiB pool
+python3 tools/g3_probe/analyze_bit_scan.py \
+    artifacts/g3/pool/<run_dir>                # writes constraints.csv
+```
+
+`analyze_bit_scan.py` classifies each pair against the run's own
+calibration triple — **low** (no conflict: column bit, or bank/channel
+bit — the pair primitive cannot tell these apart yet), **mid** (shoulder),
+**conflict** (same bank different row: a row-address bit outside the bank
+hash) — flags asymmetric pairs, checks every pair's PA xor really is one
+bit against the pool map, and prints the per-bit vote table (SPLIT marks
+bits whose votes disagree across bases). `constraints.csv` is the input
+for the S4 solver.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the
