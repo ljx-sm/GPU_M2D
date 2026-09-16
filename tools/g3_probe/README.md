@@ -183,6 +183,46 @@ across the PA range — seed structure), and per page-level bit the
 anchored votes plus fresh single-bit votes (a stability check on S3
 without a separate run).
 
+## S3b result on GPU 0 (2026-09-16)
+
+Run healthy end to end (`artifacts/g3/pool/run_pool_gpu0_1789550420238116565`,
+1587/1587 rows, 0 lost events, 0 asymmetric, 2716.6 MHz, the same 4 GiB PA
+hole as S3; calibration floor/baseline/conflict = 1028/1020/1143, amplitude
+123 cyc):
+
+- **Anchor validity is position-dependent.** Only 1 of the 4 in-page bases
+  keeps the bank under `0xd0100` — the S1 page family (1144/1144) — while
+  the other three drop to low/mid. The anchor sweep finds 35/128 pages
+  valid (32 mid / 61 low). Under a linear bank hash a fixed mask is either
+  always or never bank-preserving, so a 27% mix rules the fixed-support
+  linear model out by direct measurement. Caveat: the stride-16 sampling
+  leaves PA bits 21–24 constant, so 27% is the rate within that slice; the
+  page-triple anchors cover other slices at 3–10 valid of 16.
+- **In-page bits 0–20 split at the anchor-valid base**: bank_kept (column
+  candidates) 0–7, 9, 11 (conflict stays 1144–1148); bank_changed (hash
+  support) 8, 12–14, 16–18, 20, with 8/16/17/18 dropping deepest
+  (1022–1023); mid 10 (1068), 19 (1077), 15 (1104), and bit 11's conflict
+  vote (1115) clears the threshold by only 9 cyc. The anchor's own bits
+  {8,16,18,19} all land in bank_changed/mid — self-consistent, the anchor
+  works precisely by flipping row bits without leaving the bank.
+- **Two-bit pairs (840: 66 conflict / 659 low / 115 mid, per base
+  17/6/25/18)**: conflicts are "column bit × row-carrier bit" pairs whose
+  carrier rotates with the base — bit 10 carries at base 2, 11 at base 0,
+  16 at base 3, 19 at base 2 — plus a local cancellation cluster at base 0
+  ((7,12), (11,13), (11,14), (12,13), (12,14), (13,15), (15,18)). Bit 16
+  flipping the bank at base 0 (anchored 1022) yet carrying the row at base
+  3 ((0..9,16) all conflict) is direct evidence that the hash support
+  moves with the address seed: locally low-degree, coefficients seeded.
+- **Page bits resolved**: strong row bits 25/27/28/29 (anchored kept +
+  fresh single conflict: 5/5, 6/6, 3/3, 3/3), bank bits 22 (changed 5,
+  low 5) and 26 (changed 4), column-like fold 21 (kept 2 + low 2),
+  row-leaning mixed 24/30, seed-mixed 23/31. The sweep samples pages with
+  PA bit 32 set (top PA 0x114e00000), so the seed includes bit 32 even
+  though no query flips it directly.
+- `pair_constraints.csv` (1587 rows) + S3 `constraints.csv` (788) are the
+  S4 solver input: bank = degree-≤2 GF(2) hash with seeded terms, row
+  support learned jointly, mid votes kept soft.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the
