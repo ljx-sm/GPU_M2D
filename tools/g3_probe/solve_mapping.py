@@ -635,6 +635,19 @@ def print_report(feats: Features, inputs: list[dict], pairs: list[Pair],
     print(f"holdout accuracy: {hold_stats['correct']}/{hold_stats['total']} "
           f"= {hold_stats['accuracy']:.4f} "
           f"[gate >= {HOLDOUT_GATE:.2f} {gate}]")
+    confusion = hold_stats["confusion"]
+    n_conflict = sum(v for (cls, _), v in confusion.items() if cls == "conflict")
+    n_low = sum(v for (cls, _), v in confusion.items() if cls == "low")
+    if n_conflict:
+        recall = confusion[("conflict", "conflict")] / n_conflict
+        print(f"holdout conflict recall: "
+              f"{confusion[('conflict', 'conflict')]}/{n_conflict} "
+              f"= {recall:.3f}, lows {confusion[('low', 'low')]}/{n_low}")
+        if hold_stats["accuracy"] >= HOLDOUT_GATE and recall < HOLDOUT_GATE:
+            print(f"  DEGENERATE PASS: overall accuracy clears the gate only "
+                  f"via the low base rate ({n_low}/{n_conflict + n_low} of "
+                  f"hard pairs are low) -- the mapping is NOT validated; "
+                  f"S5 stays blocked")
     if hold_stats["mid_votes"]:
         votes = hold_stats["mid_votes"]
         print(f"holdout mid (soft, {sum(votes.values())}): "

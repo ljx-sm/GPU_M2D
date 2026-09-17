@@ -419,6 +419,72 @@ all 4 pilot pages resolved, 0 drops.
   185 S3b shallow + residual mids): the channel partition is now a graph
   question over shoulder edges, not a lambda question.
 
+## S4b-2 — three-band relabel, channel graph, re-solve
+
+`analyze_three_band.py` relabels the S3/S3b constraints with the S4b-1
+census per-page lambdas (same PA hole — the census page table joins
+1:1; any uncovered constraint page refuses the run, exit 2) and the
+three-band rule (deep >= 0.90*amp global; shoulder >= 0.70*amp global;
+low < max(lambda_a, lambda_b) + 0.35*amp). It writes
+`<name>_bands.csv` (four classes) and `<name>_solver3.csv` (solver
+view: deep -> conflict, shoulder -> mid).
+
+```bash
+python3 tools/g3_probe/analyze_three_band.py <s3_or_s3b_run> \
+    --census <census_run>
+python3 tools/g3_probe/analyze_channel_graph.py \
+    <s3_run>/constraints_bands.csv <s3b_run>/pair_constraints_bands.csv \
+    --census <census_run>
+```
+
+`analyze_channel_graph.py` builds the same-channel page graph (shoulder
++ deep cross-page edges both prove same channel; deep = same bank
+implies same channel). A cross-page low inside a component is a
+contradiction: two distinct 2 MiB pages cannot share channel+bank+row
+(they differ in PA bits >= 21, which the in-page column field cannot
+absorb), so same-channel implies not-low. The tool reports component
+count/sizes vs ~12 channels, the contradiction rate, per-component PA
+bit signatures, super-tail (7 mod 16) membership, census-lambda mixing,
+and writes `channel_components.csv`.
+
+## S4b-2 result on GPU 0 (2026-09-16): clean labels, honest solver FAIL
+
+- **The retroactive split reproduces the census estimate exactly**: S3's
+  139 conflicts are ALL shoulder; S3b is 185 shoulder + 70 deep. And
+  the census lambda nearly erases the old mid band (S3 241 -> 5, S3b
+  315 -> 124): most S4/S4b-0 "mids" were lambda smear around a low that
+  the noisy pair-lambda estimate could not localize — they are now
+  correctly low (1851 lows of 2375 pairs).
+- **The channel partition signal exists but is under-determined.** 380
+  cross-page same-channel edges (379 shoulder + 1 deep; the census
+  re-probe shoulders fold in via `--census`) touch 250 pages and give
+  82 components, largest 13 pages (5%): consistent edges (only 28/845
+  = 3.3% of cross-page lows contradict a component, and those mark
+  individual bad edges, not a broken rule) but far below the density
+  needed to merge each channel's ~170 of 2048 pages. The two largest
+  components carry strong high-bit signatures (bit 27/28 100%, bit 31
+  92%; bit 24-26 exclusive), and the census lambdas MIX inside them —
+  the partition is address-structural, not lambda-structural, closing
+  the loop on S4b-1's lambda finding.
+- **Deep is in-page, shoulder is page-level**: 69/70 deep conflicts have
+  both endpoints inside one 2 MiB page (the bank hash is fed by PA bits
+  < 21), while flipping a page-level bit yields shoulder (same channel)
+  or low (different channel). Channel selection lives at high PA bits;
+  bank hashing lives at in-page bits — one clean architectural fact the
+  bimodal split bought.
+- **The solver still cannot fit the deep set — and the gate now says so
+  honestly.** On the 3-band labels (71 conflicts / 1851 lows / 453
+  mid-excluded) degree 2 finds 18 bank functionals (all vanishing on
+  train conflicts) but leaves 47 of ~57 train conflicts unexplained by
+  any row functional; holdout accuracy 0.9557 would numerically PASS —
+  but holdout conflict recall is 0/14: with conflicts at 3.6% of hard
+  pairs, all-low clears 0.95 on base rate alone. The report now prints
+  per-class recall and flags this as a DEGENERATE PASS (added to
+  `solve_mapping.py`; S5 stays blocked). The S4 verdict stands with
+  clean labels: the degree-2/weight-4 model class is insufficient for
+  the seeded row fold, and 70 structurally-similar deep conflicts do
+  not span it.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the
