@@ -38,11 +38,18 @@ inputs / off-pool pages):
       bits >= 21. (A "bank class spans two channel components" check
       would be vacuous: every cross-page deep edge unions the channel
       components by construction.)
-  C5  cross-source label disagreements on one PA pair -- reprobe >
-      pilot > S3b > S3 priority; informational, counted.
+  C5  cross-source label disagreements on one PA pair -- T1 edges >
+      reprobe > pilot > S3b > S3 priority; informational, counted.
 
     python3 build_bank_table.py <s3_run> <s3b_run> <census_run> \
-        [--out artifacts/g3/table_v0] [--query 0xPA]
+        [--t1 <table_build_run> ...] [--out artifacts/g3/table_v0] \
+        [--query 0xPA]
+
+`--t1` (repeatable, later args = fresher) folds a table-build run's
+`table_build_edges.csv` (analyze_table_build.py) in as the top-priority
+source: the T1 anchors swept 24 candidate masks per page and classified
+every page against every seed component, so its edges supersede all
+retroactive labels.
 
 Writes gddr_seed_table.csv, bank_classes.csv and table_report.txt into
 --out. Exit codes: 0 ok, 2 integrity failure, 1 error (repo
@@ -64,15 +71,17 @@ from analyze_census import UnionFind
 
 PAGE = 2 * 1024 * 1024
 CLASSES = ("low", "mid", "shoulder", "deep_conflict")
-# Freshest re-measurement wins when the same PA pair appears twice.
-SOURCE_PRIORITY = ("reprobe", "pilot", "s3b", "s3")
+# Freshest re-measurement wins when the same PA pair appears twice; T1
+# table-build edges outrank every retroactive label.
+SOURCE_PRIORITY = ("t1", "reprobe", "pilot", "s3b", "s3")
 
 
 def _hex(value: str) -> int:
     return int(value, 16)
 
 
-def load_edges(s3: Path, s3b: Path, census: Path, problems: list[str]) \
+def load_edges(s3: Path, s3b: Path, census: Path, t1: list[Path],
+               problems: list[str]) \
         -> tuple[dict[tuple[int, int], tuple[str, str]],
                  list[tuple[tuple[int, int], str, str, str]]]:
     """(pa_a, pa_b) -> (class, source) deduped by source priority, plus
@@ -126,7 +135,28 @@ def load_edges(s3: Path, s3b: Path, census: Path, problems: list[str]) \
     else:
         problems.append(f"missing {pilots} (run analyze_census.py)")
 
-    rank = {name: i for i, name in enumerate(SOURCE_PRIORITY)}
+    # Later --t1 args are fresher; within one rank first-wins, so feed
+    # the runs in reverse to make the last-specified run win collisions.
+    rank_names: list[str] = []
+    for path in reversed(t1):
+        name = f"t1:{path.name}"
+        edges_csv = path / "table_build_edges.csv"
+        if not edges_csv.is_file():
+            problems.append(f"missing {edges_csv} "
+                            "(run analyze_table_build.py)")
+            continue
+        with edges_csv.open(encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                cls = row.get("class") or ""
+                if cls not in CLASSES or not row.get("pa_a") \
+                        or not row.get("pa_b"):
+                    continue  # asymmetric/self rows carry no regime
+                if abs(int(row["cycles_a"]) - int(row["cycles_b"])) > 999:
+                    continue
+                raw.append((name, cls, _hex(row["pa_a"]), _hex(row["pa_b"])))
+        rank_names.append(name)
+    rank = {name: i for i, name in
+            enumerate(rank_names + ["reprobe", "pilot", "s3b", "s3"])}
     edges: dict[tuple[int, int], tuple[str, str]] = {}
     disagreements: list[tuple[tuple[int, int], str, str, str]] = []
     for source, cls, pa_a, pa_b in sorted(raw, key=lambda r: rank[r[0]]):
@@ -157,8 +187,16 @@ def load_pages(census: Path, problems: list[str]) -> dict[int, int]:
     return lambdas
 
 
-def build(edges: dict[tuple[int, int], tuple[str, str]]):
-    """Bank/row/channel partition over the edge set."""
+def build(edges: dict[tuple[int, int], tuple[str, str]],
+          channel_deep_only: bool = False):
+    """Bank/row/channel partition over the edge set.
+
+    channel_deep_only: union the page-level graph on cross-page DEEP
+    edges only. The S5-T1 run measured that no cross-page shoulder band
+    exists -- the lambda spread (~120 cyc) is wider than the conflict
+    amplitude, so global-gate "shoulders" are lambda-slow pairs, and the
+    S4b-1/T0 shoulder-built channel components were selection artifacts.
+    Default keeps the historical T0 behavior for reproducibility."""
     node_pas = sorted({pa for pair, (cls, _) in edges.items() if cls != "mid"
                        for pa in pair})
     bank_uf = UnionFind(node_pas)
@@ -170,13 +208,15 @@ def build(edges: dict[tuple[int, int], tuple[str, str]]):
         if cls == "low" and bank_uf.find(a) == bank_uf.find(b):
             row_uf.union(a, b)
 
+    channel_cls = ("deep_conflict",) if channel_deep_only \
+        else ("shoulder", "deep_conflict")
     channel_pages = sorted({pa >> 21 for (a, b), (cls, _) in edges.items()
-                            if cls in ("shoulder", "deep_conflict")
+                            if cls in channel_cls
                             and a >> 21 != b >> 21
                             for pa in (a, b)})
     page_uf = UnionFind(channel_pages)
     for (a, b), (cls, _) in edges.items():
-        if cls in ("shoulder", "deep_conflict") and a >> 21 != b >> 21:
+        if cls in channel_cls and a >> 21 != b >> 21:
             page_uf.union(a >> 21, b >> 21)
 
     node_deg: dict[int, Counter] = defaultdict(Counter)
@@ -217,9 +257,11 @@ def contradictions(edges, part, lambdas) -> dict[str, list[tuple[int, int]]]:
 
 
 def analyze(s3: Path, s3b: Path, census: Path, out: Path,
-            query: int | None) -> int:
+            query: int | None, t1: list[Path] | None = None,
+            channel_deep_only: bool = False) -> int:
+    t1 = t1 or []
     problems: list[str] = []
-    edges, disagreements = load_edges(s3, s3b, census, problems)
+    edges, disagreements = load_edges(s3, s3b, census, t1, problems)
     lambdas = load_pages(census, problems)
     for (a, b) in edges:
         for pa in (a, b):
@@ -233,7 +275,7 @@ def analyze(s3: Path, s3b: Path, census: Path, out: Path,
         print(f"INTEGRITY: {'; '.join(problems)}")
         return 2
 
-    part = build(edges)
+    part = build(edges, channel_deep_only)
     found = contradictions(edges, part, lambdas)
     lines: list[str] = []
 
@@ -243,7 +285,10 @@ def analyze(s3: Path, s3b: Path, census: Path, out: Path,
 
     n_cls = Counter(cls for cls, _ in edges.values())
     n_src = Counter(src for _, src in edges.values())
-    say("=== EMT v0 seed table (S5-T0, zero new collection) ===")
+    say("=== EMT v0 seed table (S5-T0, zero new collection) ==="
+        if not t1 else
+        f"=== EMT table (S5-T0 seed + {len(t1)} S5-T1 densified "
+        "source(s)) ===")
     say(f"pool universe: {len(lambdas)} census pages; edges after dedup: "
         f"{len(edges)} (deep {n_cls['deep_conflict']}, shoulder "
         f"{n_cls['shoulder']}, low {n_cls['low']}, mid {n_cls['mid']} "
@@ -276,7 +321,10 @@ def analyze(s3: Path, s3b: Path, census: Path, out: Path,
         f"{len(rows_in_multi)}")
     comp_sizes = sorted((len(m) for m in part["page_groups"].values()),
                         reverse=True)
-    say(f"channel components (recomputed, cross-page shoulder+deep): "
+    chan_label = ("deep-only = same-bank page sets; the S5-T1-measured "
+                  "model: no cross-page shoulder band"
+                  if channel_deep_only else "shoulder+deep")
+    say(f"channel components (recomputed, cross-page {chan_label}): "
         f"{len(part['page_groups'])} over {len(comp_sizes) and sum(comp_sizes)}"
         f" pages, sizes {comp_sizes[:8]}"
         f"{' ...' if len(comp_sizes) > 8 else ''}")
@@ -536,6 +584,49 @@ def self_test() -> int:
         assert pages["6"]["channel_size"] == "2"
         assert pages["0"]["channel_root"] == ""
 
+        # --channel-deep-only: the shoulder-built {3,4,5} component must
+        # vanish (no cross-page deep touches those pages); only the deep
+        # C4 edge keeps {6,7} -- and the (6,7) low still fires C3 inside
+        # it, while the (3,5) C3 plant dies with its component.
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = analyze(root / "s3", root / "s3b", root / "census",
+                           out, None, channel_deep_only=True)
+        assert code == 0
+        report = buffer.getvalue()
+        assert "cross-page deep-only" in report, report
+        assert ": 1 over 2 pages" in report, report
+        assert "C3: 1 contradiction(s)" in report, report
+        assert "C4: 1 contradiction(s)" in report, report
+
+        # --t1 fold: the table-build run re-measures (4,5) as deep where
+        # the reprobe said shoulder -> t1 wins, C5 records the flip, and a
+        # bank class now spans pages 4/5 through the fresh cross-page deep.
+        t1_dir = root / "t1"
+        t1_dir.mkdir()
+        t1_fields = ["query_id", "pa_a", "pa_b", "section", "cycles_a",
+                     "cycles_b", "late_offset", "corrected_cycles", "class"]
+        (t1_dir / "table_build_edges.csv").write_text(
+            ",".join(t1_fields) + "\n"
+            f"0,0x{pa(4, 0x1000):x},0x{pa(5, 0x1000):x},classify,"
+            "1141,1141,18,1159,deep_conflict\n")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = analyze(root / "s3", root / "s3b", root / "census",
+                           out, None, t1=[t1_dir])
+        assert code == 0
+        report = buffer.getvalue()
+        assert "S5-T0 seed + 1 S5-T1 densified source(s)" in report, report
+        # 3 = the pilot flip + the t1 deep disagreeing with BOTH older
+        # sources that measured (4,5): reprobe shoulder and s3 shoulder.
+        assert "C5 cross-source disagreements: 3" in report, report
+        assert "deep_conflict->shoulder" in report, report
+        nodes = {row["pa"]: row for row in csv.DictReader(
+            (out / "bank_classes.csv").open(encoding="utf-8"))}
+        assert (nodes[f"0x{pa(4, 0x1000):x}"]["bank_class"]
+                == nodes[f"0x{pa(5, 0x1000):x}"]["bank_class"])
+        assert int(nodes[f"0x{pa(4, 0x1000):x}"]["bank_size"]) >= 2
+
         # fail-closed: an edge off the census pages refuses the run
         bad = root / "s3" / "constraints_bands.csv"
         bad.write_text("\n".join(bands_rows(
@@ -561,6 +652,16 @@ def main() -> int:
     parser.add_argument("--out", type=Path,
                         default=Path("artifacts/g3/table_v0"),
                         help="output dir (default artifacts/g3/table_v0)")
+    parser.add_argument("--t1", type=Path, action="append", default=[],
+                        help="table-build run dir(s) (table_build_edges.csv "
+                             "from analyze_table_build.py); repeatable, "
+                             "later args are fresher")
+    parser.add_argument("--channel-deep-only", action="store_true",
+                        help="build the page-level graph on cross-page DEEP "
+                             "edges only (same-bank page sets). The T1 run "
+                             "measured that the shoulder band does not "
+                             "exist; the historical T0 default unions on "
+                             "shoulder+deep for reproducibility")
     parser.add_argument("--query", type=str, default=None,
                         help="print the table rows for one PA, e.g. 0x1ee0d0100")
     parser.add_argument("--self-test", action="store_true")
@@ -570,7 +671,8 @@ def main() -> int:
     if not (args.s3 and args.s3b and args.census):
         parser.error("three run dirs are required outside --self-test")
     query = int(args.query, 16) if args.query else None
-    return analyze(args.s3, args.s3b, args.census, args.out, query)
+    return analyze(args.s3, args.s3b, args.census, args.out, query,
+                   t1=args.t1, channel_deep_only=args.channel_deep_only)
 
 
 if __name__ == "__main__":

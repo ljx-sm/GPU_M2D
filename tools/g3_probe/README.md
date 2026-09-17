@@ -539,6 +539,103 @@ python3 build_bank_table.py \
   collection mode (`--work-mode table-build`) that densifies classes
   until the pool is covered.
 
+## S5-T1 — table-build collection (`--work-mode table-build`)
+
+One pre-planned run densifies the seed table, no iteration needed on
+this pool. The orchestrator (`run_g3_pool_probe.py`) plans six sections
+in a fixed order and the harness executes them back-to-back:
+
+| section      | queries | what it measures                                                   |
+|--------------|---------|--------------------------------------------------------------------|
+| calibration  | 3       | floor/baseline/conflict anchors for the band gates                 |
+| self         | 2048    | fresh per-page lambda (the classification reference)               |
+| anchor_sweep | 49152   | (p, p^M) per page x 24 candidate masks: deep = valid anchor + edge |
+| classify     | 151478  | (p, rep) page starts vs 74 seed reps: deep = same bank, low = other|
+| bank_map     | 392     | 8 pages x 25-offset lattice x {base, anchor} double probe          |
+| repeat       | 64      | drift anchor for the late-section additive step                    |
+
+Total 203137 queries in a 19 s work phase (~10.8k queries/s). Anchors
+come from the seed table (`--seed-table`): the 24 masks that ever
+produced a deep conflict anywhere, plus per-page reps from its bank
+classes; `--bank-map-from` reuses the mined anchor validity to place the
+double-probe lattice (skipping the y∈{0,M} degenerate probes).
+
+`analyze_table_build.py` verifies every row's PA against the plan
+(fail-closed, exit 2), classifies with **λ-referenced gates** (see the
+model revision below) and writes `table_build_edges.csv` (the
+`build_bank_table.py --t1` source), `anchor_validity.csv`,
+`bank_map_pages.csv`, `channel_partition.csv`.
+
+```bash
+sudo scripts/run_g2_observer_probe.sh --api g3pool --device 0 \
+    --work-mode table-build \
+    --seed-table artifacts/g3/table_v0 --bank-map-from artifacts/g3/table_v0
+python3 tools/g3_probe/analyze_table_build.py \
+    artifacts/g3/pool/<table_build_run>
+python3 tools/g3_probe/build_bank_table.py \
+    artifacts/g3/pool/<s3_run> artifacts/g3/pool/<s3b_run> \
+    artifacts/g3/pool/<census_run> --t1 artifacts/g3/pool/<table_build_run> \
+    --channel-deep-only --out artifacts/g3/table_v1 [--query 0x1eed0100]
+```
+
+Model revision (measured on this run; supersedes S4b-1's three-band
+story for cross-page pairs): every pair value references
+max(λ_a, λ_b), not the global calibration baseline. The per-page λ
+spread (~120 cycles) is wider than the conflict amplitude (110), so any
+global gate lands inside the λ spread and manufactures a "shoulder"
+band out of slow pages. λ-referenced, the classify section is bimodal
+with an **empty +30..+80 valley**: low at d≈0 (96%) and deep at
+d≥+80 (0.26% ≈ 1/384, matching the AD102 prior 24 channels × 16 banks).
+The historical cross-page "shallow band" (S3b's 185, the census
+re-probe's 228) shows the same λ-referenced d distribution for its
+shoulder and low verdicts — selection bias, not a physical regime.
+Consequences: `analyze_table_build.py` has no shoulder class;
+`build_bank_table.py --channel-deep-only` builds page components on
+cross-page deep edges only (same-bank page sets) instead of the T0
+shoulder+deep union; the old C3 rule (cross-page low inside a channel
+component) becomes the valid same-bank contradiction check. In-page the
+valley sits at +45..+70; gates: low < 0.35·amp, deep ≥ 0.60·amp above
+the λ reference.
+
+## S5-T1 result on GPU 0 (2026-09-17): pool covered, model corrected
+
+Run `run_pool_gpu0_1789656551689364094` (status
+G3_POOL_PA_MAP_COMPLETE_OBSERVED, 0 failures): 201022 classified pairs
+{deep 11932, low 187761, mid 1329}; calibration 1011/1011/1121
+(amp 110); late-section offset −14 cyc anchored on the repeat block.
+
+- **Same-bank page graph**: 387 cross-page deep edges (0.26% of classify
+  pairs, vs the 1/384 = 0.26% random-pair prior for 24ch × 16bank) →
+  60 components over 370/2048 pages, largest 11. Cross-page lows inside
+  a component (bad-deep-edge markers): **0**.
+- **Anchor validity**: 2048/2048 pages have ≥1 valid anchor. Masks
+  0x1fdc80 and 0x1f9dc0 are valid on **every** page (kernel masks of
+  the bank hash); 0x119980/0x11e300/0xd0100 are partial (818/650/484
+  pages), floor ~235–320. This corrects S3b's "27% anchor validity,
+  position-dependent" — validity is mask-dependent, not
+  position-dependent.
+- **Bank maps** (8 pages, 25-offset lattice, anchor 0xd0100): clean
+  base-low/anchor-deep row splits at healthy pages (0x2ae00000: 9/25
+  same-bank, 0x200→row0, 0xd0300/0xd3880/0xd7b00→rowM; 0x42e00000:
+  6/25). Three pages ≡7 mod 16 (0x1ee00000, 0x32e00000, 0x3ce00000 —
+  the S4b-1 super-conflict family) read deep against **all** 24 sweep
+  candidates and 25/25 lattice offsets: their whole in-page pair
+  baseline is shifted (sweep d p50 ≈ +85 vs typical +15), so their bank
+  maps are super-conflict structure, not contamination (the 0x200
+  column probe still reads low there, so λ is sound). Cross-page
+  same-bank-set Jaccard p50 0.36 — per-page seed structure on top of
+  the universal core, as the S4 verdict predicted.
+- **Table v1** (`artifacts/g3/table_v1/`, built with `--t1` +
+  `--channel-deep-only`): 200183 deduped edges (198129 from T1, the
+  top-priority source; C5 records 321 disagreements, dominated by
+  low↔shoulder flips against the old global-gate labels — the expected
+  λ correction). 39059 bank classes, 1741 multi-node (largest 125,
+  60 spanning >1 page), 13444 row classes inside them; **C1/C2/C3/C4
+  all 0 contradictions** on the fully merged edge set. Classified
+  nodes on **2048/2048 pages** (T0: 38/2048); same-bank page
+  components on 370/2048 pages (the rest are honest T2/T3 residue —
+  1/384 odds mean most pages simply share no bank with a rep).
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the

@@ -35,6 +35,12 @@ Modes:
   census        S4b-1 workload: per-page self-pairs (a clean per-page
                 lambda), suspect-conflict re-probes, and a row-class
                 pilot at anchor-valid pages (analyze_census.py).
+  table-build   S5-T1 workload: anchor-expansion collection that
+                densifies the seed table -- per-page self lambdas, a
+                per-page anchor-candidate sweep, every page classified
+                against one representative page per seed channel
+                component, and a double-probe bank/row map at
+                anchor-valid pages (analyze_table_build.py).
 
 Run with --self-test to pin the arithmetic on a synthetic pool map.
 """
@@ -512,6 +518,162 @@ def select_census_queries(pool: PoolMap, **kwargs) -> list[Query]:
     return [typed.query for typed in plan]
 
 
+# S5-T1 anchor candidates: same-bank different-row in-page masks. Curated
+# from the S1 tight conflict cluster (>=1120 cycles: 215 points, median
+# 1124, spread 29) by greedy descending S1 value with a 0x1000 minimum
+# separation, seeded with the two cross-run-validated masks -- 0xd0100
+# (S1 targeted check 1143-1145; the S3b anchor and the S4b-1 deep pilot)
+# and 0xd0300 (the S4b-1 pilot's M|0x200 partner). S3b measured that a
+# single mask keeps the bank on only ~27% of pages, so the sweep carries
+# a spread of candidates: per page, any DEEP hit is a bank-class edge and
+# a valid anchor for double-probe classification.
+TABLE_BUILD_ANCHOR_CANDIDATES = (0xd0100, 0xd0300, 0xd7b00, 0x11e300,
+                                 0x119980, 0xd3880, 0x1fdc80, 0x1b5f00,
+                                 0x1f9dc0, 0x37680, 0xb0b00, 0x1c00c0,
+                                 0x1cd000, 0x30ec0, 0x4c0c0, 0x5a7c0,
+                                 0x8d780, 0xeacc0, 0x12efc0, 0x135840,
+                                 0x1388c0, 0x1b8d00, 0x22a00, 0x42bc0)
+# Column probe folded into the bank-map lattice: bit 9 is the hardware
+# column bit (S4b-1 pilot), so 0x200 pairs inside one bank class are
+# same-row evidence.
+TABLE_BUILD_COLUMN_PROBE = 0x200
+
+
+def plan_table_build_queries(pool: PoolMap,
+                             rep_pas: Sequence[int] = (),
+                             anchor_candidates: Sequence[int] =
+                             TABLE_BUILD_ANCHOR_CANDIDATES,
+                             bank_map_pages: Sequence[int] = (),
+                             bank_map_anchor: int = PAIR_SCAN_ANCHOR,
+                             bank_map_probes: Sequence[int] =
+                             TABLE_BUILD_ANCHOR_CANDIDATES,
+                             repeat_pages: int = 64
+                             ) -> tuple[list[TypedQuery], dict[str, object]]:
+    """S5-T1 table-build plan. Section order is contractual for
+    analyze_table_build.py:
+
+      calibration   ids 0..2: floor / different-bank / anchor conflict
+      self          (p, p) per pool page -- the fresh per-page lambda
+                    that anchors the three-band classifier
+      anchor_sweep  (p, p^M_c) per pool page x candidate mask: any DEEP
+                    hit is a same-bank different-row edge and marks M_c
+                    a valid anchor at p; the matrix answers whether
+                    validity is page- or mask-specific (S3b only ever
+                    swept one mask)
+      classify      (p, rep) page starts, every pool page x one
+                    representative page per seed channel component:
+                    cross-page shoulder/deep proves same channel
+                    (shoulder = same channel different bank; deep =
+                    same bank, rarer), cross-page low proves different
+                    channel -- the page->channel assignment and the
+                    component merges come out of this one section
+      bank_map      at anchor-valid pages (mined from the S3b sweep):
+                    (p, p^y) and (p^M, p^y) per lattice offset y. With
+                    the anchor M valid, bank(x0)=bank(x0^M) and the two
+                    rows differ, so y is same-bank iff EITHER probe is
+                    deep (a same-row hit with one endpoint is a deep
+                    with the other); a low among same-bank pairs splits
+                    rows
+      repeat        the first repeat_pages self pairs again, late in
+                    the list -- the late-section step measured by the
+                    census shows up here too; the analyzer anchors the
+                    additive correction on this block
+
+    rep_pas and bank_map_pages are byte PA page bases from the seed
+    table / the S3b anchor sweep; each is resolved against THIS run's
+    pool map and unresolvable entries are reported in meta['dropped'],
+    never silently dropped.
+    """
+    anchor_candidates = tuple(anchor_candidates)
+    by_pa = {page.fb_pa_page_base: page for page in pool.pa_pages}
+
+    def page_query(page: Page, low_a: int, low_b: int) -> Query:
+        offset = page.va_page_base - pool.chunk_base_va(page.chunk_index)
+        return Query(page.chunk_index, offset + low_a,
+                     page.chunk_index, offset + low_b)
+
+    def cross_query(left: Page, right: Page) -> Query:
+        return Query(left.chunk_index,
+                     left.va_page_base - pool.chunk_base_va(left.chunk_index),
+                     right.chunk_index,
+                     right.va_page_base - pool.chunk_base_va(right.chunk_index))
+
+    plan: list[TypedQuery] = []
+    first = pool.pa_pages[0]
+    for index, candidate in enumerate(S1_IN_PAGE_CANDIDATES):
+        plan.append(TypedQuery(page_query(first, 0, candidate), "calibration",
+                               role=("floor", "baseline", "conflict")[index]))
+
+    for index, page in enumerate(pool.pa_pages):
+        plan.append(TypedQuery(page_query(page, 0, 0), "self",
+                               sample_index=index))
+
+    for page_index, page in enumerate(pool.pa_pages):
+        for cand_index, mask in enumerate(anchor_candidates):
+            plan.append(TypedQuery(page_query(page, 0, mask), "anchor_sweep",
+                                   bit=cand_index, sample_index=page_index))
+
+    dropped: dict[str, list[str]] = {"reps": [], "bank_map": []}
+    reps: list[Page] = []
+    for pa_base in rep_pas:
+        page = by_pa.get(pa_base)
+        if page is None:
+            dropped["reps"].append(f"0x{pa_base:x}")
+        elif page not in reps:
+            reps.append(page)
+    for page_index, page in enumerate(pool.pa_pages):
+        for rep_index, rep in enumerate(reps):
+            if page.fb_pa_page_base == rep.fb_pa_page_base:
+                continue  # a page is not classified against itself
+            plan.append(TypedQuery(cross_query(page, rep), "classify",
+                                   base_index=rep_index,
+                                   sample_index=page_index))
+
+    lattice = tuple(dict.fromkeys(
+        (*bank_map_probes, TABLE_BUILD_COLUMN_PROBE)))
+    bank_pages: list[Page] = []
+    for pa_base in bank_map_pages:
+        page = by_pa.get(pa_base)
+        if page is None:
+            dropped["bank_map"].append(f"0x{pa_base:x}")
+        else:
+            bank_pages.append(page)
+    for bank_index, page in enumerate(bank_pages):
+        for offset_index, low in enumerate(lattice):
+            plan.append(TypedQuery(page_query(page, 0, low), "bank_map",
+                                   bit=offset_index, base_index=bank_index,
+                                   role="base"))
+            if low in (0, bank_map_anchor):
+                continue  # (M, 0) is (0, M) again; (M, M) is a self pair
+            plan.append(TypedQuery(page_query(page, bank_map_anchor, low),
+                                   "bank_map", bit=offset_index,
+                                   base_index=bank_index, role="anchor"))
+
+    if repeat_pages > 0:
+        for index, page in enumerate(pool.pa_pages[:repeat_pages]):
+            plan.append(TypedQuery(page_query(page, 0, 0), "repeat",
+                                   sample_index=index, role="drift"))
+
+    meta: dict[str, object] = {
+        "pages": len(pool.pa_pages),
+        "anchor_candidates": [f"0x{mask:x}" for mask in anchor_candidates],
+        "reps": [f"0x{page.fb_pa_page_base:x}" for page in reps],
+        "reps_requested": len(rep_pas),
+        "bank_map_pages": [f"0x{page.fb_pa_page_base:x}"
+                           for page in bank_pages],
+        "bank_map_anchor": f"0x{bank_map_anchor:x}",
+        "bank_map_offsets": [f"0x{low:x}" for low in lattice],
+        "repeat_pages": min(repeat_pages, len(pool.pa_pages)),
+        "dropped": dropped,
+    }
+    return plan, meta
+
+
+def select_table_build_queries(pool: PoolMap, **kwargs) -> list[Query]:
+    plan, _ = plan_table_build_queries(pool, **kwargs)
+    return [typed.query for typed in plan]
+
+
 def write_work_csv(path: Path | None, queries: list[Query],
                    mode: str = "sanity") -> str:
     lines = [f"# mode={mode}", WORK_HEADER]
@@ -690,6 +852,61 @@ def self_test() -> int:
     assert any((pool.query_pa(t.query)[0] ^ pool.query_pa(t.query)[1])
                == PAIR_SCAN_ANCHOR for t in pilot)
 
+    # Table-build: calibration triple, one self per PA page, the anchor
+    # sweep at every page x candidate, cross-page classify pairs against
+    # resolvable reps only (same-page pairs skipped, off-pool reps
+    # reported), the double-probe bank map with the (M,0)/(M,M)
+    # degenerates dropped, and a late repeat block.
+    cands = (0xd0100, 0x2000)
+    plan, meta = plan_table_build_queries(
+        pool, rep_pas=(0x120000000, 0x120200000, 0x900000000),
+        anchor_candidates=cands, bank_map_probes=cands,
+        bank_map_pages=(0x120400000, 0xDEAD0000), repeat_pages=2)
+    tqueries = [typed.query for typed in plan]
+    assert tqueries[:3] == sanity[:3], "table-build must open with the triple"
+    sections = [typed.section for typed in plan]
+    assert sections == (["calibration"] * 3 + ["self"] * 4
+                        + ["anchor_sweep"] * 8 + ["classify"] * 6
+                        + ["bank_map"] * 5 + ["repeat"] * 2), sections
+    assert meta["dropped"] == {"reps": ["0x900000000"],
+                               "bank_map": ["0xdead0000"]}
+    assert meta["reps"] == ["0x120000000", "0x120200000"]
+    assert meta["bank_map_pages"] == ["0x120400000"]
+    assert meta["anchor_candidates"] == ["0xd0100", "0x2000"]
+    # pa_pages PA order: 0x120000000, 0x120200000, 0x120400000, 0x120600000
+    # -> reps are pages 0 and 1; classify skips the two same-page pairs.
+    for typed in plan:
+        pa_a, pa_b = pool.query_pa(typed.query)
+        if typed.section == "anchor_sweep":
+            assert pa_a >> 21 == pa_b >> 21
+            assert pa_a ^ pa_b == cands[typed.bit]
+            assert pa_a & (page_size - 1) == 0
+        elif typed.section == "classify":
+            assert pa_a >> 21 != pa_b >> 21
+            assert pa_a & (page_size - 1) == 0 and pa_b & (page_size - 1) == 0
+            assert pool.pa_pages[typed.sample_index].fb_pa_page_base == pa_a
+    # bank map: lattice = candidates + column probe, base probes for every
+    # offset, anchor probes except the two degenerates; y=0xd0100 keeps the
+    # (0, M) anchor-validation probe itself.
+    bank = [typed for typed in plan if typed.section == "bank_map"]
+    lattice = (0xd0100, 0x2000, TABLE_BUILD_COLUMN_PROBE)
+    assert [t.bit for t in bank] == [0, 1, 1, 2, 2], [t.bit for t in bank]
+    seen = {}
+    for typed in bank:
+        pa_a, pa_b = pool.query_pa(typed.query)
+        assert pa_a >> 21 == pa_b >> 21 == 0x120400000 >> 21
+        pair = {pa_a & (page_size - 1), pa_b & (page_size - 1)}
+        fixed = {PAIR_SCAN_ANCHOR} if typed.role == "anchor" else {0}
+        assert pair == fixed | {lattice[typed.bit]}, (pair, typed.role)
+        seen.setdefault(typed.bit, []).append(typed.role)
+    assert seen[0] == ["base"], seen[0]          # y == M: anchor probe is (M, M)
+    assert seen[1] == ["base", "anchor"]
+    assert seen[2] == ["base", "anchor"]
+    repeat = [typed for typed in plan if typed.section == "repeat"]
+    for typed in repeat:
+        pa_a, pa_b = pool.query_pa(typed.query)
+        assert pa_a == pa_b and pa_a & (page_size - 1) == 0
+
     print("g3_pool self-test: PASS")
     return 0
 
@@ -700,7 +917,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--mode",
                         choices=("sanity", "single-bit", "bit-scan", "pair-scan",
-                                 "census"),
+                                 "census", "table-build"),
                         default="sanity")
     parser.add_argument("--bit", type=int)
     parser.add_argument("--cross-page", type=int, default=8)
@@ -729,6 +946,10 @@ def main() -> int:
                                            anchor_samples=args.anchor_samples)
     elif args.mode == "census":
         queries = select_census_queries(pool)
+    elif args.mode == "table-build":
+        # Shape-debug aid only: the real run's reps / bank-map pages come
+        # from the seed table and the S3b sweep via the orchestrator.
+        queries = select_table_build_queries(pool, repeat_pages=0)
     else:
         if args.bit is None or not 0 <= args.bit < 40:
             parser.error("--bit must be in [0, 40)")

@@ -76,6 +76,7 @@ from g3_pool import (  # noqa: E402  (path-based import of a sibling tool)
     PoolMap,
     Page,
     plan_census_queries,
+    plan_table_build_queries,
     select_bit_scan_queries,
     select_pair_scan_queries,
     select_sanity_queries,
@@ -191,6 +192,36 @@ def mine_pilot_pages(source: Path | None, count: int,
     return sorted(bases)[:count]
 
 
+def load_seed_reps(seed_table: Path, pool: PoolMap) -> tuple[list[int], list[str]]:
+    """One representative page base per seed-table channel component, for
+    the table-build classify section. The first member page backed by
+    THIS run's pool represents each component (the PA hole has been
+    stable, so this is a robustness fallback, not the expected path);
+    components with no backed page are reported, never dropped silently.
+    """
+    table = seed_table / "gddr_seed_table.csv"
+    components: dict[str, list[int]] = {}
+    with table.open(encoding="utf-8", newline="") as stream:
+        for row in csv.DictReader(line for line in stream
+                                  if not line.startswith("#")):
+            root = row.get("channel_root")
+            if root:
+                components.setdefault(root, []).append(
+                    int(row["page_base"], 16))
+    backed = {page.fb_pa_page_base for page in pool.pa_pages}
+    reps: list[int] = []
+    dropped: list[str] = []
+    for root, members in sorted(components.items()):
+        for base in sorted(members):
+            if base in backed:
+                reps.append(base)
+                break
+        else:
+            dropped.append(f"component {root}: {len(members)} pages, "
+                           "none backed by this pool")
+    return reps, dropped
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true",
@@ -204,11 +235,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cross-page", type=int, default=8,
                         help="sanity mode: cross-page queries over the observed PA range")
     parser.add_argument("--work-mode", choices=("sanity", "bit-scan", "pair-scan",
-                                                 "census"),
+                                                 "census", "table-build"),
                         default="sanity",
                         help="query selection: S2 sanity triple, the S3 bit-scan "
-                             "matrix, the S3b anchored/two-bit matrix, or the "
-                             "S4b-1 per-page census / re-probe / row pilot")
+                             "matrix, the S3b anchored/two-bit matrix, the "
+                             "S4b-1 per-page census / re-probe / row pilot, or "
+                             "the S5-T1 anchor-expansion table build")
+    parser.add_argument("--seed-table", type=Path,
+                        default=PROJECT / "artifacts/g3/table_v0",
+                        help="table-build mode: seed table dir "
+                             "(gddr_seed_table.csv from build_bank_table.py); "
+                             "one rep page per channel component")
+    parser.add_argument("--bank-map-from", type=Path, default=None,
+                        help="table-build mode: S3b run directory (or its "
+                             "pair_constraints.csv) mined for anchor-valid "
+                             "bank-map pages")
+    parser.add_argument("--bank-map-pages", type=int, default=8,
+                        help="table-build mode: anchor-valid pages for the "
+                             "double-probe bank/row map")
     parser.add_argument("--reprobe-csv", type=Path, action="append", default=[],
                         help="census mode: CSV(s) with pa_a,pa_b columns to "
                              "re-measure (e.g. suspect_conflicts.csv from "
@@ -699,6 +743,20 @@ def main() -> int:
                 "repeat_pages": args.repeat_pages,
                 "dropped": census_dropped,
             }
+        elif args.work_mode == "table-build":
+            reps, comp_dropped = load_seed_reps(args.seed_table, pool)
+            bank_pages = mine_pilot_pages(args.bank_map_from,
+                                          args.bank_map_pages,
+                                          pool.pages[0].page_size)
+            tb_plan, tb_meta = plan_table_build_queries(
+                pool, rep_pas=reps, bank_map_pages=bank_pages,
+                repeat_pages=args.repeat_pages)
+            queries = [typed.query for typed in tb_plan]
+            tb_meta["dropped"]["seed_components"] = comp_dropped
+            if comp_dropped:
+                print("GPU_M2D_G3_TABLE_BUILD_WARNING: seed components with "
+                      "no backed representative: " + "; ".join(comp_dropped))
+            extra["table_build_selection"] = tb_meta
         else:
             queries = select_sanity_queries(pool, cross_page=args.cross_page)
         work = [(index, query.chunk_a, query.ofs_a, query.chunk_b, query.ofs_b)
@@ -804,7 +862,14 @@ def main() -> int:
             shared.setdefault(str(row["fb_pa_page_base"]), set()).add(int(row["chunk_index"]))
         extra["shared_backing_page_chunk_groups"] = sorted(
             sorted(groups) for groups in shared.values() if len(groups) > 1)
-        extra["timing_results_informational"] = result_rows
+        # The informational per-query embed exists for small runs; a
+        # table-build run has O(10^5) rows, which would bloat summary.json
+        # (result.csv always holds every row).
+        embed_cap = 4000
+        extra["timing_results_informational"] = result_rows[:embed_cap]
+        if len(result_rows) > embed_cap:
+            extra["timing_results_truncated_to"] = embed_cap
+            extra["timing_results_total"] = len(result_rows)
     finally:
         gate.unlink(missing_ok=True)
         release.unlink(missing_ok=True)
