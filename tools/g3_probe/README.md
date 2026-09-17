@@ -636,6 +636,90 @@ G3_POOL_PA_MAP_COMPLETE_OBSERVED, 0 failures): 201022 classified pairs
   components on 370/2048 pages (the rest are honest T2/T3 residue —
   1/384 odds mean most pages simply share no bank with a rep).
 
+## S5-T2 — table validation gates (`validate_table.py`)
+
+T1 built a table; T2 decides whether it may be TRUSTED as the G4/G5
+mapping. `validate_table.py` runs the gates, each printing its numbers
+and an explicit pass bar (GeForge-style offline tables ship with no
+validation at all; a defensive-reliability deliverable must state its
+accuracy):
+
+```bash
+python3 tools/g3_probe/validate_table.py <s3> <s3b> <census> [--t1 RUN ...] \
+    [--channel-deep-only] [--r-c RUN2] [--r-d RUN2] \
+    [--r-e-plan --out pairs.csv --n-deep 128 --n-low 128] \
+    [--r-e-check PREDICT_RUN]
+```
+
+- **R-a** transitive consistency: recount of C1–C4 plus a new count a3
+  (a row class spanning two 2 MiB pages is physically impossible — the
+  in-page column field cannot absorb PA bits >= 21). Bar: every count 0.
+- **R-b** class cardinality: the unbiased cross-page deep rate against
+  the 1/384 prior (z-test) plus the implied bank count. The
+  uniform-hash Monte Carlo null is demoted to diagnostics: the T1 reps
+  were drawn one per v0 channel component and lambda correlates with
+  bank, so reps are bank-clustered (rep-rep deeps 64 vs null p50 6) —
+  a selection property, measured and reported, not gated on.
+- **R-c** same-card reproducibility: hard deep<->low flips bar 0 (a
+  flip across the measured-empty valley falsifies the model); deep|mid
+  REGION recall >= 99% and d-shift <= 15 cyc, because deep<->mid is
+  gate wobble — each run's gate rides its own single-query calibration
+  amplitude. Also anchor-validity agreement and same-bank partition
+  co-membership Jaccard.
+- **R-d** cross-card transfer (same model, another GPU): structure bars
+  only — hard-flip RATE <= 0.1%, Jaccard >= 0.99, region >= 99%; the
+  corrected-d median shift is informational because lambda carries a
+  per-card timing offset. This is why the table stores classes, not
+  cycles.
+- **R-e** end-to-end prediction: `--r-e-plan` samples unmeasured pairs
+  the table predicts transitively (same row class -> low, row classes
+  linked by a deep edge -> deep, row relation unknown -> excluded;
+  cross-page pairs first), the orchestrator's
+  `--work-mode predict-check --pairs-csv` measures them through the
+  calibration/self/predict/repeat query plan, and `--r-e-check` scores
+  the run. Bar >= 95% per class counting hard flips only.
+
+## S5-T2 result (2026-09-17): 5/5 gates PASS, row classes probable
+
+Runs: R-c rerun `run_pool_gpu0_1789662064404501578`, predict-check
+`run_pool_gpu0_1789663372902350235`, cross-card GPU 1
+`run_pool_gpu1_1789663447672819650` (different UUID, identical pool PA
+layout — first_pa 0x1ee00000 on both cards).
+
+- **R-a PASS** — a1/a2/a3/a4 = 0/0/0/0 on table v2 (both T1 runs
+  merged).
+- **R-b PASS** — cross-page deep rate 774/302956 = 0.2555% vs prior
+  0.2604% (z = −0.53); implied banks 391 (2σ 365..422) covers 384.
+  Null diagnostics: components 60 vs 67–68, covered 370 vs 408–465,
+  rep-rep deeps 64 vs 6 — all v0 rep-selection properties (bank
+  clustering), not hash violations; next build round should draw reps
+  uniformly.
+- **R-c PASS** — 200830 common pairs, agreement 99.45%, deep region
+  recall 10936/10936, hard flips 0, d-shift median 4 cyc, anchor hard
+  flips 0, co-membership Jaccard 1.000; universal masks 0x1f9dc0 +
+  0x1fdc80.
+- **R-d PASS** — GPU0 vs GPU1: agreement 99.36%, deep region recall
+  10936/10936, hard-flip rate 0/200830 = 0.0000%, anchor hard 0,
+  Jaccard 1.000; d-shift median 25 cyc informational (amp 110 vs 111,
+  calibration 1032/1038/1149 — the per-card timing offset). The
+  same-bank structure — 387 deeps to the same 60 components/370 pages,
+  bank-map offset sets, void pages, universal 0x1f9dc0 — transfers
+  across cards of one model (0x1fdc80 is 2047/2048 on GPU 1): the
+  table is per-MODEL, corroborating GeForge's reuse claim with
+  measured evidence.
+- **R-e PASS** — 215 predicted pairs (128 deep, 87 low): deep hard
+  0/128 = 100%, low hard 86/87 = 98.85%. One hard falsifier
+  (0x2aed3880/0x2aed7b00 — both reproducibly anchor-low vs M at
+  0x2ae00000, yet deep +97 between themselves): the double-probe row
+  inference is not universally valid, so row classes are PROBABLE
+  (~1% error); bank-level claims are solid (deep hard flips 0/128 in
+  every gate).
+
+Verdict for G4/G5: bank classes may be consumed as measured facts; row
+classes carry ~1% uncertainty — treat a row-class collision as strong
+evidence, not proof (a future build round should double-read low edges
+used for row merging).
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the

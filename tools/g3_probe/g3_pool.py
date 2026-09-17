@@ -674,6 +674,100 @@ def select_table_build_queries(pool: PoolMap, **kwargs) -> list[Query]:
     return [typed.query for typed in plan]
 
 
+def plan_predict_check_queries(pool: PoolMap,
+                               pair_pas: Sequence[tuple[int, int, str]],
+                               repeat_pages: int = 32
+                               ) -> tuple[list[TypedQuery], dict[str, object]]:
+    """S5-T2 R-e prediction-check plan. Section order is contractual
+    for validate_table.py --r-e-check:
+
+      calibration  ids 0..2: floor / different-bank / anchor conflict
+      self         (p, p) per DISTINCT page touched by a kept pair, in
+                   PA order -- the lambda references
+      predict      one row per kept (pa_a, pa_b, predicted) triple in
+                   input order; validate_table scores the measured
+                   label against the embedded prediction
+      repeat       the first repeat_pages touched pages again, late in
+                   the list -- the drift anchor for the late-section
+                   step
+
+    pair_pas entries are (pa_a, pa_b, predicted) byte PAs from the
+    table's transitive closure; each PA must fall inside THIS run's
+    pool or the pair is reported in meta['dropped'], never silently
+    dropped.
+    """
+    import bisect
+    bases = [page.fb_pa_page_base for page in pool.pa_pages]
+
+    def page_of(pa: int) -> Page | None:
+        index = bisect.bisect_right(bases, pa) - 1
+        if index < 0:
+            return None
+        page = pool.pa_pages[index]
+        return page if pa < page.fb_pa_page_base + page.page_size else None
+
+    def half(pa: int, page: Page) -> tuple[int, int]:
+        offset = page.va_page_base - pool.chunk_base_va(page.chunk_index)
+        return page.chunk_index, offset + (pa - page.fb_pa_page_base)
+
+    dropped: list[str] = []
+    kept: list[tuple[int, int, int, int, str]] = []
+    kept_pas: list[tuple[int, int, str]] = []
+    for pa_a, pa_b, predicted in pair_pas:
+        page_a, page_b = page_of(pa_a), page_of(pa_b)
+        if page_a is None or page_b is None:
+            dropped.append(f"0x{pa_a:x}/0x{pa_b:x}")
+            continue
+        chunk_a, ofs_a = half(pa_a, page_a)
+        chunk_b, ofs_b = half(pa_b, page_b)
+        kept.append((chunk_a, ofs_a, chunk_b, ofs_b, predicted))
+        kept_pas.append((pa_a, pa_b, predicted))
+
+    touched_bases = {page.fb_pa_page_base
+                     for pa_a, pa_b, _ in kept_pas
+                     for page in (page_of(pa_a), page_of(pa_b))}
+    self_pages = sorted(touched_bases)
+    self_page_of = {page.fb_pa_page_base: page
+                    for page in pool.pa_pages}
+
+    plan: list[TypedQuery] = []
+    first = pool.pa_pages[0]
+    for index, candidate in enumerate(S1_IN_PAGE_CANDIDATES):
+        offset = first.va_page_base - pool.chunk_base_va(first.chunk_index)
+        plan.append(TypedQuery(Query(first.chunk_index, offset,
+                                     first.chunk_index, offset + candidate),
+                               "calibration",
+                               role=("floor", "baseline", "conflict")[index]))
+    for index, base in enumerate(self_pages):
+        page = self_page_of[base]
+        offset = page.va_page_base - pool.chunk_base_va(page.chunk_index)
+        plan.append(TypedQuery(Query(page.chunk_index, offset,
+                                     page.chunk_index, offset),
+                               "self", sample_index=index))
+    for index, (chunk_a, ofs_a, chunk_b, ofs_b, _) in enumerate(kept):
+        plan.append(TypedQuery(Query(chunk_a, ofs_a, chunk_b, ofs_b),
+                               "predict", sample_index=index))
+    repeat_of = self_pages[:repeat_pages]
+    for index, base in enumerate(repeat_of):
+        page = self_page_of[base]
+        offset = page.va_page_base - pool.chunk_base_va(page.chunk_index)
+        plan.append(TypedQuery(Query(page.chunk_index, offset,
+                                     page.chunk_index, offset),
+                               "repeat", sample_index=index, role="drift"))
+
+    meta: dict[str, object] = {
+        "pairs": len(kept),
+        "pair_pa_a": [f"0x{pa_a:x}" for pa_a, _, _ in kept_pas],
+        "pair_pa_b": [f"0x{pa_b:x}" for _, pa_b, _ in kept_pas],
+        "pair_predicted": [predicted for _, _, predicted in kept_pas],
+        "self_pages": [f"0x{base:x}" for base in self_pages],
+        "repeat_pages": len(repeat_of),
+        "repeat_of": [f"0x{base:x}" for base in repeat_of],
+        "dropped": {"pairs": dropped},
+    }
+    return plan, meta
+
+
 def write_work_csv(path: Path | None, queries: list[Query],
                    mode: str = "sanity") -> str:
     lines = [f"# mode={mode}", WORK_HEADER]
@@ -906,6 +1000,36 @@ def self_test() -> int:
     for typed in repeat:
         pa_a, pa_b = pool.query_pa(typed.query)
         assert pa_a == pa_b and pa_a & (page_size - 1) == 0
+
+    # Predict-check: calibration triple, one self per DISTINCT touched
+    # page in PA order, one row per kept pair (PA round-trip exact,
+    # including in-page offsets), repeat block over the first touched
+    # pages, off-pool pairs reported.
+    pplan, pmeta = plan_predict_check_queries(
+        pool,
+        pair_pas=[(0x120000000 + 0x200, 0x120000000 + 0xd0300, "low"),
+                  (0x120000000, 0x120400000 + 0xd0100, "deep_conflict"),
+                  (0x120600000 + 0x1000, 0x900000000, "deep_conflict")],
+        repeat_pages=2)
+    psections = [typed.section for typed in pplan]
+    assert psections == (["calibration"] * 3 + ["self"] * 2
+                         + ["predict"] * 2 + ["repeat"] * 2), psections
+    assert pmeta["dropped"] == {"pairs": ["0x120601000/0x900000000"]}
+    assert pmeta["pair_pa_a"] == ["0x120000200", "0x120000000"]
+    assert pmeta["pair_pa_b"] == ["0x1200d0300", "0x1204d0100"]
+    assert pmeta["pair_predicted"] == ["low", "deep_conflict"]
+    assert pmeta["self_pages"] == ["0x120000000", "0x120400000"], \
+        pmeta["self_pages"]
+    assert pmeta["repeat_of"] == ["0x120000000", "0x120400000"]
+    self_rows = [typed for typed in pplan if typed.section == "self"]
+    for typed, base in zip(self_rows, pmeta["self_pages"]):
+        pa_a, pa_b = pool.query_pa(typed.query)
+        assert pa_a == pa_b == int(base, 16)
+    predict_rows = [typed for typed in pplan if typed.section == "predict"]
+    for typed, pa_hex_a, pa_hex_b in zip(predict_rows, pmeta["pair_pa_a"],
+                                         pmeta["pair_pa_b"]):
+        assert pool.query_pa(typed.query) == (int(pa_hex_a, 16),
+                                              int(pa_hex_b, 16))
 
     print("g3_pool self-test: PASS")
     return 0

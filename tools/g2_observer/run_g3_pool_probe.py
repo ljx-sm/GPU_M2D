@@ -76,6 +76,7 @@ from g3_pool import (  # noqa: E402  (path-based import of a sibling tool)
     PoolMap,
     Page,
     plan_census_queries,
+    plan_predict_check_queries,
     plan_table_build_queries,
     select_bit_scan_queries,
     select_pair_scan_queries,
@@ -235,7 +236,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cross-page", type=int, default=8,
                         help="sanity mode: cross-page queries over the observed PA range")
     parser.add_argument("--work-mode", choices=("sanity", "bit-scan", "pair-scan",
-                                                 "census", "table-build"),
+                                                 "census", "table-build",
+                                                 "predict-check"),
                         default="sanity",
                         help="query selection: S2 sanity triple, the S3 bit-scan "
                              "matrix, the S3b anchored/two-bit matrix, the "
@@ -253,6 +255,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bank-map-pages", type=int, default=8,
                         help="table-build mode: anchor-valid pages for the "
                              "double-probe bank/row map")
+    parser.add_argument("--pairs-csv", type=Path, default=None,
+                        help="predict-check mode: CSV with pa_a,pa_b,predicted "
+                             "rows (validate_table.py --r-e-plan output)")
     parser.add_argument("--reprobe-csv", type=Path, action="append", default=[],
                         help="census mode: CSV(s) with pa_a,pa_b columns to "
                              "re-measure (e.g. suspect_conflicts.csv from "
@@ -757,6 +762,27 @@ def main() -> int:
                 print("GPU_M2D_G3_TABLE_BUILD_WARNING: seed components with "
                       "no backed representative: " + "; ".join(comp_dropped))
             extra["table_build_selection"] = tb_meta
+        elif args.work_mode == "predict-check":
+            if args.pairs_csv is None:
+                raise RuntimeError("predict-check needs --pairs-csv "
+                                   "(validate_table.py --r-e-plan output)")
+            pair_pas: list[tuple[int, int, str]] = []
+            with args.pairs_csv.open(encoding="utf-8", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    if row.get("pa_a") and row.get("pa_b"):
+                        pair_pas.append((int(row["pa_a"], 16),
+                                         int(row["pa_b"], 16),
+                                         row.get("predicted", "")))
+            if not pair_pas:
+                raise RuntimeError(f"no pairs in {args.pairs_csv}")
+            pc_plan, pc_meta = plan_predict_check_queries(
+                pool, pair_pas=pair_pas, repeat_pages=args.repeat_pages)
+            queries = [typed.query for typed in pc_plan]
+            pc_meta["predicted_from"] = str(args.pairs_csv)
+            if pc_meta["dropped"]["pairs"]:
+                print("GPU_M2D_G3_PREDICT_CHECK_WARNING: off-pool pairs "
+                      "dropped: " + ", ".join(pc_meta["dropped"]["pairs"]))
+            extra["predict_check_selection"] = pc_meta
         else:
             queries = select_sanity_queries(pool, cross_page=args.cross_page)
         work = [(index, query.chunk_a, query.ofs_a, query.chunk_b, query.ofs_b)
