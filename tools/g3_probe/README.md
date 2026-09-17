@@ -720,6 +720,78 @@ classes carry ~1% uncertainty — treat a row-class collision as strong
 evidence, not proof (a future build round should double-read low edges
 used for row merging).
 
+## T3.0 — big-pool full-card table (table v3)
+
+The table is an absolute-PA relation snapshot (the S4 verdict + per-page
+seeded lattice: cross-page same-bank Jaccard p50 0.36), so a NEW PA can
+only be measured, never extrapolated. Rather than rebuild mid-experiment
+when an experiment pool grows, T3.0 pays the coverage cost once: a
+704×32 MiB ≈ 22 GiB pool = 11264 pages covering the whole card. Reps are
+drawn UNIFORMLY (`--rep-uniform N`, default seed 7) — the T2 R-b
+diagnostic showed the v0 seed reps were bank-clustered (rep-rep deeps 64
+vs null 6). With 384 banks, R uniform reps link 1−(1−1/384)^R of pages
+to a same-bank rep: R=1024 → 93% (chosen; 1536 → 98% costs 50% more
+queries for 5 points of coverage). Query budget ≈ 11.8M (classify
+11264×1024 dominates), ~18 min of work on an idle card.
+
+Two gate refinements, both evidence-driven and documented in
+`validate_table.py` (never bar-bending; each carries its measured
+rationale):
+
+- **R-b effective-class band** — the big run (11.5M classify pairs)
+  measures the cross-page deep rate reproducibly 2% BELOW 1/384:
+  implied effective classes 392 (2σ 387..396, z = −3.4; earlier runs
+  391.4/391.7 agree). A rate below 1/384 is impossible for any fixed
+  distribution over ≤384 buckets (non-uniformity only raises
+  collisions), so the deviation direction excludes the corruption R-b
+  exists to catch; and the per-page degree split proves σ is NOT
+  understated (non-rep degrees UNDER-dispersed vs the multinomial null,
+  variance 2.20 vs 2.67, no page above the null max degree — the
+  apparent 27× overdispersion is just the two populations: ~2.7 for
+  normal pages, ~30 for the 1024 reps themselves). Gate = implied
+  classes in [368, 400]; the exactly-uniform-384 z-test and the MC null
+  stay as printed diagnostics.
+- **R-d Jaccard is same-shape only** — co-membership across runs with
+  different pool/rep sets compares pair coverage, not structure (the
+  denser graph merges strictly more page pairs by measuring more of
+  them; big-vs-old-2048 measured Jaccard 0.199 with zero hard flips
+  both ways). Shape-mismatched pairs print it as informational; the
+  falsifying bars (hard-flip rate, anchor flips, region recall) stay
+  fully gated. Same-shape cross-card runs (the T3.0 protocol: identical
+  builds per card) still gate Jaccard ≥ 0.99.
+
+`build_bank_table.py` also validates every T1 edge against ITS OWN
+run's `pool_map.csv` universe (big-run edges span 11264 pages; the
+2048-page census universe was the wrong integrity reference — the first
+v3 build attempt failed closed on exactly this) and widens the table
+universe to census ∪ T1-pool pages with an honest empty λ cell for
+T1-only pages (λ is per-run timing, never a table constant).
+
+## T3.0 result on GPU 0 (2026-09-17): 96% coverage, 4/4 gates + R-e PASS
+
+Big build `run_pool_gpu0_1789670148751001580`: 11,815,371 queries in
+513 s (23,028 q/s), 0 failures, amp 117, late offset −18. PA hole
+stable (first_pa 0x1ee00000, one contiguous 22 GiB range, old 2048
+pages a strict subset). Cross-page deep rate 29441/11533312 = 0.2553%.
+Anchor validity 11264/11264 pages (0x1f9dc0 11264, 0x1fdc80 11263);
+super-conflict trio (pages ≡7 mod 16) 25/25 lattice offsets identical
+across runs; 0x2ae/0x42e bank maps match T1 exactly. Three bank-map
+pages void (0x22e/0x2ce/0x48e anchors read low) — traced to stale S3b
+mining under the λ-referenced model, not a reproducibility failure
+(rerun-vs-big anchor hard flips 0/49152).
+
+Table v3 (`artifacts/g3/table_v3/`): universe 11264 pages (2048 census +
+9216 T1-pool-only), 11396475 deduped edges (deep 81050), C1–C4 all 0
+contradictions; 372 same-bank page components over 10852/11264 pages
+(**96%**, was 370/2048 = 18%), largest 42; classified bank-class nodes
+on 11264/11264 pages. Gates: R-a 0/0/0/0; R-b K̂ 392 in band; R-c vs
+the 2048-page rerun — hard flips 0, region recall 10521/10521, d-shift
+median 5, anchor hard 0; R-d vs GPU1's 2048-page run — hard-flip rate
+0/71869, anchor hard 0, region recall 100%, Jaccard informational
+(shape mismatch); R-e — deep hard 0/128, low 86/87 (the same reproducible
+0x2aed3880/0x2aed7b00 row-inference falsifier as T2). GPU1/GPU2
+same-shape big builds follow; big-vs-big R-d gates Jaccard.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the

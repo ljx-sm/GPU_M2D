@@ -256,24 +256,57 @@ def contradictions(edges, part, lambdas) -> dict[str, list[tuple[int, int]]]:
     return found
 
 
+def load_t1_pool_pages(t1: list[Path], problems: list[str]) \
+        -> dict[str, set[int]]:
+    """Per-T1-run pool page bases from pool_map.csv -- the integrity
+    universe for that run's edges. A big-pool T1 run covers pages far
+    beyond the census universe; analyze_table_build.py already verified
+    every edge against its own pool map, and this re-checks it
+    independently (fail-closed on a missing map)."""
+    pages: dict[str, set[int]] = {}
+    for path in t1:
+        map_csv = path / "pool_map.csv"
+        if not map_csv.is_file():
+            problems.append(f"missing {map_csv} (T1 universe unverifiable)")
+            continue
+        bases: set[int] = set()
+        with map_csv.open(encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                if row.get("fb_pa_page_base"):
+                    bases.add(_hex(row["fb_pa_page_base"]) >> 21)
+        pages[f"t1:{path.name}"] = bases
+    return pages
+
+
 def analyze(s3: Path, s3b: Path, census: Path, out: Path,
             query: int | None, t1: list[Path] | None = None,
             channel_deep_only: bool = False) -> int:
     t1 = t1 or []
     problems: list[str] = []
     edges, disagreements = load_edges(s3, s3b, census, t1, problems)
-    lambdas = load_pages(census, problems)
-    for (a, b) in edges:
+    census_lambdas = load_pages(census, problems)
+    t1_pages = load_t1_pool_pages(t1, problems)
+    census_pages = set(census_lambdas)
+    for (a, b), (_, source) in edges.items():
+        allowed = (t1_pages.get(source, census_pages)
+                   if source.startswith("t1:") else census_pages)
         for pa in (a, b):
-            if (pa >> 21) not in lambdas:
-                problems.append(f"edge PA 0x{pa:x} not on a census page "
-                                f"(pool-map mismatch)")
+            if (pa >> 21) not in allowed:
+                problems.append(f"edge PA 0x{pa:x} not on a {source} "
+                                f"pool page (pool-map mismatch)")
                 break
         if problems:
             break
     if problems:
         print(f"INTEGRITY: {'; '.join(problems)}")
         return 2
+    # Universe = census pages + every T1 pool page. The lambda column
+    # carries the census value only: lambda is a per-run timing property
+    # (the R-d cross-card offset is ~26 cycles), never a table constant,
+    # so an empty cell is honest for T1-only pages.
+    lambdas = {page: census_lambdas.get(page, "")
+               for page in census_pages
+               | {base for bases in t1_pages.values() for base in bases}}
 
     part = build(edges, channel_deep_only)
     found = contradictions(edges, part, lambdas)
@@ -289,7 +322,9 @@ def analyze(s3: Path, s3b: Path, census: Path, out: Path,
         if not t1 else
         f"=== EMT table (S5-T0 seed + {len(t1)} S5-T1 densified "
         "source(s)) ===")
-    say(f"pool universe: {len(lambdas)} census pages; edges after dedup: "
+    say(f"pool universe: {len(lambdas)} pages ({len(census_pages)} census "
+        f"+ {len(lambdas) - len(census_pages)} T1-pool-only, lambda column "
+        f"from the census run); edges after dedup: "
         f"{len(edges)} (deep {n_cls['deep_conflict']}, shoulder "
         f"{n_cls['shoulder']}, low {n_cls['low']}, mid {n_cls['mid']} "
         f"excluded from classes) from {dict(n_src)}")
@@ -602,6 +637,9 @@ def self_test() -> int:
         # --t1 fold: the table-build run re-measures (4,5) as deep where
         # the reprobe said shoulder -> t1 wins, C5 records the flip, and a
         # bank class now spans pages 4/5 through the fresh cross-page deep.
+        # The t1 pool_map also carries page 9 BEYOND the census universe
+        # (big-pool build): an edge there must pass integrity and widen
+        # the seed table universe with an empty lambda cell.
         t1_dir = root / "t1"
         t1_dir.mkdir()
         t1_fields = ["query_id", "pa_a", "pa_b", "section", "cycles_a",
@@ -609,7 +647,15 @@ def self_test() -> int:
         (t1_dir / "table_build_edges.csv").write_text(
             ",".join(t1_fields) + "\n"
             f"0,0x{pa(4, 0x1000):x},0x{pa(5, 0x1000):x},classify,"
-            "1141,1141,18,1159,deep_conflict\n")
+            "1141,1141,18,1159,deep_conflict\n"
+            f"1,0x{pa(9, 0):x},0x{pa(9, 0x200):x},classify,"
+            "1141,1141,18,1141,low\n")
+        with (t1_dir / "pool_map.csv").open("w", encoding="utf-8",
+                                            newline="") as sink:
+            writer = csv.writer(sink)
+            writer.writerow(["fb_pa_page_base"])
+            for page in (*range(8), 9):
+                writer.writerow([f"0x{pa(page):x}"])
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             code = analyze(root / "s3", root / "s3b", root / "census",
@@ -617,6 +663,7 @@ def self_test() -> int:
         assert code == 0
         report = buffer.getvalue()
         assert "S5-T0 seed + 1 S5-T1 densified source(s)" in report, report
+        assert "8 census + 1 T1-pool-only" in report, report
         # 3 = the pilot flip + the t1 deep disagreeing with BOTH older
         # sources that measured (4,5): reprobe shoulder and s3 shoulder.
         assert "C5 cross-source disagreements: 3" in report, report
@@ -626,6 +673,24 @@ def self_test() -> int:
         assert (nodes[f"0x{pa(4, 0x1000):x}"]["bank_class"]
                 == nodes[f"0x{pa(5, 0x1000):x}"]["bank_class"])
         assert int(nodes[f"0x{pa(4, 0x1000):x}"]["bank_size"]) >= 2
+        # a bare low pair carries no deep anchor, so the two page-9 nodes
+        # land as singletons (row merging needs a bank class first)
+        assert nodes[f"0x{pa(9, 0):x}"]["bank_size"] == "1"
+        assert nodes[f"0x{pa(9, 0x200):x}"]["bank_size"] == "1"
+        pages = {row["page_index"]: row for row in csv.DictReader(
+            (out / "gddr_seed_table.csv").open(encoding="utf-8"))}
+        assert len(pages) == 9 and pages["9"]["lambda"] == ""
+
+        # fail-closed: a t1 edge off ITS OWN pool map refuses the run
+        (t1_dir / "table_build_edges.csv").write_text(
+            ",".join(t1_fields) + "\n"
+            f"0,0x{pa(99, 0):x},0x{pa(99, 0x200):x},classify,"
+            "1141,1141,18,1141,low\n")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = analyze(root / "s3", root / "s3b", root / "census",
+                           out, None, t1=[t1_dir])
+        assert code == 2 and "INTEGRITY" in buffer.getvalue()
 
         # fail-closed: an edge off the census pages refuses the run
         bad = root / "s3" / "constraints_bands.csv"
