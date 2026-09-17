@@ -485,6 +485,60 @@ and writes `channel_components.csv`.
   the seeded row fold, and 70 structurally-similar deep conflicts do
   not span it.
 
+## S5-T0 — empirical mapping table (EMT) builder
+
+Direction change (2026-09-17): the closed-form solver line is archived as
+an honest negative result (S4/S4b-2, independently confirmed by GeForge's
+footnote 1 — see `docs/G3_SURVEY.md` section 1). The G3 deliverable
+becomes the GeForge-style empirical table: measure which PAs share
+(channel, bank, row), store the classes, query them. G2 pins every pool
+page's true PA each run, so GeForge's page-anchoring problem does not
+exist here.
+
+`build_bank_table.py` is the pure-offline first step — zero new
+collection. It folds S3/S3b/census into the seed table:
+
+- edges deduped by PA pair with **reprobe > pilot > S3b > S3 priority**
+  (the controlled re-measurement supersedes the retroactive label);
+- bank classes = union-find over deep conflicts (same bank, different
+  row); row classes = union-find over low pairs **inside** a bank class
+  (same bank AND same row); mid pairs never become class evidence;
+- the same-channel page graph is recomputed from the deduped edges and
+  cross-checked against the S4b-2 `channel_components.csv`;
+- consistency gates C1 (shoulder inside a bank class), C2 (deep inside a
+  row class), C3 (cross-page low inside a channel component), C4
+  (cross-page low inside a bank class), C5 (cross-source label
+  disagreements).
+
+```bash
+python3 build_bank_table.py \
+    artifacts/g3/pool/<s3_run> artifacts/g3/pool/<s3b_run> \
+    artifacts/g3/pool/<census_run> --out artifacts/g3/table_v0 \
+    [--query 0x1eed0100]
+```
+
+## S5-T0 result on GPU 0 (2026-09-17): clean seed, honest sparsity
+
+- 2455 deduped edges (54 deep / 320 shoulder / 1932 low; 149 mid
+  excluded) over the 2048-page pool universe. The deep count corrects
+  S4b-2's "70": those were 71 rows over **47 distinct pairs** (S3b's
+  probe types re-emit the same pair), 3 confirmed by the pilot, 1
+  demoted to shoulder by its re-probe — 54 survive.
+- The recomputed channel partition is **74 components over 220 pages**,
+  not S4b-2's 82/250: that graph only ADDED reprobe shoulders and never
+  demoted bands labels; here 29 cross-page shoulder edges re-measured
+  as low/mid are dropped. C3 falls to 20/807 (2.5%) on the corrected
+  graph — the demotion makes the partition cleaner, not worse.
+- Classes: 40 bank classes with ≥2 nodes (largest 12 at the pilot page,
+  38 pairs of 2), 4 row pairs — the S4b-1 pilot structure is the spine;
+  **zero** bank classes span pages (the single cross-page deep of
+  S4b-2 was the re-probe demotion). C1/C2/C4: 0 contradictions.
+- Coverage is honestly sparse: channel component on 220/2048 pages,
+  classified nodes on 38/2048 pages, 2022/2114 singleton nodes. That
+  is exactly the S5-T1 workload: an iterative anchor-expansion
+  collection mode (`--work-mode table-build`) that densifies classes
+  until the pool is covered.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the

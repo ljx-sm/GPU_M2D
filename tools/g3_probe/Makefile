@@ -24,7 +24,7 @@ check: all
 	python3 -m py_compile analyze_scan.py analyze_bit_scan.py \
 		analyze_pair_scan.py analyze_local_recal.py analyze_census.py \
 		analyze_three_band.py analyze_channel_graph.py solve_mapping.py \
-		g3_pool.py
+		build_bank_table.py g3_pool.py
 	python3 analyze_scan.py --self-test
 	python3 analyze_bit_scan.py --self-test
 	python3 analyze_pair_scan.py --self-test
@@ -33,6 +33,7 @@ check: all
 	python3 analyze_three_band.py --self-test
 	python3 analyze_channel_graph.py --self-test
 	python3 solve_mapping.py --self-test
+	python3 build_bank_table.py --self-test
 	python3 g3_pool.py --self-test
 
 clean:

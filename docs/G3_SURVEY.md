@@ -13,11 +13,13 @@ measurement (research-plan requirement R2).
 | --- | --- | --- | --- |
 | `sith-lab/gpuhammer` | `2bfd290cdfa289370fc41152d552eb78cdacc51d` | 2026-03-11 | none |
 | `heelsec/GDDRHammer` | `30673e5433440fcc39dd27833563a29326b61add` | 2026-08-03 | none |
+| `stefan1wan/GeForge` | `dbccd1248443759bea86b7e1c117848dc094478d` (main) | 2026-09 (checked) | none |
 
-Both are cloned to `/data1/luojx/g3_refs/` (outside this repository). They
-carry **no license**, so nothing may be copied into GPU_M2D; we study the
-methodology and write our own implementation (which we must do anyway,
-because our probe is PA-annotated while theirs is a VA-only black box).
+All are cloned to `/data1/luojx/g3_refs/` (outside this repository; GeForge
+inspected via GitHub only). They carry **no license**, so nothing may be
+copied into GPU_M2D; we study the methodology and write our own
+implementation (which we must do anyway, because our probe is PA-annotated
+while theirs is a VA-only black box).
 
 - GPUHammer (USENIX Security '25, U Toronto): first practical Rowhammer on
   GPU GDDR6; its `src/re_gddr/` is the address-mapping RE toolchain
@@ -26,6 +28,19 @@ because our probe is PA-annotated while theirs is a VA-only black box).
 - GDDRHammer (IEEE S&P '26): fork of the same RE toolchain plus multibank
   synchronized hammering and multi-GPU orchestration
   (`rowhammer/util/run_timing_task_multi_gpus.py`, `lock_freq.sh`).
+- GeForge (IEEE S&P '26, PDF in repo root): end-to-end GPU page-table
+  Rowhammer. **We adopt ONLY its mapping methodology** — offline per-model
+  profiling into an empirical (bank,row) table (`mapping/PA-BANK_ROW-DIR_*`,
+  per-bank row→PA-chunk lists at 256 B granularity), the row-stripe
+  monotonic-row-ID model (App. B), and per-model reuse. Its footnote 1
+  independently confirms our S4 verdict: the PA→bank function "is not only
+  highly non-linear but also mixes (nearly) all address bits", so they too
+  never reverse-engineer a closed form. Their page anchoring (L2
+  eviction-set fingerprints to locate a page frame without PA visibility)
+  is unnecessary for us: the G2 observer pins true PAs every run. The
+  hammering patterns, memory templating, memory massaging, and the exploit
+  chain are attack techniques outside our defensive scope and are not
+  ported (shared GPU; read-only observation discipline).
 
 ## 2. Technique catalog to port into our S1/S3 probe
 
