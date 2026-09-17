@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import random
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -537,6 +538,19 @@ TABLE_BUILD_ANCHOR_CANDIDATES = (0xd0100, 0xd0300, 0xd7b00, 0x11e300,
 # column bit (S4b-1 pilot), so 0x200 pairs inside one bank class are
 # same-row evidence.
 TABLE_BUILD_COLUMN_PROBE = 0x200
+
+
+def sample_uniform_reps(pool: PoolMap, count: int, seed: int = 7) -> list[int]:
+    """Uniformly drawn rep page bases for big-pool table builds. The
+    seed-table reps are one per v0 channel component and land
+    bank-clustered (the S5-T2 R-b diagnostic: rep-rep deep edges 64 vs
+    null 6), so a fresh large pool draws its reps uniformly instead --
+    with 384 banks, count R links a fraction 1-(1-1/384)^R of pages to
+    a same-bank rep (R=1024 -> ~93%, R=1536 -> ~98%). The fixed default
+    seed makes the selection reproducible run to run."""
+    rng = random.Random(seed)
+    bases = sorted(page.fb_pa_page_base for page in pool.pa_pages)
+    return sorted(rng.sample(bases, min(count, len(bases))))
 
 
 def plan_table_build_queries(pool: PoolMap,
@@ -1030,6 +1044,14 @@ def self_test() -> int:
                                          pmeta["pair_pa_b"]):
         assert pool.query_pa(typed.query) == (int(pa_hex_a, 16),
                                               int(pa_hex_b, 16))
+
+    # uniform rep sampling: deterministic, sorted, distinct, clamped
+    universe = {0x120000000, 0x120400000, 0x120200000, 0x120600000}
+    reps = sample_uniform_reps(pool, 3, seed=7)
+    assert len(reps) == 3 and reps == sorted(reps) \
+        and len(set(reps)) == 3 and set(reps) <= universe, reps
+    assert sample_uniform_reps(pool, 3, seed=7) == reps
+    assert sample_uniform_reps(pool, 99) == sorted(universe)
 
     print("g3_pool self-test: PASS")
     return 0

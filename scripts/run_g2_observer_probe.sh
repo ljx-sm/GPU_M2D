@@ -59,7 +59,8 @@ while [[ $# -gt 0 ]]; do
         --row-pilot-pages|--census-stride|--repeat-pages) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --reprobe-csv|--row-pilot-from) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
-        --seed-table|--bank-map-from|--bank-map-pages|--pairs-csv) \
+        --seed-table|--bank-map-from|--bank-map-pages|--pairs-csv|\
+        --rep-uniform|--rep-seed) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --device) G3_DEVICE="$2"; shift 2 ;;
         --runner) RUNNER="$2"; shift 2 ;;

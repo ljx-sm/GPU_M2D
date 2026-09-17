@@ -78,6 +78,7 @@ from g3_pool import (  # noqa: E402  (path-based import of a sibling tool)
     plan_census_queries,
     plan_predict_check_queries,
     plan_table_build_queries,
+    sample_uniform_reps,
     select_bit_scan_queries,
     select_pair_scan_queries,
     select_sanity_queries,
@@ -248,6 +249,14 @@ def parse_args() -> argparse.Namespace:
                         help="table-build mode: seed table dir "
                              "(gddr_seed_table.csv from build_bank_table.py); "
                              "one rep page per channel component")
+    parser.add_argument("--rep-uniform", type=int, default=0, metavar="N",
+                        help="table-build mode: draw N rep pages uniformly "
+                             "from the pool instead of the seed table (big-"
+                             "pool builds; the seed reps are bank-clustered). "
+                             "With 384 banks, N=1024 links ~93% of pages to "
+                             "a same-bank rep")
+    parser.add_argument("--rep-seed", type=int, default=7,
+                        help="RNG seed for --rep-uniform (reproducible)")
     parser.add_argument("--bank-map-from", type=Path, default=None,
                         help="table-build mode: S3b run directory (or its "
                              "pair_constraints.csv) mined for anchor-valid "
@@ -749,7 +758,15 @@ def main() -> int:
                 "dropped": census_dropped,
             }
         elif args.work_mode == "table-build":
-            reps, comp_dropped = load_seed_reps(args.seed_table, pool)
+            if args.rep_uniform > 0:
+                reps = sample_uniform_reps(pool, args.rep_uniform,
+                                           args.rep_seed)
+                comp_dropped = []
+                rep_source = (f"uniform:{args.rep_uniform}"
+                              f":seed{args.rep_seed}")
+            else:
+                reps, comp_dropped = load_seed_reps(args.seed_table, pool)
+                rep_source = f"seed_table:{args.seed_table}"
             bank_pages = mine_pilot_pages(args.bank_map_from,
                                           args.bank_map_pages,
                                           pool.pages[0].page_size)
@@ -758,6 +775,7 @@ def main() -> int:
                 repeat_pages=args.repeat_pages)
             queries = [typed.query for typed in tb_plan]
             tb_meta["dropped"]["seed_components"] = comp_dropped
+            tb_meta["rep_source"] = rep_source
             if comp_dropped:
                 print("GPU_M2D_G3_TABLE_BUILD_WARNING: seed components with "
                       "no backed representative: " + "; ".join(comp_dropped))
