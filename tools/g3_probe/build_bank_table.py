@@ -40,6 +40,10 @@ inputs / off-pool pages):
       components by construction.)
   C5  cross-source label disagreements on one PA pair -- T1 edges >
       reprobe > pilot > S3b > S3 priority; informational, counted.
+      Across T1 runs a deep<->low contest is resolved by majority vote
+      (a tie leaves the pair mid = unestablished): the anchor sweep's
+      mid valley is populated, so one card's band-edge deep read must
+      not become a same-bank edge against another card's decided low.
 
     python3 build_bank_table.py <s3_run> <s3b_run> <census_run> \
         [--t1 <table_build_run> ...] [--out artifacts/g3/table_v0] \
@@ -157,8 +161,52 @@ def load_edges(s3: Path, s3b: Path, census: Path, t1: list[Path],
         rank_names.append(name)
     rank = {name: i for i, name in
             enumerate(rank_names + ["reprobe", "pilot", "s3b", "s3"])}
-    edges: dict[tuple[int, int], tuple[str, str]] = {}
     disagreements: list[tuple[tuple[int, int], str, str, str]] = []
+    # Cross-T1-run hard contests: deep vs low on one PA pair. A deep
+    # survives a fresher MID read (mid is the undecided valley), but a
+    # decided LOW from another same-shape run is a band-edge
+    # counter-read: the three-card merge measured 633 sweep cells where
+    # GPU2 read deep, GPU1 low, GPU0 mid -- per-card gate placement
+    # (calibration amplitudes 117/121/101 cyc) over a POPULATED sweep
+    # valley (3.5-7% mid cells, unlike classify's empty one). Majority
+    # vote among the decided reads; a tie leaves the pair UNESTABLISHED
+    # (mid, excluded from classes), never a wrong same-bank edge.
+    deep_sets: dict[str, set[tuple[int, int]]] = {
+        name: set() for name in rank_names}
+    for source, cls, pa_a, pa_b in raw:
+        if source in deep_sets and cls == "deep_conflict":
+            key = (pa_a, pa_b) if pa_a < pa_b else (pa_b, pa_a)
+            deep_sets[source].add(key)
+    any_deep: set[tuple[int, int]] = (set().union(*deep_sets.values())
+                                      if deep_sets else set())
+    votes: dict[tuple[int, int], list[tuple[str, str]]] = defaultdict(list)
+    for source, cls, pa_a, pa_b in raw:
+        if cls == "low":
+            key = (pa_a, pa_b) if pa_a < pa_b else (pa_b, pa_a)
+            if key in any_deep:
+                votes[key].append((source, "low"))
+    for key in any_deep:
+        for source, keys in deep_sets.items():
+            if key in keys:
+                votes[key].append((source, "deep_conflict"))
+    contested: dict[tuple[int, int], str] = {}
+    for key, vs in votes.items():
+        deeps = sum(1 for _, c in vs if c == "deep_conflict")
+        lows = len(vs) - deeps
+        if deeps and lows:
+            contested[key] = ("deep_conflict" if deeps > lows
+                              else "low" if lows > deeps else "mid")
+    if contested:
+        freshest = min(rank_names, key=lambda n: rank[n])
+        contested_keys = contested.keys() | set()
+        raw = [(s, c, a, b) for s, c, a, b in raw
+               if not (s in deep_sets and c in ("deep_conflict", "low")
+                       and ((a, b) if a < b else (b, a)) in contested_keys)]
+        for (a, b), winner in contested.items():
+            raw.append((freshest, winner, a, b))
+            disagreements.append(((a, b), "deep<->low", winner,
+                                  f"t1-majority x{len(votes[(a, b)])}"))
+    edges: dict[tuple[int, int], tuple[str, str]] = {}
     for source, cls, pa_a, pa_b in sorted(raw, key=lambda r: rank[r[0]]):
         if pa_a == pa_b:
             continue
@@ -167,6 +215,16 @@ def load_edges(s3: Path, s3b: Path, census: Path, t1: list[Path],
             edges[key] = (cls, source)
         elif edges[key][0] != cls:
             disagreements.append((key, edges[key][0], cls, source))
+            # mid is the undecided valley band and never class evidence:
+            # a DECIDED label from any rank survives a fresher mid, and a
+            # fresher decided label replaces an older mid. A deep measured
+            # once is a same-bank fact (cross-card R-d: hard deep<->low
+            # flips 1/11.8M; deep<->mid is shallow-conflict wobble), so
+            # priority-dropping deeps behind fresher mids would silently
+            # shrink the classes -- measured on the three-card merge:
+            # 26555 deeps behind GPU2 mids, 14 pages of coverage lost.
+            if edges[key][0] == "mid" and cls != "mid":
+                edges[key] = (cls, source)
     return edges, disagreements
 
 
@@ -334,6 +392,13 @@ def analyze(s3: Path, s3b: Path, census: Path, out: Path,
         say(f"C5 cross-source disagreements: {len(disagreements)} "
             f"{dict(flips)} (priority {' > '.join(SOURCE_PRIORITY)} keeps "
             f"the freshest)")
+        n_contest = sum(1 for _, kept, _, _ in disagreements
+                        if kept == "deep<->low")
+        if n_contest:
+            say(f"    of which cross-T1-run deep<->low contests resolved "
+                f"by majority vote (deep needs the plurality; a tie leaves "
+                f"the pair mid = unestablished, excluded from classes): "
+                f"{n_contest}")
     else:
         say("C5 cross-source disagreements: 0")
 
@@ -552,6 +617,10 @@ def self_test() -> int:
         (pa(6, 0x2000), pa(7, 0x2000), "low"),               # C4 + C3
         # C5 plant: s3 says low, pilot says shoulder -> pilot wins
         (pa(5, 0x1000), pa(5, 0x3000), "low"),
+        # C5 mid-override plant: s3 says deep, the fresher reprobe says
+        # mid -> the decided deep must SURVIVE the fresher mid (mid is
+        # the undecided valley, never negative evidence)
+        (pa(7, 0x1000), pa(7, 0x3000), "deep_conflict"),
     ]
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -576,6 +645,10 @@ def self_test() -> int:
             writer.writerow([90, f"0x{pa(4, 0x1000):x}",
                              f"0x{pa(5, 0x1000):x}", 1114, 1114,
                              "shoulder"])
+            # the fresher mid that must NOT kill the s3 deep above
+            writer.writerow([91, f"0x{pa(7, 0x1000):x}",
+                             f"0x{pa(7, 0x3000):x}", 1114, 1114,
+                             "mid"])
         with (root / "census" / "row_pilot_classes.csv").open(
                 "w", encoding="utf-8", newline="") as sink:
             writer = csv.writer(sink)
@@ -596,8 +669,18 @@ def self_test() -> int:
         assert "C2: 1 contradiction(s)" in report, report
         assert "C3: 2 contradiction(s)" in report, report  # plant + C4 edge
         assert "C4: 1 contradiction(s)" in report, report
-        assert "C5 cross-source disagreements: 1" in report, report
+        assert "C5 cross-source disagreements: 2" in report, report
         assert "shoulder->low" in report, report          # C5 direction
+        # the reprobe mid did not kill the s3 deep: (7,0x1000) sits in
+        # the same bank class as (7,0x3000) -- the 5-node class the C4
+        # plant had already grown across p6/p7 (the mid override added
+        # the link)
+        assert "mid->deep_conflict" in report, report
+        nodes = {row["pa"]: row for row in csv.DictReader(
+            (out / "bank_classes.csv").open(encoding="utf-8"))}
+        p7 = [nodes[f"0x{pa(7, 0x1000):x}"], nodes[f"0x{pa(7, 0x3000):x}"]]
+        assert p7[0]["bank_class"] == p7[1]["bank_class"] \
+            and p7[0]["bank_size"] == "5", p7
         assert "2 channel" in report or \
             "channel components (recomputed, cross-page shoulder+deep): 2 " \
             in report, report
@@ -664,9 +747,10 @@ def self_test() -> int:
         report = buffer.getvalue()
         assert "S5-T0 seed + 1 S5-T1 densified source(s)" in report, report
         assert "8 census + 1 T1-pool-only" in report, report
-        # 3 = the pilot flip + the t1 deep disagreeing with BOTH older
-        # sources that measured (4,5): reprobe shoulder and s3 shoulder.
-        assert "C5 cross-source disagreements: 3" in report, report
+        # 4 = the pilot flip + the mid->deep override + the t1 deep
+        # disagreeing with BOTH older sources that measured (4,5):
+        # reprobe shoulder and s3 shoulder.
+        assert "C5 cross-source disagreements: 4" in report, report
         assert "deep_conflict->shoulder" in report, report
         nodes = {row["pa"]: row for row in csv.DictReader(
             (out / "bank_classes.csv").open(encoding="utf-8"))}
@@ -680,6 +764,61 @@ def self_test() -> int:
         pages = {row["page_index"]: row for row in csv.DictReader(
             (out / "gddr_seed_table.csv").open(encoding="utf-8"))}
         assert len(pages) == 9 and pages["9"]["lambda"] == ""
+
+        # -- cross-T1-run contest: a fresher run reading LOW on the
+        # (4,5) deep ties 1-1 -> the pair is UNESTABLISHED (mid; the
+        # older sources' decided labels may still claim it, but never
+        # deep), so the bank link across pages 4/5 must not survive.
+        # A third run re-reading deep wins 2-1 by majority -> back.
+        t1b = root / "t1b"
+        t1b.mkdir()
+        (t1b / "table_build_edges.csv").write_text(
+            ",".join(t1_fields) + "\n"
+            f"0,0x{pa(4, 0x1000):x},0x{pa(5, 0x1000):x},classify,"
+            "1050,1050,0,1050,low\n")
+        for extra in (t1b, ):
+            with (extra / "pool_map.csv").open("w", encoding="utf-8",
+                                               newline="") as sink:
+                writer = csv.writer(sink)
+                writer.writerow(["fb_pa_page_base"])
+                for page in range(9):
+                    writer.writerow([f"0x{pa(page):x}"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = analyze(root / "s3", root / "s3b", root / "census",
+                           out, None, t1=[t1_dir, t1b])
+        assert code == 0
+        report = buffer.getvalue()
+        assert "'deep<->low->mid': 1" in report, report
+        assert "resolved by majority" in report, report
+        nodes = {row["pa"]: row for row in csv.DictReader(
+            (out / "bank_classes.csv").open(encoding="utf-8"))}
+        assert nodes[f"0x{pa(4, 0x1000):x}"]["bank_class"] \
+            != nodes[f"0x{pa(5, 0x1000):x}"]["bank_class"]
+
+        t1c = root / "t1c"
+        t1c.mkdir()
+        (t1c / "table_build_edges.csv").write_text(
+            ",".join(t1_fields) + "\n"
+            f"0,0x{pa(4, 0x1000):x},0x{pa(5, 0x1000):x},classify,"
+            "1141,1141,18,1159,deep_conflict\n")
+        with (t1c / "pool_map.csv").open("w", encoding="utf-8",
+                                         newline="") as sink:
+            writer = csv.writer(sink)
+            writer.writerow(["fb_pa_page_base"])
+            for page in range(9):
+                writer.writerow([f"0x{pa(page):x}"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = analyze(root / "s3", root / "s3b", root / "census",
+                           out, None, t1=[t1_dir, t1b, t1c])
+        assert code == 0
+        report = buffer.getvalue()
+        assert "'deep<->low->deep_conflict': 1" in report, report
+        nodes = {row["pa"]: row for row in csv.DictReader(
+            (out / "bank_classes.csv").open(encoding="utf-8"))}
+        assert nodes[f"0x{pa(4, 0x1000):x}"]["bank_class"] \
+            == nodes[f"0x{pa(5, 0x1000):x}"]["bank_class"]
 
         # fail-closed: a t1 edge off ITS OWN pool map refuses the run
         (t1_dir / "table_build_edges.csv").write_text(

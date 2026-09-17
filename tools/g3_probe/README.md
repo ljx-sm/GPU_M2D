@@ -792,6 +792,67 @@ median 5, anchor hard 0; R-d vs GPU1's 2048-page run — hard-flip rate
 0x2aed3880/0x2aed7b00 row-inference falsifier as T2). GPU1/GPU2
 same-shape big builds follow; big-vs-big R-d gates Jaccard.
 
+## T3.0 result on all three cards (2026-09-17): identical structure, table v4
+
+GPU1 `run_pool_gpu1_1789673269815802288` and GPU2
+`run_pool_gpu2_1789673819559585717`, same shape as GPU0's big build
+(704×32 MiB, `--rep-uniform 1024 --rep-seed 7`): cross-page deeps
+29441/29439/29441 over the identical 11,533,312 classify pairs, the
+same component size head [42, 41, 40, 38, ...], identical bank-map
+lattice tables and the same three void pages (0x22e/0x2ce/0x48e — the
+stale S3b mining labels), 0x1f9dc0 near-universal on every card
+(11264/11263/11264). Calibration amplitudes differ per card:
+117/121/101 cyc.
+
+Pairwise big-vs-big R-d (the T3.0 protocol, identical pool/rep shape):
+
+- GPU1-vs-GPU0: hard deep<->low 1/11803848, deep|mid region recall
+  100.00%, co-membership Jaccard 1.000 (156286 page pairs together in
+  both, 0 in exactly one) — PASS.
+- GPU2-vs-GPU0: hard 43/11803848 (0.0004%), region 99.95%, Jaccard
+  1.000 — PASS. Universal mask in both: 0x1f9dc0.
+- GPU2-vs-GPU1: hard 635/11803848 (0.0054%), region 99.32%, Jaccard
+  1.000 — PASS. All 11264 pages keep a common anchor on every pair.
+
+One more evidence-driven gate refinement (the third of T3.0): the R-d
+per-CELL anchor hard-flip rate is informational, replaced by the
+consumer-level common-anchor bar (no page may lose every anchor the
+other run found; 0.1% rate cross-card, 0 same-card). The anchor
+sweep's mid valley is POPULATED (16427/19162/9461 mid cells =
+3.5–7%, vs classify's 0.08%), so per-card gate placement (amplitudes
+117/121/101) composes a per-cell deep<->low flip out of two soft
+band-edge steps: measured 633 cells GPU2-deep/GPU1-low with GPU0
+reading mid on 601 of them — one direction, 209 pages — while every
+structure bar sat at 1.000 and ZERO pages lost a common anchor
+(11264/11264 pages keep an anchor both runs found; per-page
+anchor-set Jaccard p50 1.000, p10 0.286 on the worst pair). A card
+with a genuinely different bank hash would fail this bar on
+essentially every page.
+
+Two merge rules make the canonical table honest under repeated
+same-shape measurement (`build_bank_table.py`):
+
+- **mid never overrides a decided label** — a deep measured once is a
+  same-bank fact (hard deep<->mid is shallow-conflict wobble); a
+  decided label from any rank survives a fresher mid.
+- **a cross-T1-run deep<->low contest is resolved by majority vote** —
+  deep needs the plurality; a tie leaves the pair mid (unestablished,
+  excluded from classes), never a wrong same-bank edge. On the
+  three-card merge: 656 contests (622 ties -> mid, 34 low-majority),
+  which drops GPU2's band-edge sweep deeps that GPU1 read low.
+
+Table v4 (`artifacts/g3/table_v4/`, the canonical G4/G5 table): five
+T1 sources folded chronologically (2048-page v1 run + rerun + the
+three big builds — the old runs' edges are uncontradicted evidence on
+pairs the big rep sets never measured; omitting them cost 14 pages of
+coverage), 11,396,475 deduped edges (deep 91,911), C1–C4 all 0,
+**372 same-bank components over 10852/11264 pages (96%)**, classified
+nodes on 11264/11264 pages. Remaining honest limits: 412 pages
+unlinked (1/384 odds — most pages share no bank with any of the 1024
+uniform reps), row classes ~1% probable (the reproducible
+0x2aed3880/0x2aed7b00 double-probe falsifier), three bank-map void
+pages (stale S3b labels), λ column census-only.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the

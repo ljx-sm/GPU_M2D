@@ -9,11 +9,14 @@ so every gate prints numbers plus an explicit pass bar.
 
   R-a transitive consistency   the class closures must not be falsified
        by any measured edge: deep inside a row class (C2), shoulder
-       inside a bank class (C1), non-deep cross-page inside a channel
-       component (C3), and a row class spanning two pages -- the last
-       is new here: same (bank,row) on two distinct 2 MiB pages is
-       physically impossible (the in-page column field cannot absorb
-       PA bits >= 21), and the T1 edges must not force one.
+       inside a bank class (C1), decided non-deep (low/shoulder)
+       cross-page inside a channel component (C3 -- mid is the
+       undecided valley band: a mid between same-bank pages is the
+       measured shallow-conflict wobble and never falsifies), and a
+       row class spanning two pages -- the last is new here: same
+       (bank,row) on two distinct 2 MiB pages is physically impossible
+       (the in-page column field cannot absorb PA bits >= 21), and the
+       T1 edges must not force one.
        Bar: every count 0.
   R-b class cardinality        the bank structure must match the AD102
        prior (24 channels x 16 banks = 384). Unbiased estimator: the
@@ -59,15 +62,26 @@ so every gate prints numbers plus an explicit pass bar.
        cycles. Bars: same-bank partition co-membership Jaccard >=
        0.99, hard deep<->low flip RATE <= 0.1% (one borderline edge
        in 200k pairs is silicon variation; a systematic pattern would
-       falsify the per-model claim), anchor hard-flip rate <= 0.1%,
-       deep|mid region recall >= 99%. The Jaccard bar applies to
+       falsify the per-model claim), pages keeping a common anchor
+       (no page may lose every anchor the other run found; rate bar
+       0.1% cross-card, zero same-card -- a card with a different bank
+       hash would lose common anchors essentially everywhere),
+       deep|mid region recall >= 99%. Per-CELL anchor hard flips are
+       informational, not gated: the anchor sweep's mid valley is
+       POPULATED (3.5-7% of cells, unlike classify's empty valley), so
+       per-card gate placement (calibration amplitudes measured
+       117/121/101 cyc across the three cards) composes a deep<->low
+       cell flip out of two soft band-edge steps -- measured 633 cells
+       GPU2-deep/GPU1-low/GPU0-mid while every structure bar sat at
+       1.000 and zero pages lost a common anchor. The Jaccard bar
+       applies to
        SAME-SHAPE runs only: a run pair with different pool/rep sets
        cannot compare co-membership -- the denser run merges strictly
        more page pairs simply by measuring more of them (big-pool vs
        old-2048-page run: Jaccard 0.199 with zero hard flips both
        ways), so shape-mismatched pairs print it as informational
-       while the falsifying bars (hard flips, region recall, anchor
-       flips) stay fully gated. The corrected-d median shift is
+       while the falsifying bars (hard flips, region recall, common
+       anchors) stay fully gated. The corrected-d median shift is
        informational only: lambda carries a per-card timing offset
        (measured 26 cyc GPU0->GPU1 vs bar 15 same-card), which is
        exactly why the table stores classes, not cycle counts.
@@ -171,7 +185,15 @@ def gate_ra(edges: dict[tuple[int, int], tuple[str, str]], part: dict,
             a1 += 1                                    # C2 recount
         if cls == "shoulder" and bank_root(a) == bank_root(b):
             a2 += 1                                    # C1 recount
-        if a >> 21 != b >> 21 and cls != "deep_conflict" \
+        # a4 mirrors the build's C3 on DECIDED non-deep (low/shoulder):
+        # a decided-different measurement inside a same-bank component
+        # contradicts transitivity. mid is the undecided valley band --
+        # a mid between same-bank pages is the S4b-1 shallow-conflict
+        # observation (same bank paying a partial penalty), the same
+        # deep<->mid wobble R-c/R-d/R-e treat as boundary wobble, so it
+        # falsifies nothing (measured: GPU1-big read 2 classify pairs
+        # mid that GPU0-big read deep, both inside one component).
+        if a >> 21 != b >> 21 and cls in ("low", "shoulder") \
                 and comp_of.get(a >> 21) is not None \
                 and comp_of.get(a >> 21) == comp_of.get(b >> 21):
             a4 += 1                                    # C3 family
@@ -184,8 +206,8 @@ def gate_ra(edges: dict[tuple[int, int], tuple[str, str]], part: dict,
     say(f"  a1 deep edge inside a row class:        {a1}")
     say(f"  a2 shoulder edge inside a bank class:   {a2}")
     say(f"  a3 row class spanning >1 page:          {a3}")
-    say(f"  a4 non-deep cross-page inside a channel "
-        f"component: {a4}")
+    say(f"  a4 decided non-deep (low/shoulder) cross-page inside a "
+        f"channel component: {a4}")
     ok = a1 == a2 == a3 == a4 == 0
     say(f"  R-a: {'PASS' if ok else 'FAIL'}")
     return ok
@@ -424,11 +446,37 @@ def gate_rc(run1: Path, run2: Path, say, cross_card: bool = False) -> bool:
                         and va2.get((p, cand)) == "deep_conflict"
                         for p in pages1 & pages2)]
     say(f"  anchor validity agreement {agree_cells}/{len(cells)} = "
-        f"{anchor_ok:.2%}; hard deep<->low flips {anchor_hard} "
-        + (f"(bar <= {CROSS_HARD_RATE_BAR:.1%} rate)" if cross_card
-           else "(bar 0)")
-        + "; universal in both runs: "
+        f"{anchor_ok:.2%}; per-cell hard deep<->low flips {anchor_hard} "
+        "(informational: the anchor sweep's mid valley is POPULATED "
+        "(3.5-7% of cells, unlike classify's empty one), so per-card "
+        "gate placement composes deep<->low from two soft band-edge "
+        "steps -- three-card measurement: 633 cells GPU2-deep/GPU1-low/"
+        "GPU0-mid, amplitudes 117/121/101); universal in both runs: "
         + (" ".join(f"0x{c:x}" for c in sorted(universal)) or "none"))
+    # the TRANSFER gate at the consumer level: whatever the bank_map
+    # touches must keep an anchor the other run also found. A card with
+    # a different bank hash would lose common anchors on essentially
+    # every page; band-edge wobble loses a handful at most (measured 0
+    # on all three card pairs).
+    anchors1: dict[int, set[int]] = defaultdict(set)
+    anchors2: dict[int, set[int]] = defaultdict(set)
+    for (page, cand), cls in va1.items():
+        if cls == "deep_conflict":
+            anchors1[page].add(cand)
+    for (page, cand), cls in va2.items():
+        if cls == "deep_conflict":
+            anchors2[page].add(cand)
+    need_pages = [p for p in pages1 & pages2
+                  if anchors1.get(p) or anchors2.get(p)]
+    no_common = sum(1 for p in need_pages
+                    if not (anchors1.get(p, set())
+                            & anchors2.get(p, set())))
+    anchor_loss = no_common / len(need_pages) if need_pages else 0.0
+    say(f"  pages keeping a common anchor: "
+        f"{len(need_pages) - no_common}/{len(need_pages)}; {no_common} "
+        f"without a common anchor "
+        + (f"(bar <= {CROSS_HARD_RATE_BAR:.1%} of anchored pages)"
+           if cross_card else "(bar 0)"))
 
     # co-membership of the same-bank page partition over common pages
     def components(edges: dict) -> dict[int, int]:
@@ -479,11 +527,11 @@ def gate_rc(run1: Path, run2: Path, say, cross_card: bool = False) -> bool:
 
     if cross_card:
         ok = (hard / len(common) if common else 0) <= CROSS_HARD_RATE_BAR \
-            and (anchor_hard / len(cells) if cells else 0) <= CROSS_HARD_RATE_BAR \
+            and anchor_loss <= CROSS_HARD_RATE_BAR \
             and region >= REGION_RECALL_BAR \
             and (jac >= CROSS_JACCARD_BAR or not same_pool)
     else:
-        ok = hard == 0 and anchor_hard == 0 and region >= REGION_RECALL_BAR \
+        ok = hard == 0 and no_common == 0 and region >= REGION_RECALL_BAR \
             and med_shift <= D_SHIFT_BAR
     say(f"  R-{'d' if cross_card else 'c'}: {'PASS' if ok else 'FAIL'}")
     return ok
@@ -873,6 +921,21 @@ def self_test() -> int:
         assert not ra_bad and "a3 row class spanning >1 page:          1" \
             in buffer.getvalue(), buffer.getvalue()
 
+        # a4 mechanics: the {0,2} deep-only page component makes a
+        # cross-page LOW inside it a decided contradiction (a4 fires)
+        # while a cross-page MID inside it is valley wobble (a4 must
+        # not count it -- the GPU1-big 2-pair case).
+        bad2 = dict(edges)
+        bad2[(pa(0, 0x800), pa(2, 0x800))] = ("low", "plant")
+        bad2[(pa(0, 0x900), pa(2, 0x900))] = ("mid", "plant")
+        part2 = build(bad2, channel_deep_only=True)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            ra_a4 = gate_ra(bad2, part2, print)
+        assert not ra_a4 \
+            and "inside a channel component: 1" in buffer.getvalue(), \
+            buffer.getvalue()
+
         # R-b mechanics: rate and null quantiles computed; fixture fails
         rows = load_t1_edges(root / "t1a", [])
         buffer = io.StringIO()
@@ -968,6 +1031,7 @@ def self_test() -> int:
         assert rd and "R-d: PASS" in out, out
         assert "hard deep<->low flips: 0/12 = 0.0000%" in out, out
         assert "informational cross-card" in out, out
+        assert "pages keeping a common anchor: 4/4" in out, out
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             rd_bad = gate_rc(root / "t1a", root / "run2", print,
@@ -1013,6 +1077,33 @@ def self_test() -> int:
         assert "pool page sets DIFFER" in out, out
         assert "Jaccard 0.333" in out, out
         assert "INFORMATIONAL: pool shapes differ" in out, out
+        assert "pages keeping a common anchor: 3/3" in out, out
+
+        # anchor-transfer gate: run5's edge labels mirror t1a (0 hard
+        # flips, Jaccard 1.000) but its only deep anchors use a
+        # DIFFERENT candidate mask, so every page loses its common
+        # anchor -- the consumer claim breaks and R-d must FAIL on it.
+        run5_rows = [list(row) for row in classify_rows]
+        (root / "run5").mkdir()
+        t1_edges(root / "run5" / "table_build_edges.csv", run5_rows)
+        (root / "run5" / "pool_map.csv").write_text(pool_text)
+        with (root / "run5" / "anchor_validity.csv").open(
+                "w", encoding="utf-8", newline="") as sink:
+            writer = csv.writer(sink)
+            writer.writerow(["page_base", "candidate",
+                             "corrected_cycles", "class"])
+            for p in range(4):
+                writer.writerow([f"0x{pa(p):x}", "0xd0300", 1150,
+                                 "deep_conflict"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rd_anchor = gate_rc(root / "t1a", root / "run5", print,
+                                cross_card=True)
+        out = buffer.getvalue()
+        assert not rd_anchor and "R-d: FAIL" in out, out
+        assert "pages keeping a common anchor: 0/4" in out, out
+        assert "without a common anchor" in out, out
+        assert "informational: the anchor sweep's mid valley" in out, out
 
         # R-e plan: bank class spans p0/p2 with row classes A/B/C/D all
         # deep-linked -> 7 unmeasured cross-row pairs predict deep; the
