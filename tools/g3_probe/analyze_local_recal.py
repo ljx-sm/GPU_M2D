@@ -231,7 +231,7 @@ def analyze(run_dir: Path, output: Path | None,
     out_rows: list[dict[str, str]] = []
     transitions: Counter = Counter()
     residual_mids: list[dict[str, str]] = []
-    suspect_conflicts = 0
+    suspects: list[dict[str, str]] = []
     for row in rows:
         new_row = dict(row)
         qid = row.get("query_id", "")
@@ -244,7 +244,7 @@ def analyze(run_dir: Path, output: Path | None,
             transitions[(row["class"], new_class)] += 1
             if (new_class == "conflict"
                     and value < base_l + HIGH_FRACTION * amplitude):
-                suspect_conflicts += 1  # kept, but flagged for S4b-1
+                suspects.append(new_row)  # kept, but flagged for S4b-1
             new_row["class"] = new_class
             new_row["global_class"] = row["class"]
             new_row["local_base"] = str(base_l)
@@ -275,6 +275,12 @@ def analyze(run_dir: Path, output: Path | None,
             writer = csv.DictWriter(sink, fieldnames=fields)
             writer.writeheader()
             writer.writerows(residual_mids)
+    if suspects:
+        with (run_dir / "suspect_conflicts.csv").open(
+                "w", encoding="utf-8", newline="") as sink:
+            writer = csv.DictWriter(sink, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(suspects)
 
     stats = {
         "run_dir": run_dir, "output": output, "floor": floor,
@@ -282,7 +288,8 @@ def analyze(run_dir: Path, output: Path | None,
         "hi_global": hi_global, "rows": rows, "lambdas": lambdas,
         "samples": samples, "candidates": candidates,
         "transitions": transitions, "out_rows": out_rows,
-        "residual_mids": residual_mids, "suspect_conflicts": suspect_conflicts,
+        "residual_mids": residual_mids, "suspect_conflicts": len(suspects),
+        "suspects": suspects,
         "constraints_path": constraints_path,
     }
     return stats, []
@@ -472,6 +479,9 @@ def self_test() -> int:
         assert lambdas[2] == 1055, lambdas         # from q5, the slow min
         assert stats["residual_mids"]
         assert (run / "same_channel_candidates.csv").is_file()
+        assert (run / "suspect_conflicts.csv").is_file()
+        suspects: list[dict[str, str]] = stats["suspects"]
+        assert len(suspects) == 1 and suspects[0]["query_id"] == "6"
         # mirror-check failure must be reported, never recalibrated
         bad = run / "constraints.csv"
         bad.write_text(bad.read_text().replace(",mid,x\n", ",low,x\n"))

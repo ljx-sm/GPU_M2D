@@ -26,9 +26,12 @@
 # G3-pool-only options (timing needs an idle GPU, so the device is explicit
 # instead of looping over all GPUs):
 #   [--device N] [--chunks N] [--chunk-mib N] [--iters N] [--modifier 0-5]
-#   [--cross-page N] [--work-mode sanity|bit-scan|pair-scan]
+#   [--cross-page N] [--work-mode sanity|bit-scan|pair-scan|census]
 #   [--in-page-bases N] [--pairs-per-bit N]
 #   [--page-samples N] [--anchor-samples N]
+#   census-only: [--reprobe-csv PATH]... [--row-pilot-from DIR]
+#                [--row-pilot-pages N] [--census-stride N] [--repeat-pages N]
+#                [--timeout-seconds N]
 #
 # The tensorrt mode also regenerates artifacts/g2/gpu_va_pa_map.csv from the
 # newest passing run of each GPU; mappings are never reused across runs.
@@ -50,7 +53,10 @@ while [[ $# -gt 0 ]]; do
         --size-mib|--hold-seconds) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --chunks|--chunk-mib|--iters|--modifier|--cross-page|\
         --work-mode|--in-page-bases|--pairs-per-bit|\
-        --page-samples|--anchor-samples) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --page-samples|--anchor-samples|--timeout-seconds|\
+        --row-pilot-pages|--census-stride|--repeat-pages) \
+            EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --reprobe-csv|--row-pilot-from) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --device) G3_DEVICE="$2"; shift 2 ;;
         --runner) RUNNER="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;

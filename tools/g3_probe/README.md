@@ -344,6 +344,81 @@ latency fingerprint:
   this edge density cannot merge each channel's ~170 pages. Deciding the
   channel hypothesis needs the S4b-1 per-page census.
 
+## S4b-1 — per-page census, suspect re-probes, row pilot
+
+`--work-mode census` (`plan_census_queries` in `g3_pool.py`, analyzed by
+`analyze_census.py`): one run answers the three questions S4b-0 could not.
+Sections (contractual order): `calibration` 3 / `self` one (p,p) pair per
+pool page — a clean per-page lambda, ONE endpoint per scalar, unlike pair
+data / `self_second` the same pair 1 MiB into every 4th page / `repeat`
+the first 64 self pairs again late (drift anchor) / `reprobe` the S4b-0
+suspect-conflict pairs (PA-level reverse lookup into this run's pool) /
+`row_pilot` all unordered pairs of `{0, M, probe, M|probe}` at pages the
+S3b anchor sweep classified conflict.
+
+```bash
+sudo scripts/run_g2_observer_probe.sh --api g3pool --device 0 \
+    --work-mode census --chunks 512 \
+    --reprobe-csv <s3_run>/suspect_conflicts.csv \
+    --reprobe-csv <s3b_run>/suspect_conflicts.csv \
+    --row-pilot-from <s3b_run>
+python3 tools/g3_probe/analyze_census.py <census_run> \
+    --compare-old <s3_run>
+```
+
+The analyzer reconstructs sections from the summary's census_selection
+counts, verifies every row's shape against its own PA (fail-closed),
+applies the late-section offset (below), and writes `page_lambdas.csv`,
+`reprobe_verdicts.csv`, `row_pilot_classes.csv`. The pilot unions banks
+only on DEEP conflicts (>= 0.90 amplitude) — the shallow shoulder band
+must never be same-bank evidence — then rows on in-bank lows.
+
+## S4b-1 result on GPU 0 (2026-09-16): the conflict class was bimodal
+
+Run healthy end to end (3164 queries, 0 lost events, 2712.9 MHz) and the
+same 4 GiB PA hole reproduced a THIRD time — all 273 re-probe pairs and
+all 4 pilot pages resolved, 0 drops.
+
+- **Lambda is real, spatial, and NOT a channel observable.** The clean
+  per-page lambda spans 1001-1129 cycles with the self block internally
+  flat across position (no time trend), so the spread is spatial. No
+  ~12 discrete bands exist (gap-4: two clusters, 83%/17%); both clusters
+  are fine-grained per-page placement — 249 of 512 chunks mix fast and
+  slow pages, no PA bit moves cluster share by more than 0.02 — nothing
+  like a coarse channel partition. The S4b-0 lambda-band channel test is
+  falsified by measurement. (The S4b-0 pair-derived lambdas barely
+  correlate with the census lambda, r=0.11: pair minima were noisy upper
+  bounds.)
+- **A late-section step, not drift.** Everything measured after the self
+  block reads ~-18 cycles vs the same pages inside it (repeat block
+  median; the self block's flat bucket medians rule out a ramp). The
+  analyzer corrects self_second/reprobe/row_pilot additively.
+- **The re-probes split the old conflict class in two.** Of the 273
+  S4b-0 suspect conflicts: 228 land in a reproducible SHALLOW band
+  (corrected p10-p90 = 1104-1120, ~0.70-0.85 amplitude), 36 fall to low
+  (not reproducible), 9 mid — and ZERO reach deep conflict. Applied
+  retroactively with a 0.90 gate: S3's 139 "conflicts" were ALL shallow;
+  S3b splits 185 shallow / 71 deep (>= 1139). The two-band classifier
+  conflated a partial-penalty regime with full row conflicts, and the
+  S4 solver's same-bank GF(2) constraints were that mixture — a concrete
+  cause of the gate FAIL, now removed. Bonus structure: the deep tail
+  1200-1233 (22 pairs) clusters at pages = 7 mod 16 (2 MiB pages) —
+  32 MiB-periodic super-conflicts, S4b-2 material.
+- **Row pilot (0 contradictions).** At the 2 deep-anchor pages the
+  transitive classes are exactly `{0, 0x200}` vs `{M, M|0x200}` per row:
+  bit 9 is confirmed a column bit at the hardware level, the anchor
+  flips the row, and the non-anchor hash probes leave the bank group.
+  At the 2 shallow pages the anchor pair pays only the shoulder — their
+  S3b "conflict" was same-channel different-bank evidence, and "anchor
+  validity" was the deep/shallow split all along, not a linear-hash
+  property.
+- **Updated physical model** (the S4b-2 solver input): low = different
+  channel or same row; shoulder ~1114 = same channel, different bank /
+  bank group; deep >= 1139 = same bank, different row. The shoulder band
+  gives same-channel candidates a large positive set (228 re-probed +
+  185 S3b shallow + residual mids): the channel partition is now a graph
+  question over shoulder edges, not a lambda question.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the

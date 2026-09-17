@@ -75,6 +75,7 @@ from g3_pool import (  # noqa: E402  (path-based import of a sibling tool)
     POOL_MAP_FIELDS,
     PoolMap,
     Page,
+    plan_census_queries,
     select_bit_scan_queries,
     select_pair_scan_queries,
     select_sanity_queries,
@@ -158,6 +159,38 @@ def drain_until_marker(process: subprocess.Popen[bytes], observer: G2Observer,
     return found
 
 
+def load_reprobe_pairs(paths: list[Path]) -> list[tuple[int, int]]:
+    """(pa_a, pa_b) byte addresses from constraint CSVs (any CSV with
+    pa_a/pa_b columns, e.g. suspect_conflicts.csv)."""
+    pairs: list[tuple[int, int]] = []
+    for path in paths:
+        with path.open(encoding="utf-8", newline="") as source:
+            rows = csv.DictReader(line for line in source
+                                  if not line.startswith("#"))
+            for row in rows:
+                if row.get("pa_a") and row.get("pa_b"):
+                    pairs.append((int(row["pa_a"], 16), int(row["pa_b"], 16)))
+    return pairs
+
+
+def mine_pilot_pages(source: Path | None, count: int,
+                     page_size: int) -> list[int]:
+    """Anchor-valid page bases for the row pilot: pages whose anchor_sweep
+    probe (p, p^M) classified conflict in the S3b run."""
+    if source is None or count <= 0:
+        return []
+    path = source / "pair_constraints.csv" if source.is_dir() else source
+    with path.open(encoding="utf-8", newline="") as stream:
+        rows = csv.DictReader(line for line in stream
+                              if not line.startswith("#"))
+        bases: set[int] = set()
+        for row in rows:
+            if (row.get("section") == "anchor_sweep"
+                    and row.get("class") == "conflict" and row.get("pa_a")):
+                bases.add(int(row["pa_a"], 16) & ~(page_size - 1))
+    return sorted(bases)[:count]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true",
@@ -170,10 +203,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--modifier", type=int, default=5)
     parser.add_argument("--cross-page", type=int, default=8,
                         help="sanity mode: cross-page queries over the observed PA range")
-    parser.add_argument("--work-mode", choices=("sanity", "bit-scan", "pair-scan"),
+    parser.add_argument("--work-mode", choices=("sanity", "bit-scan", "pair-scan",
+                                                 "census"),
                         default="sanity",
                         help="query selection: S2 sanity triple, the S3 bit-scan "
-                             "matrix, or the S3b anchored/two-bit matrix")
+                             "matrix, the S3b anchored/two-bit matrix, or the "
+                             "S4b-1 per-page census / re-probe / row pilot")
+    parser.add_argument("--reprobe-csv", type=Path, action="append", default=[],
+                        help="census mode: CSV(s) with pa_a,pa_b columns to "
+                             "re-measure (e.g. suspect_conflicts.csv from "
+                             "analyze_local_recal.py); repeatable")
+    parser.add_argument("--row-pilot-from", type=Path, default=None,
+                        help="census mode: S3b run directory (or its "
+                             "pair_constraints.csv) mined for anchor-valid "
+                             "sweep pages as row-pilot pages")
+    parser.add_argument("--row-pilot-pages", type=int, default=4,
+                        help="census mode: anchor-valid pages for the row pilot")
+    parser.add_argument("--census-stride", type=int, default=4,
+                        help="census mode: every Nth page also gets a second "
+                             "self-pair 1 MiB into the page")
+    parser.add_argument("--repeat-pages", type=int, default=64,
+                        help="census mode: first N self-pairs repeated late in "
+                             "the list as a within-run drift check")
     parser.add_argument("--in-page-bases", type=int, default=4,
                         help="bit-scan/pair-scan: base pages voting per in-page bit")
     parser.add_argument("--pairs-per-bit", type=int, default=64,
@@ -616,6 +667,38 @@ def main() -> int:
                                                in_page_bases=args.in_page_bases,
                                                page_samples=args.page_samples,
                                                anchor_samples=args.anchor_samples)
+        elif args.work_mode == "census":
+            reprobe_pairs = load_reprobe_pairs(args.reprobe_csv)
+            pilot_pages = mine_pilot_pages(args.row_pilot_from,
+                                           args.row_pilot_pages,
+                                           pool.pages[0].page_size)
+            census_plan, census_dropped = plan_census_queries(
+                pool, second_stride=args.census_stride,
+                repeat_pages=args.repeat_pages,
+                reprobe_pairs=reprobe_pairs, pilot_pages=pilot_pages)
+            queries = [typed.query for typed in census_plan]
+            dropped_total = sum(len(entries) for entries in census_dropped.values())
+            if dropped_total:
+                # Not fatal (the census itself is pool-local), but never
+                # silent: entries the new pool does not back are reported
+                # here and recorded in the summary.
+                print(f"GPU_M2D_G3_CENSUS_WARNING: {dropped_total} entries "
+                      "not backed by this pool: "
+                      + ", ".join(f"{kind}={len(entries)}"
+                                  for kind, entries in census_dropped.items()))
+            extra["census_selection"] = {
+                "reprobe_pairs_requested": len(reprobe_pairs),
+                "reprobe_pairs_planned":
+                    len(reprobe_pairs) - len(census_dropped["reprobe"]),
+                "reprobe_csvs": [str(path) for path in args.reprobe_csv],
+                "pilot_pages": [f"0x{base:x}" for base in pilot_pages],
+                "pilot_pages_planned":
+                    len(pilot_pages) - len(census_dropped["row_pilot"]),
+                "row_pilot_from": str(args.row_pilot_from),
+                "second_stride": args.census_stride,
+                "repeat_pages": args.repeat_pages,
+                "dropped": census_dropped,
+            }
         else:
             queries = select_sanity_queries(pool, cross_page=args.cross_page)
         work = [(index, query.chunk_a, query.ofs_a, query.chunk_b, query.ofs_b)

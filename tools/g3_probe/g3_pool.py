@@ -32,6 +32,9 @@ Modes:
                 conflict anchor (a same-bank different-row in-page mask),
                 which separates column bits from bank-hash bits that the
                 single-bit scan cannot tell apart (analyze_pair_scan.py).
+  census        S4b-1 workload: per-page self-pairs (a clean per-page
+                lambda), suspect-conflict re-probes, and a row-class
+                pilot at anchor-valid pages (analyze_census.py).
 
 Run with --self-test to pin the arithmetic on a synthetic pool map.
 """
@@ -42,6 +45,7 @@ import argparse
 import csv
 import io
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -390,6 +394,124 @@ def select_pair_scan_queries(pool: PoolMap, in_page_bases: int = 4,
                                    anchor_samples=anchor_samples)]
 
 
+# S4b-1 census: in-page probe offsets for the row-class pilot. Each probe
+# is measured alone and XOR-ed with the S1 anchor M, so the pilot sees both
+# row states of every probe bit at an anchor-valid page: bits 9/11 are
+# S3b-classified column bits (keep bank and row), 12/17/20 are hash bits
+# that do NOT belong to the anchor mask (M covers 8/16/18/19), so M|probe
+# stays inside the page and never collapses onto M.
+CENSUS_PILOT_PROBES = (0x200, 0x800, 0x1000, 0x20000, 0x100000)
+CENSUS_SELF_SECOND_OFFSET = 1 << 20  # 1 MiB into the page: lambda stability
+# at a PA-distant cache line of the same page
+
+
+def _pa_query(by_pa: dict[int, Page], pool: PoolMap,
+              pa: int) -> Query | None:
+    """Reverse lookup: a byte PA observed in a previous run -> the query
+    addressing it in THIS pool (page base + in-page offset). None when the
+    page is not backed by this pool."""
+    page_size = pool.pages[0].page_size
+    page = by_pa.get(pa & ~(page_size - 1))
+    if page is None:
+        return None
+    in_page = pa & (page_size - 1)
+    base = page.va_page_base - pool.chunk_base_va(page.chunk_index)
+    return Query(page.chunk_index, base + in_page,
+                 page.chunk_index, base + in_page)
+
+
+def plan_census_queries(pool: PoolMap, second_stride: int = 4,
+                        second_offset: int = CENSUS_SELF_SECOND_OFFSET,
+                        repeat_pages: int = 64,
+                        reprobe_pairs: Sequence[tuple[int, int]] = (),
+                        pilot_pages: Sequence[int] = (),
+                        pilot_probes: Sequence[int] = CENSUS_PILOT_PROBES
+                        ) -> tuple[list[TypedQuery], dict[str, list[str]]]:
+    """S4b-1 census plan. Section order is contractual for
+    analyze_census.py:
+
+      calibration  ids 0..2: floor / different-bank / anchor conflict
+      self         (p, p) per pool page -- a clean per-page lambda: ONE
+                   endpoint per scalar, unlike pair data where both pages
+                   mix into one value (S4b-0 could only bound lambda)
+      self_second  (p+K, p+K) every stride-th page -- is lambda a page
+                   property or an offset property?
+      repeat       the first repeat_pages self queries again, late in the
+                   list -- within-run drift / DVFS check
+      reprobe      the S4b-0 suspect-conflict pairs (kept conflict but
+                   below their own local conflict threshold), re-measured
+                   with clean census lambdas available for both pages
+      row_pilot    at anchor-valid pages (S3b anchor_sweep conflicts):
+                   every unordered pair of {0, M, probe, M|probe} -- the
+                   transitive (bank,row) class clustering pilot
+
+    reprobe_pairs and pilot_pages are byte PAs / PA page bases from the
+    previous runs; they are resolved against THIS run's pool map at plan
+    time, and unresolvable entries are reported (never silently dropped).
+    """
+    anchor = PAIR_SCAN_ANCHOR
+    by_pa = {page.fb_pa_page_base: page for page in pool.pa_pages}
+    page_size = pool.pages[0].page_size
+    if second_offset <= 0 or second_offset >= page_size:
+        raise ValueError("second_offset must lie inside a page")
+
+    def page_query(page: Page, low_a: int, low_b: int) -> Query:
+        offset = page.va_page_base - pool.chunk_base_va(page.chunk_index)
+        return Query(page.chunk_index, offset + low_a,
+                     page.chunk_index, offset + low_b)
+
+    plan: list[TypedQuery] = []
+    first = pool.pa_pages[0]
+    for index, candidate in enumerate(S1_IN_PAGE_CANDIDATES):
+        plan.append(TypedQuery(page_query(first, 0, candidate), "calibration",
+                               role=("floor", "baseline", "conflict")[index]))
+
+    for index, page in enumerate(pool.pa_pages):
+        plan.append(TypedQuery(page_query(page, 0, 0), "self",
+                               sample_index=index))
+    if second_stride > 0:
+        for index, page in enumerate(pool.pa_pages):
+            if index % second_stride == 0:
+                plan.append(TypedQuery(page_query(page, second_offset,
+                                                  second_offset),
+                                       "self_second", sample_index=index))
+    if repeat_pages > 0:
+        for index, page in enumerate(pool.pa_pages[:repeat_pages]):
+            plan.append(TypedQuery(page_query(page, 0, 0), "repeat",
+                                   sample_index=index, role="drift"))
+
+    dropped: dict[str, list[str]] = {"reprobe": [], "row_pilot": []}
+    for index, (pa_a, pa_b) in enumerate(reprobe_pairs):
+        query = _pa_query(by_pa, pool, pa_a)
+        other = _pa_query(by_pa, pool, pa_b)
+        if query is None or other is None:
+            dropped["reprobe"].append(f"0x{pa_a:x}/0x{pa_b:x}")
+            continue
+        plan.append(TypedQuery(Query(query.chunk_a, query.ofs_a,
+                                     other.chunk_a, other.ofs_a),
+                               "reprobe", base_index=index))
+
+    for base_index, pa_base in enumerate(pilot_pages):
+        page = by_pa.get(pa_base)
+        if page is None:
+            dropped["row_pilot"].append(f"0x{pa_base:x}")
+            continue
+        offsets = [0, anchor] + [probe for probe in pilot_probes] \
+            + [anchor ^ probe for probe in pilot_probes]
+        for left in range(len(offsets)):
+            for right in range(left + 1, len(offsets)):
+                plan.append(TypedQuery(
+                    page_query(page, offsets[left], offsets[right]),
+                    "row_pilot", bit=left, bit2=right,
+                    base_index=base_index))
+    return plan, dropped
+
+
+def select_census_queries(pool: PoolMap, **kwargs) -> list[Query]:
+    plan, _ = plan_census_queries(pool, **kwargs)
+    return [typed.query for typed in plan]
+
+
 def write_work_csv(path: Path | None, queries: list[Query],
                    mode: str = "sanity") -> str:
     lines = [f"# mode={mode}", WORK_HEADER]
@@ -523,6 +645,51 @@ def self_test() -> int:
         roles = [typed.role for typed in triples if typed.bit == bit]
         assert roles == ["anchor", "single", "anchored"] * 2, roles
 
+    # Census: calibration triple, one self-pair per PA page, strided second
+    # offsets, a drift repeat block, PA-level reprobe reverse lookup with
+    # honest drop reporting, and the 12-offset row pilot per pilot page.
+    reprobe = [(0x120001234, 0x120401234),   # both pages backed
+               (0x120001234, 0x900000000)]   # second page absent -> dropped
+    census, dropped = plan_census_queries(
+        pool, second_stride=2, repeat_pages=2, reprobe_pairs=reprobe,
+        pilot_pages=(0x120000000, 0xDEAD0000))
+    cqueries = [typed.query for typed in census]
+    assert cqueries[:3] == sanity[:3], "census must open with the calibration triple"
+    sections = [typed.section for typed in census]
+    assert sections.count("self") == 4            # every PA page
+    assert sections.count("self_second") == 2     # stride 2 over 4 pages
+    assert sections.count("repeat") == 2
+    assert sections.count("reprobe") == 1         # one dropped, reported
+    assert dropped["reprobe"] == ["0x120001234/0x900000000"]
+    assert dropped["row_pilot"] == ["0xdead0000"]
+    n_probes = len(CENSUS_PILOT_PROBES)
+    assert sections.count("row_pilot") == (2 + 2 * n_probes) * (2 + 2 * n_probes - 1) // 2
+    # Self-pairs address the first byte of each PA page; second-offset
+    # pairs move 1 MiB into the same page.
+    for typed in census:
+        if typed.section == "self":
+            pa_a, pa_b = pool.query_pa(typed.query)
+            assert pa_a == pa_b and pa_a & (page_size - 1) == 0
+        elif typed.section == "self_second":
+            pa_a, pa_b = pool.query_pa(typed.query)
+            assert pa_a == pa_b and pa_a & (page_size - 1) == CENSUS_SELF_SECOND_OFFSET
+    # The resolved reprobe pair addresses exactly the requested bytes.
+    reprobe_query = next(typed.query for typed in census
+                         if typed.section == "reprobe")
+    assert pool.query_pa(reprobe_query) == (0x120001234, 0x120401234)
+    # Pilot xors: (0, M) conflicts by construction, probe pairs carry one
+    # probe bit or one probe bit folded into the anchor.
+    pilot = [typed for typed in census if typed.section == "row_pilot"]
+    for typed in pilot:
+        pa_a, pa_b = pool.query_pa(typed.query)
+        xor = (pa_a ^ pa_b) & (page_size - 1)
+        probes = {0, PAIR_SCAN_ANCHOR}
+        probes |= set(CENSUS_PILOT_PROBES)
+        probes |= {PAIR_SCAN_ANCHOR ^ probe for probe in CENSUS_PILOT_PROBES}
+        assert xor in {a ^ b for a in probes for b in probes if a != b}, hex(xor)
+    assert any((pool.query_pa(t.query)[0] ^ pool.query_pa(t.query)[1])
+               == PAIR_SCAN_ANCHOR for t in pilot)
+
     print("g3_pool self-test: PASS")
     return 0
 
@@ -532,7 +699,8 @@ def main() -> int:
     parser.add_argument("--pool-map", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--mode",
-                        choices=("sanity", "single-bit", "bit-scan", "pair-scan"),
+                        choices=("sanity", "single-bit", "bit-scan", "pair-scan",
+                                 "census"),
                         default="sanity")
     parser.add_argument("--bit", type=int)
     parser.add_argument("--cross-page", type=int, default=8)
@@ -559,6 +727,8 @@ def main() -> int:
         queries = select_pair_scan_queries(pool, in_page_bases=args.in_page_bases,
                                            page_samples=args.page_samples,
                                            anchor_samples=args.anchor_samples)
+    elif args.mode == "census":
+        queries = select_census_queries(pool)
     else:
         if args.bit is None or not 0 <= args.bit < 40:
             parser.error("--bit must be in [0, 40)")
