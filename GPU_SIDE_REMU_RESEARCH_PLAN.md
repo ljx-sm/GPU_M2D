@@ -860,6 +860,34 @@ run 的 deep↔low 竞争按多数表决（平局→mid 排除，不让单卡带
 void 页（S3b 陈旧标签）、λ 列仅 census 页。**下一步：等用户确认后进
 入 S5-T3（查询 API + G4 集成，含 fail-closed 覆盖检查）。**
 
+Status（2026-09-17）：**用户确认三项边界决策后 S5-T3 完成——EMT 查询
+API 落地（`tools/g3_probe/query_table.py`，纯离线、自测锁定），G3 阶段
+闭合**。用户批准的决策：同/异 bank、同/异行按实测交付；行邻接借鉴
+GeForge（假设+显式标注，不复杂化）；相邻列放弃（timing 原理上不可测，
+G5 故障模型简化：列相邻折叠为"同行随机列"，DQ 维持 unsupported）。
+API 语义：(1) **四级 provenance**——measured（直接实测：锚扫描格、行类
+low 边、完备 classify 闭包）/ transitive（等价类闭包，R-e 已验证
+0/128）/ assumed（行邻接：GeForge App. B 单调行条带先验，timing 无行距
+信息）/ unknown（不猜测）；(2) **四条可靠性论证写入 docstring**——页面
+分量互异⇒异 bank（classify 对页×代表完备，同 bank 页必同分量）；
+跨页同分量⇒异行（a3 物理论证）；**页内节点 bank 类互异⇒未知而非异
+bank**（页内稀疏采样不享完备性论证）；异行只由直接 deep 证据或跨页物
+理论证宣布（行不等式不可经未测对传递）；(3) **fail-closed 覆盖检查**——
+宇宙外 PA 拒绝（exit 2），未连页默认警告、`--require-linked` 升级为拒
+绝；(4) **两个模型拒绝**——dq-adjacent（R3）、column-adjacent（折叠，
+附原理说明）；(5) **证伪对守卫**——0x2aed3880/0x2aed7b00 查询打
+`measured-contradicted` 标签、选择器剔除；(6) `--annotate-pool` 把
+run 的 pool_map（VA 页↔PA 页）与 GDDR 类拼接为 G4 消费的快照 CSV
+（G3 腿）；(7) `--build-anchors` 把三个大池 run 的锚扫描格折叠为逐页
+严格多数共识（per-cell 翻转维持信息级——正是 R-d 记录的谷带摆动）。
+表 v4 上实测：锚共识 270,336 格、**11264/11264 页保有有效锚**、通用
+掩码 0x1f9dc0+0x1fdc80；大池覆盖检查 11264/11264 PASS（412 未连页警
+告）；实测同行点位 = 9 个 row 类上 113 对（114 减剔除的证伪对——同行
+故障的诚实选址上限）；S3b run 标注 2048/2048 页、bank 已知 1992/2048、
+5 页含同行点位。**下一步 G4**：以 annotate-pool 快照为 G3 腿，组合
+G1（Tensor↔VA）与 G2（VA↔PA）建立 TensorBit↔GDDR 双向链与
+reverse index。
+
 目标：
 
 ```text

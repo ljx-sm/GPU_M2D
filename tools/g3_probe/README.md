@@ -853,6 +853,71 @@ uniform reps), row classes ~1% probable (the reproducible
 0x2aed3880/0x2aed7b00 double-probe falsifier), three bank-map void
 pages (stale S3b labels), λ column census-only.
 
+## S5-T3 — EMT query API (`query_table.py`)
+
+The consumer surface for the canonical table (v4) — what G4/G5 call into.
+Every claim carries a **provenance label** (measured / transitive /
+assumed / unknown), and the two fault-model families the timing channel
+cannot support are REFUSED outright (exit 2): `dq-adjacent` (research-plan
+R3 — the burst/DQ domain has no observable structure) and
+`column-adjacent` (column distance never alters latency; folded into
+same-row random-column sites under the simplified G5 fault model).
+
+```bash
+python3 query_table.py --table artifacts/g3/table_v4 \
+    --query 0x1ee00000 0x2ae00000            # relation + provenance
+python3 query_table.py --table ... --check-pool <g3_run_dir>   # fail-closed
+python3 query_table.py --table ... --select same-bank-diff-row \
+    --near 0x1ee00000 --count 3              # fault-site selectors
+python3 query_table.py --table ... --select row-adjacent --near 0x1ee00000
+python3 query_table.py --table ... --annotate-pool <g3_run_dir> \
+    --out snapshot.csv                       # G4 seam: VA<->PA<->GDDR
+python3 query_table.py --table ... --build-anchors <t1_run> <t1_run> \
+    <t1_run> --out <table_dir>/page_anchors.csv
+```
+
+Semantics (all pinned by `--self-test`):
+
+- **Distinct page components ⇒ different bank** — the classify sections
+  are COMPLETE over pages × reps, so a page joins a component exactly
+  when some rep shares its bank; two same-bank pages therefore always
+  share a component (merging runs only unions). Same component ⇒ same
+  bank (transitive; R-e validated the closure 0/128 hard flips) and
+  **different row, physically** (gate a3: two 2 MiB pages cannot share a
+  bank row).
+- **In-page node classes do NOT get that argument** — in-page pairs were
+  sparsely sampled, so two nodes in different in-page bank classes are
+  UNKNOWN, never "different bank", and differing row classes are not row
+  inequality. Different row in-page is claimed only from direct deep
+  evidence (a consensus anchor cell `(page_base, page_base^M)`).
+- **Same row** = row-class membership (measured in-bank lows, ~1%
+  probable). The one reproducible R-e falsifier (0x2aed3880/0x2aed7b00,
+  predict-check measured the pair deep) is flagged on query
+  (`measured-contradicted`) and excluded from fault-site selection.
+- **Row-adjacent** is ASSUMED, never measured: PA-order neighbors within
+  a bank component under the GeForge App. B monotonic-row-stripe prior
+  (timing carries no row-distance information). In-page row boundaries
+  are unmapped, so only the cross-page selector is offered.
+- **Coverage is fail-closed**: a PA whose page is outside the table
+  universe exits 2 (the relation must be measured, never extrapolated);
+  unlinked pages (bank drew none of the 1024 uniform reps) warn by
+  default, `--require-linked` escalates.
+- `--annotate-pool` joins a run's `pool_map.csv` (VA page ↔ PA page)
+  with the GDDR classes into the per-run snapshot file G4 consumes (the
+  G3 leg of its dual-addressing chain).
+- `--build-anchors` folds the T1 runs' anchor sweep cells into a per-page
+  strict-majority consensus (per-cell flips stay informational — the
+  populated sweep valley — exactly the wobble R-d documented).
+
+S5-T3 result on table v4 (2026-09-17): anchor consensus over the three
+big builds — 270,336 cells, **11264/11264 pages keep a valid anchor**,
+universal masks 0x1f9dc0 + 0x1fdc80; big-pool coverage check 11264/11264
+PASS (412 unlinked pages warned); measured same-row siting = 113 pairs on
+9 row classes (114 minus the excluded falsifier — the honest limit for
+same-row faults); `--annotate-pool` on the S3b run: 2048/2048 pages in
+universe, 1992 bank-known, 5 pages with same-row sites. G3 is closed;
+G4 consumes the snapshots.
+
 ## Validity boundary
 
 - Latencies are cycle counts from one SM; conversion to ns uses the
