@@ -953,6 +953,29 @@ f_MC_card2
 
 ### G4：Dual Addressing Integration
 
+Status（2026-09-20）：**G4-T1 完成（纯离线，零新采集）——三腿拼接工具落地，
+三卡真实快照建成**。新增 `tools/g4_dualaddr/build_snapshot.py`：G1.5
+AllocationRegistry（allocation_id↔VA↔语义标签）× G2 逐 run
+`gpu_va_pa_map.csv`（join 键 = allocation_id + VA 页，非 VA 算术）× G3 表 v4
+（PA 页→bank 组件/row 类/锚）→ 每 run 双向寻址快照（snapshot_pages.csv +
+manifest.json 含 mapping checksum=快照 sha256）。fail-closed：ACTIVE 分配的
+每 VA 页必须有 pte_valid+VIDEO+COMPLETE 观察行；驻留 PA 页必须在表宇宙内；
+跨 VA 页 PA 别名拒绝；同页字节驻留不交叠（TRT 实测 5 个小分配共享一页）；
+map 悬挂 allocation 拒绝；未连页/无锚页如实标注+警告。自测锁定全部路径
+（含 gap/outside/invalid-PTE/alias/overlap/dangling 六种拒绝）。一个数据
+教训：顶层 `artifacts/g1_5/` 与聚合 map 来自不同执行（g1_5_run_id 是逻辑
+标签），必须用 run 目录内的配对 `g1_5_allocations.csv`。三卡实测（各自
+最新 TRT run）：各 18 行/14 PA 页/26.4 MiB 驻留/7 分配，全部在宇宙内；
+bank 已知 14/14（GPU0/GPU1）、12/14（GPU2，2 页未连警告）；锚 14/14 三卡
+全有；`--lookup-va/--lookup-pa` 双向查询通过。两个塑造 G4-T2 的发现：
+(1) 三卡 PA 页集互不相同（0x1f0../0x205../0x26e.. 段）——共驻显存状态改变
+分配落点，per-run 快照 + 宇宙 fail-closed 按设计吸收（用户批准的共驻结论
+获得实测印证：观察与注入不受他人进程影响，仅显存压力可能把分配推出宇宙
+而拒绝 run）；(2) 负载驻留页与 5 个实测同行类页交集为 0——G5 同行 MCU
+需放置规划（受测数据导向 row 类页）或 row-mining 定向补测，G4-T2 出决断
+数据。**下一步 G4-T2**：三卡各一次实机门控 run——在线建快照 + 反向链
+选点 + CUDA XOR 穿链演示（binding 语义区 + TRT internal 区各一次）。
+
 将：
 
 ```text
