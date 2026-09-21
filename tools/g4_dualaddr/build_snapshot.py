@@ -364,6 +364,69 @@ def load_snapshot(out: Path, say):
         return list(csv.DictReader(fh))
 
 
+@dataclass
+class BuildResult:
+    rows: list[dict]
+    manifest: dict
+    problems: list[str]
+    warnings: list[str]
+    allocs: list[Allocation]
+
+
+def run_build(allocations: Path, va_pa: Path, device: int, table: Path,
+              out: Path, say) -> BuildResult:
+    """The full build path shared by the CLI and the G4-T2 orchestrator.
+
+    On problems NOTHING is written (fail-closed) and the result carries the
+    refusals in .problems / .manifest["problems"]. Table-integrity errors
+    raise RuntimeError (CLI exit 1); join problems are returned (exit 2).
+    """
+    problems: list[str] = []
+    tab = Table(table, problems)
+    if problems:
+        raise RuntimeError("; ".join(problems))
+    allocs = load_allocations(allocations, device, say)
+    pages, uuid, map_run = load_map(va_pa, device,
+                                    {a.run_id for a in allocs},
+                                    {a.allocation_id for a in allocs}, say)
+    if pages is None:
+        refusal = ["va-pa map rejected at load"]
+        return BuildResult([], {"problems": refusal}, refusal, [], allocs)
+    rows, problems, warnings = build_rows(allocs, pages, tab, say)
+    if problems:
+        return BuildResult([], {"problems": problems}, problems, warnings,
+                           allocs)
+    manifest = {
+        "schema": "gpu-m2d.g4-dualaddr.snapshot.v1",
+        "device": device,
+        "gpu_uuid": uuid,
+        "run_id": map_run,
+        "g1_5_run_id": sorted({a.run_id for a in allocs}),
+        "table_dir": str(table),
+        "inputs": {
+            "allocations_sha256": _sha256(allocations),
+            "va_pa_sha256": _sha256(va_pa),
+            "gddr_seed_table_sha256": _sha256(table / "gddr_seed_table.csv"),
+            "bank_classes_sha256": _sha256(table / "bank_classes.csv"),
+        },
+        "counts": {
+            "allocations": len(allocs),
+            "rows": len(rows),
+            "resident_bytes": sum(a.size for a in allocs),
+            "pa_pages": len({r["fb_pa_page_base"] for r in rows}),
+            "unlinked_pages":
+                len({r["fb_pa_page_base"] for r in rows
+                     if str(r["bank_linked"]) == "0"}),
+            "row_site_pages":
+                len({r["fb_pa_page_base"] for r in rows
+                     if int(r["same_row_site_nodes"]) > 0}),
+        },
+        "warnings": sorted(set(warnings)),
+    }
+    write_outputs(out, rows, manifest)
+    return BuildResult(rows, manifest, [], warnings, allocs)
+
+
 # --------------------------------------------------------------------------
 # driver + self-test
 # --------------------------------------------------------------------------
@@ -406,51 +469,16 @@ def main() -> int:
     if args.allocations is None or args.va_pa is None \
             or args.device is None or args.out is None:
         parser.error("build needs --allocations, --va-pa, --device, --out")
-    problems: list[str] = []
-    tab = Table(args.table, problems)
-    if problems:
-        say(f"INTEGRITY: {'; '.join(problems)}")
+    try:
+        result = run_build(args.allocations, args.va_pa, args.device,
+                           args.table, args.out, say)
+    except RuntimeError as error:
+        say(f"INTEGRITY: {error}")
         return 1
-    allocs = load_allocations(args.allocations, args.device, say)
-    pages, uuid, map_run = load_map(args.va_pa, args.device,
-                                    {a.run_id for a in allocs},
-                                    {a.allocation_id for a in allocs}, say)
-    if pages is None:
+    rows, manifest = result.rows, result.manifest
+    print_stats(rows, result.allocs, result.problems, result.warnings, say)
+    if result.problems:
         return 2
-    rows, problems, warnings = build_rows(allocs, pages, tab, say)
-    print_stats(rows, allocs, problems, warnings, say)
-    if problems:
-        return 2
-    manifest = {
-        "schema": "gpu-m2d.g4-dualaddr.snapshot.v1",
-        "device": args.device,
-        "gpu_uuid": uuid,
-        "run_id": map_run,
-        "g1_5_run_id": sorted({a.run_id for a in allocs}),
-        "table_dir": str(args.table),
-        "inputs": {
-            "allocations_sha256": _sha256(args.allocations),
-            "va_pa_sha256": _sha256(args.va_pa),
-            "gddr_seed_table_sha256":
-                _sha256(args.table / "gddr_seed_table.csv"),
-            "bank_classes_sha256":
-                _sha256(args.table / "bank_classes.csv"),
-        },
-        "counts": {
-            "allocations": len(allocs),
-            "rows": len(rows),
-            "resident_bytes": sum(a.size for a in allocs),
-            "pa_pages": len({r["fb_pa_page_base"] for r in rows}),
-            "unlinked_pages":
-                len({r["fb_pa_page_base"] for r in rows
-                     if str(r["bank_linked"]) == "0"}),
-            "row_site_pages":
-                len({r["fb_pa_page_base"] for r in rows
-                     if int(r["same_row_site_nodes"]) > 0}),
-        },
-        "warnings": sorted(set(warnings)),
-    }
-    write_outputs(args.out, rows, manifest)
     say(f"output: {args.out}/snapshot_pages.csv + manifest.json "
         f"(mapping checksum {manifest['snapshot_sha256'][:16]}...)")
     if args.lookup_va:

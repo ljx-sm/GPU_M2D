@@ -74,6 +74,39 @@ Two findings that shape G4-T2:
   placement steering (copy the data under test onto row-class pages) or a
   row-mining top-up round — G4-T2 produces the decision data.
 
+## G4-T2: live gated XOR through the chain (`run_g4_t2_injection.py`)
+
+Online per-run join + reverse-chain fault injection on the live TRT
+workload. The runner gets a second gate: after clean inference it writes
+its gate-time registry and blocks; the orchestrator builds the PTE
+ledger, the run's `gpu_va_pa_map_gate.csv`, and the snapshot (same
+`run_build` as above), then selects two targets FROM the snapshot —
+`t1-binding` (bank-linked page, then the `data` input binding) and
+`t2-internal` (bank-linked page, then the largest TRT-internal
+allocation) — and releases the runner with the work file. The runner
+checks each target against its LIVE registry (expected VA), XORs the bit,
+verifies `after == before ^ mask` + every other byte unchanged +
+reverse-map, runs the injected inference (DUE tolerated as an outcome),
+restores both faults byte-exactly, and finishes with a sanity inference
+that must reproduce the clean output. Post-teardown checks: strict
+ledger, mappings alive across the injection window, gate == final
+registry, gate-vs-final map diff (mid-run remap detector), independent
+re-verification of every result row.
+
+```bash
+python3 tools/g4_dualaddr/run_g4_t2_injection.py --self-test
+sudo scripts/run_g2_observer_probe.sh --api g4t2 --device 0   # or omit
+                                                              # --device to
+                                                              # loop all GPUs
+```
+
+Result (2026-09-20): **all three cards PASS** (`G4_T2_DUALADDR_CHAIN_
+XOR_VERIFIED`), 0 lost events, every check green, and all six injected
+inferences SDC_NUMERIC — the faults were semantically real. Artifacts per
+run under `artifacts/g4/t2/<run>/`: events, both maps, work file +
+detail, snapshot, `g1_5_g4_result.csv`, summary with per-target chain
+evidence and checksums. Full write-up: `docs/G4_VALIDATION.md`.
+
 ## Validity boundary
 
 - The snapshot is run-scoped: never reused across runs (registry + map

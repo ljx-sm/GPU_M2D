@@ -36,6 +36,10 @@ constexpr int kInputHeight = 224;
 constexpr int kInputWidth = 224;
 constexpr int kClassCount = 45;
 constexpr float kProbabilityTolerance = 1.0e-6F;
+// G4-T2 post-restore sanity inference: INT8 execution is deterministic for
+// a fixed engine and input, so a fully restored run must reproduce the
+// clean output; the tolerance only absorbs float reduction wobble.
+constexpr float kSanityTolerance = 1.0e-4F;
 const std::array<float, 3> kMean{{0.485F, 0.456F, 0.406F}};
 const std::array<float, 3> kStd{{0.229F, 0.224F, 0.225F}};
 
@@ -58,6 +62,85 @@ struct TrtDeleter {
         delete object;
     }
 };
+
+// Polls for a gate file's appearance. Used by the observer pre-allocation
+// gate and by the G4-T2 injection release gate; the orchestrator creates
+// the file only after its side of the handshake is complete.
+bool wait_for_file(const std::string& path, int timeout_seconds) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (access(path.c_str(), F_OK) == 0) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return false;
+}
+
+// One reverse-chain XOR target selected by the G4-T2 orchestrator from the
+// per-run dual-addressing snapshot (GDDR PA page -> VA -> allocation byte).
+struct InjectionTarget {
+    std::string target_id;
+    std::string allocation_id;
+    std::size_t byte_offset{0};
+    unsigned bit_in_byte{0};
+    std::uintptr_t expected_gpu_va{0};
+};
+
+std::vector<std::string> split_csv_line(const std::string& line) {
+    std::vector<std::string> fields;
+    std::string field;
+    std::istringstream stream(line);
+    while (std::getline(stream, field, ',')) {
+        fields.push_back(field);
+    }
+    if (!line.empty() && line.back() == ',') {
+        fields.emplace_back();
+    }
+    return fields;
+}
+
+// Work file: "target_id,allocation_id,byte_offset,bit_in_byte,expected_gpu_va"
+// with a header row and optional '#' comment lines. expected_gpu_va is the
+// chain check: it must equal the live registry's forward mapping, so any
+// drift between the orchestrator's snapshot and this process is refused.
+std::vector<InjectionTarget> read_injection_work(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("cannot open injection work file: " + path);
+    }
+    std::vector<InjectionTarget> targets;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty() || line.front() == '#' ||
+            line.rfind("target_id,", 0) == 0) {
+            continue;
+        }
+        const std::vector<std::string> fields = split_csv_line(line);
+        if (fields.size() != 5) {
+            throw std::runtime_error("malformed injection work row: " + line);
+        }
+        InjectionTarget target;
+        target.target_id = fields[0];
+        target.allocation_id = fields[1];
+        target.byte_offset = std::stoull(fields[2]);
+        target.bit_in_byte = std::stoul(fields[3]);
+        target.expected_gpu_va = std::stoull(fields[4], nullptr, 16);
+        if (target.target_id.empty() || target.allocation_id.empty() ||
+            target.bit_in_byte > 7 || target.expected_gpu_va == 0) {
+            throw std::runtime_error("invalid injection work row: " + line);
+        }
+        targets.push_back(std::move(target));
+    }
+    if (targets.empty()) {
+        throw std::runtime_error("injection work file has no targets: " + path);
+    }
+    return targets;
+}
 
 // Optional G2 observer instrumentation. When a gate file is configured the
 // runner blocks before creating any CUDA context (the eBPF probes attach in
@@ -86,15 +169,7 @@ struct ObserverEmitter {
     }
 
     bool wait_for_gate() const {
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(gate_timeout_seconds);
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (access(gate_file.c_str(), F_OK) == 0) {
-                return true;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        }
-        return false;
+        return wait_for_file(gate_file, gate_timeout_seconds);
     }
 
     void event(const char* name) const {
@@ -105,6 +180,19 @@ struct ObserverEmitter {
                     ",monotonic_ns=%" PRIu64 "\n",
                     name, static_cast<int>(getpid()), static_cast<int>(getpid()),
                     wall_time_ns(), monotonic_time_ns());
+        std::fflush(stdout);
+    }
+
+    // Same lifecycle line format with extra comma-free key=value fields
+    // (used by the G4-T2 per-target events).
+    void event_with(const char* name, const std::string& fields) const {
+        if (!enabled) {
+            return;
+        }
+        std::printf("GPU_M2D_EVENT,event=%s,%s,pid=%d,tgid=%d,wall_time_ns=%"
+                    PRIu64 ",monotonic_ns=%" PRIu64 "\n",
+                    name, fields.c_str(), static_cast<int>(getpid()),
+                    static_cast<int>(getpid()), wall_time_ns(), monotonic_time_ns());
         std::fflush(stdout);
     }
 
@@ -370,6 +458,13 @@ struct Options {
     std::string observer_gate;
     int hold_seconds{0};
     int gate_timeout_seconds{30};
+    // G4-T2 gated dual-addressing injection mode: both paths must be given
+    // together. The runner writes its gate-time allocation registry, waits
+    // for the release file, then executes the work file's reverse-chain
+    // XOR targets instead of the fixed element/bit self-injection.
+    std::string injection_work;
+    std::string injection_release;
+    int injection_gate_timeout_seconds{0};
 };
 
 struct Sample {
@@ -442,6 +537,15 @@ Options parse_options(int argc, char** argv) {
             if (options.gate_timeout_seconds <= 0) {
                 throw std::invalid_argument("--gate-timeout-seconds must be > 0");
             }
+        } else if (key == "--injection-work") {
+            options.injection_work = value;
+        } else if (key == "--injection-release") {
+            options.injection_release = value;
+        } else if (key == "--injection-gate-timeout-seconds") {
+            options.injection_gate_timeout_seconds = std::stoi(value);
+            if (options.injection_gate_timeout_seconds <= 0) {
+                throw std::invalid_argument("--injection-gate-timeout-seconds must be > 0");
+            }
         } else if (key == "--output-prefix") {
             options.output_prefix = value;
         } else {
@@ -454,7 +558,13 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument(
             "required arguments: --engine PATH --sample-csv PATH "
             "--output-prefix PATH [--sample-index N --device N --element N --bit N] "
-            "[--observer-gate PATH --hold-seconds N --gate-timeout-seconds N]");
+            "[--observer-gate PATH --hold-seconds N --gate-timeout-seconds N] "
+            "[--injection-work PATH --injection-release PATH "
+            "--injection-gate-timeout-seconds N]");
+    }
+    if (options.injection_work.empty() != options.injection_release.empty()) {
+        throw std::invalid_argument(
+            "--injection-work and --injection-release must be given together");
     }
     return options;
 }
@@ -769,6 +879,67 @@ void write_result(const std::string& path,
            << (injected.class_index == sample.target ? 1 : 0) << '\n';
 }
 
+// One row per reverse-chain XOR target of a G4-T2 run, plus the shared
+// injected/sanity inference outcomes (repeated per row for self-contained
+// CSV consumption).
+struct G4TargetRecord {
+    InjectionTarget target;
+    std::string semantic_label;
+    gpu_m2d::BitFlipResult flip;
+    bool guard_bytes_unchanged{false};
+    bool reverse_map_ok{false};
+    bool restored_byte_ok{false};
+    bool restore_guard_ok{false};
+    std::vector<std::uint8_t> before_full;  // pristine pre-injection snapshot
+};
+
+void write_g4_result(const std::string& path, const Options& options,
+                     const Sample& sample, const std::string& run_id,
+                     const std::vector<G4TargetRecord>& records,
+                     const Prediction& clean, const Prediction& injected,
+                     const std::string& injected_outcome, bool injected_valid,
+                     const Prediction& sanity) {
+    std::ofstream output(path);
+    if (!output) {
+        throw std::runtime_error("cannot write G4 injection result: " + path);
+    }
+    const bool sanity_matches_clean =
+        sanity.class_index == clean.class_index &&
+        std::fabs(sanity.probability - clean.probability) <= kSanityTolerance;
+    output << "run_id,device,image,target,target_id,allocation_id,semantic_label,"
+              "byte_offset,bit_in_byte,xor_mask,gpu_va,expected_gpu_va,before,after,"
+              "guard_bytes_unchanged,reverse_map_ok,restored_byte_ok,restore_guard_ok,"
+              "clean_class,clean_probability,injected_class,injected_probability,"
+              "injected_outcome,sanity_class,sanity_probability,sanity_matches_clean\n";
+    for (const G4TargetRecord& record : records) {
+        output << run_id << ',' << options.device << ',' << sample.path << ','
+               << sample.target << ',' << record.target.target_id << ','
+               << record.target.allocation_id << ',' << record.semantic_label << ','
+               << record.target.byte_offset << ',' << record.target.bit_in_byte << ','
+               << static_cast<unsigned>(record.flip.xor_mask) << ','
+               << hex_address(record.flip.gpu_va) << ','
+               << hex_address(record.target.expected_gpu_va) << ','
+               << static_cast<unsigned>(record.flip.before) << ','
+               << static_cast<unsigned>(record.flip.after) << ','
+               << (record.guard_bytes_unchanged ? 1 : 0) << ','
+               << (record.reverse_map_ok ? 1 : 0) << ','
+               << (record.restored_byte_ok ? 1 : 0) << ','
+               << (record.restore_guard_ok ? 1 : 0) << ',' << clean.class_index << ','
+               << std::setprecision(9) << clean.probability << ','
+               << (injected_valid ? std::to_string(injected.class_index)
+                                  : std::string("NA"))
+               << ',';
+        if (injected_valid) {
+            output << injected.probability;
+        } else {
+            output << "NA";
+        }
+        output << ',' << injected_outcome << ',' << sanity.class_index << ','
+               << sanity.probability << ',' << (sanity_matches_clean ? 1 : 0)
+               << '\n';
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -799,6 +970,14 @@ int main(int argc, char** argv) {
         if (observer.enabled && access(observer.gate_file.c_str(), F_OK) == 0) {
             throw std::runtime_error("observer gate already exists: " +
                                      observer.gate_file);
+        }
+        // Same race discipline for the T2 release file: the orchestrator
+        // creates it only after the work file is complete, so a file that
+        // exists this early is stale from an earlier attempt.
+        if (!options.injection_release.empty() &&
+            access(options.injection_release.c_str(), F_OK) == 0) {
+            throw std::runtime_error("injection release file already exists: " +
+                                     options.injection_release);
         }
         observer.event("PROCESS_READY");
         observer.event("WAIT_PRE_ALLOC_GATE");
@@ -907,14 +1086,21 @@ int main(int argc, char** argv) {
             class_binding.index, stream);
         observer.event("CLEAN_INFERENCE_END");
 
+        Prediction injected;
+        gpu_m2d::TensorBitAddress mapped{};
+        gpu_m2d::BitFlipResult flip{};
+        std::vector<G4TargetRecord> g4_records;
+        std::string g4_injected_outcome;
+        bool g4_injected_valid = false;
+        if (options.injection_work.empty()) {
         allocator.set_phase("injected_inference");
         observer.event("INJECTED_INFERENCE_BEGIN");
         check_cuda(cudaMemcpy(binding_pointers[input_binding.index], input.data(),
                               input_binding.size_bytes, cudaMemcpyHostToDevice),
                    "reset input before injection");
-        const auto mapped = mapping.tensor_bit_to_gpu_va(
+        mapped = mapping.tensor_bit_to_gpu_va(
             input_binding.name, options.element_index, options.element_bit_index);
-        const auto flip = gpu_m2d::flip_device_bit(
+        flip = gpu_m2d::flip_device_bit(
             binding_pointers[input_binding.index], input_binding.size_bytes,
             mapped.byte_offset, mapped.bit_in_byte);
         if (flip.gpu_va != mapped.gpu_va || flip.xor_mask != mapped.xor_mask) {
@@ -959,7 +1145,7 @@ int main(int argc, char** argv) {
                 "real TensorRT input allocation forward mapping mismatch");
         }
 
-        const Prediction injected = run_inference(
+        injected = run_inference(
             *context, binding_pointers, probability_binding.index,
             class_binding.index, stream);
         observer.event("INJECTED_INFERENCE_END");
@@ -967,8 +1153,214 @@ int main(int argc, char** argv) {
                      mapped, flip, clean, injected);
         write_allocation_registry(options.output_prefix + "_allocations.csv",
                                   allocation_registry);
+        } else {
+        // ---- G4-T2: gated dual-addressing XOR through the observed chain.
+        // The orchestrator has observed every PTE, built the per-run
+        // snapshot (TensorBit-VA-PA-GDDR), and selected reverse-chain
+        // targets; the work file is authoritative about WHERE to flip.
+        allocator.set_phase("g4_injection");
+        write_allocation_registry(options.output_prefix + "_allocations.csv",
+                                  allocation_registry);
+        observer.event("ALLOCATION_REGISTRY_GATE_WRITTEN");
+        observer.event("INJECTION_GATE_WAIT");
+        if (observer.enabled) {
+            std::fflush(stdout);
+        }
+        if (!wait_for_file(options.injection_release,
+                           options.injection_gate_timeout_seconds > 0
+                               ? options.injection_gate_timeout_seconds
+                               : options.gate_timeout_seconds)) {
+            throw std::runtime_error("injection release gate timed out: " +
+                                     options.injection_release);
+        }
+        observer.event("INJECTION_WORK_BEGIN");
+        const std::vector<InjectionTarget> targets =
+            read_injection_work(options.injection_work);
+
+        // Pre-flight chain check: every work target must resolve in the
+        // LIVE registry to the orchestrator's expected VA, so any drift
+        // between the snapshot and this process refuses before any flip.
+        for (const InjectionTarget& target : targets) {
+            const auto forward = allocation_registry.allocation_bit_to_gpu_va(
+                target.allocation_id, target.byte_offset,
+                static_cast<std::uint8_t>(target.bit_in_byte));
+            if (forward.gpu_va != target.expected_gpu_va) {
+                throw std::runtime_error(
+                    "work target " + target.target_id + ": registry forward VA " +
+                    hex_address(forward.gpu_va) + " != expected " +
+                    hex_address(target.expected_gpu_va));
+            }
+        }
+
+        for (const InjectionTarget& target : targets) {
+            observer.event_with("TARGET_BEGIN",
+                                "target_id=" + target.target_id +
+                                    ",allocation_id=" + target.allocation_id);
+            const auto descriptors = allocation_registry.allocations();
+            const auto descriptor = std::find_if(
+                descriptors.begin(), descriptors.end(),
+                [&target](const gpu_m2d::AllocationDescriptor& candidate) {
+                    return candidate.allocation_id == target.allocation_id &&
+                           candidate.active;
+                });
+            if (descriptor == descriptors.end()) {
+                throw std::runtime_error("work target allocation is not active: " +
+                                         target.allocation_id);
+            }
+            void* base = reinterpret_cast<void*>(descriptor->base_gpu_va);
+
+            G4TargetRecord record;
+            record.target = target;
+            record.semantic_label = descriptor->semantic_label;
+            record.before_full.resize(descriptor->size_bytes);
+            check_cuda(cudaMemcpy(record.before_full.data(), base,
+                                  descriptor->size_bytes, cudaMemcpyDeviceToHost),
+                       "snapshot allocation before injection");
+            record.flip = gpu_m2d::flip_device_bit(
+                base, descriptor->size_bytes, target.byte_offset,
+                static_cast<std::uint8_t>(target.bit_in_byte));
+            if (record.flip.gpu_va != target.expected_gpu_va) {
+                throw std::runtime_error("flipped VA drifted from the work target");
+            }
+
+            std::vector<std::uint8_t> after_full(descriptor->size_bytes);
+            check_cuda(cudaMemcpy(after_full.data(), base, descriptor->size_bytes,
+                                  cudaMemcpyDeviceToHost),
+                       "verify full allocation after injection");
+            std::vector<std::uint8_t> expected_full = record.before_full;
+            expected_full[target.byte_offset] ^= record.flip.xor_mask;
+            record.guard_bytes_unchanged = after_full == expected_full;
+
+            try {
+                const auto reversed =
+                    allocation_registry.gpu_va_to_allocation_bit(
+                        options.device, record.flip.gpu_va,
+                        record.flip.bit_in_byte);
+                record.reverse_map_ok =
+                    reversed.allocation_id == target.allocation_id &&
+                    reversed.byte_offset == target.byte_offset &&
+                    reversed.bit_in_byte == record.flip.bit_in_byte;
+            } catch (const std::exception&) {
+                record.reverse_map_ok = false;
+            }
+            if (!record.guard_bytes_unchanged || !record.reverse_map_ok) {
+                throw std::runtime_error("target verification failed: " +
+                                         target.target_id);
+            }
+            observer.event_with(
+                "TARGET_FLIPPED",
+                "target_id=" + target.target_id +
+                    ",allocation_id=" + target.allocation_id +
+                    ",gpu_va=" + hex_address(record.flip.gpu_va) +
+                    ",before=" + std::to_string(record.flip.before) +
+                    ",after=" + std::to_string(record.flip.after) +
+                    ",xor_mask=" + std::to_string(record.flip.xor_mask));
+            g4_records.push_back(std::move(record));
+        }
+
+        allocator.set_phase("injected_inference");
+        observer.event("INJECTED_INFERENCE_BEGIN");
+        try {
+            injected = run_inference(
+                *context, binding_pointers, probability_binding.index,
+                class_binding.index, stream);
+            g4_injected_valid = true;
+        } catch (const std::exception&) {
+            // An invalid numeric output is an honest DUE outcome of the
+            // injected faults, not a tool failure; the restore and sanity
+            // phases below still verify the device state.
+            g4_injected_valid = false;
+        }
+        observer.event("INJECTED_INFERENCE_END");
+        if (!g4_injected_valid) {
+            g4_injected_outcome = "DUE_INVALID_OUTPUT";
+        } else if (injected.class_index != clean.class_index) {
+            g4_injected_outcome = "SDC_TOP1";
+        } else if (std::fabs(injected.probability - clean.probability) >
+                   kProbabilityTolerance) {
+            g4_injected_outcome = "SDC_NUMERIC";
+        } else {
+            g4_injected_outcome = "BENIGN";
+        }
+        observer.event_with("INJECTED_OUTCOME", "outcome=" + g4_injected_outcome);
+
+        observer.event("RESTORE_BEGIN");
+        for (auto record_it = g4_records.rbegin(); record_it != g4_records.rend();
+             ++record_it) {
+            G4TargetRecord& record = *record_it;
+            const auto descriptors = allocation_registry.allocations();
+            const auto descriptor = std::find_if(
+                descriptors.begin(), descriptors.end(),
+                [&record](const gpu_m2d::AllocationDescriptor& candidate) {
+                    return candidate.allocation_id == record.target.allocation_id &&
+                           candidate.active;
+                });
+            if (descriptor == descriptors.end()) {
+                throw std::runtime_error("restore target allocation is not active: " +
+                                         record.target.allocation_id);
+            }
+            void* base = reinterpret_cast<void*>(descriptor->base_gpu_va);
+            const auto unflip = gpu_m2d::flip_device_bit(
+                base, descriptor->size_bytes, record.target.byte_offset,
+                static_cast<std::uint8_t>(record.target.bit_in_byte));
+            record.restored_byte_ok = unflip.after == record.flip.before;
+            std::vector<std::uint8_t> restored_full(descriptor->size_bytes);
+            check_cuda(cudaMemcpy(restored_full.data(), base, descriptor->size_bytes,
+                                  cudaMemcpyDeviceToHost),
+                       "verify full allocation after restore");
+            record.restore_guard_ok = restored_full == record.before_full;
+            if (!record.restored_byte_ok || !record.restore_guard_ok) {
+                throw std::runtime_error("target restore failed: " +
+                                         record.target.target_id);
+            }
+            observer.event_with("TARGET_RESTORED",
+                                "target_id=" + record.target.target_id +
+                                    ",allocation_id=" +
+                                    record.target.allocation_id +
+                                    ",byte=" + std::to_string(unflip.after));
+        }
+        observer.event("RESTORE_END");
+
+        // With every fault restored the engine must reproduce the clean
+        // output exactly (INT8 inference is deterministic for a fixed
+        // engine and input): this is the no-residue check.
+        observer.event("SANITY_INFERENCE_BEGIN");
+        const Prediction sanity = run_inference(
+            *context, binding_pointers, probability_binding.index,
+            class_binding.index, stream);
+        observer.event("SANITY_INFERENCE_END");
+        if (sanity.class_index != clean.class_index ||
+            std::fabs(sanity.probability - clean.probability) > kSanityTolerance) {
+            throw std::runtime_error(
+                "post-restore sanity inference diverged from the clean run");
+        }
+        write_g4_result(options.output_prefix + "_g4_result.csv", options, sample,
+                        run_id, g4_records, clean, injected, g4_injected_outcome,
+                        g4_injected_valid, sanity);
+        write_allocation_registry(options.output_prefix + "_allocations.csv",
+                                  allocation_registry);
+        observer.event("INJECTION_WORK_END");
+        }
         observer.event("SNAPSHOT_READY");
 
+        if (!options.injection_work.empty()) {
+            std::cout << "GPU_M2D_G4_T2_PASS"
+                      << " device=" << options.device
+                      << " gpu=\"" << device_properties.name << "\""
+                      << " targets=" << g4_records.size();
+            for (const G4TargetRecord& record : g4_records) {
+                std::cout << " " << record.target.target_id
+                          << "=alloc:" << record.target.allocation_id
+                          << ",va=" << hex_address(record.flip.gpu_va)
+                          << ",byte_offset=" << record.target.byte_offset
+                          << ",bit=" << record.target.bit_in_byte
+                          << ",before=" << static_cast<unsigned>(record.flip.before)
+                          << ",after=" << static_cast<unsigned>(record.flip.after);
+            }
+            std::cout << " injected_outcome=" << g4_injected_outcome
+                      << " restored=" << g4_records.size()
+                      << " sanity=clean\n";
+        } else {
         const bool top1_changed = clean.class_index != injected.class_index;
         const bool numeric_changed = top1_changed ||
             std::fabs(clean.probability - injected.probability) >
@@ -988,6 +1380,7 @@ int main(int argc, char** argv) {
                   << " outcome=" << (top1_changed ? "SDC_TOP1" : "BENIGN_TOP1")
                   << " numeric_output_changed=" << (numeric_changed ? 1 : 0)
                   << '\n';
+        }
 
         allocator.set_phase("destroy_runtime_objects");
         if (observer.enabled && options.hold_seconds > 0) {

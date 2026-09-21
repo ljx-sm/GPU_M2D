@@ -17,6 +17,11 @@
 #   sudo scripts/run_g2_observer_probe.sh --api alias    # VMM alias double-mapping
 #   sudo scripts/run_g2_observer_probe.sh --api tensorrt # full G1.5 workload
 #   sudo scripts/run_g2_observer_probe.sh --api g3pool --device N  # G3 timing pool
+#   sudo scripts/run_g2_observer_probe.sh --api g4t2 [--device N]   # G4-T2 gated
+#                       # dual-addressing XOR runs; without --device it loops
+#                       # over all GPUs SEQUENTIALLY (one eBPF observer at a
+#                       # time). No idle-GPU requirement (post-timing policy);
+#                       # co-tenant state is recorded, never a refusal.
 #
 # Common options:
 #   [--size-mib N] [--hold-seconds N]
@@ -33,6 +38,10 @@
 #                [--row-pilot-pages N] [--census-stride N] [--repeat-pages N]
 #   table-build-only: [--seed-table DIR] [--bank-map-from DIR]
 #                     [--bank-map-pages N]
+# G4-T2-only options:
+#   [--table DIR]       G3 EMT table (default: artifacts/g3/table_v4)
+#   [--binding-bit N] [--internal-bit N]   fixed target-bit policy constants
+#   [--sample-index N]
 #   [--timeout-seconds N]
 #
 # The tensorrt mode also regenerates artifacts/g2/gpu_va_pa_map.csv from the
@@ -62,14 +71,16 @@ while [[ $# -gt 0 ]]; do
         --seed-table|--bank-map-from|--bank-map-pages|--pairs-csv|\
         --rep-uniform|--rep-seed) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --table|--binding-bit|--internal-bit|--sample-index) \
+            EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --device) G3_DEVICE="$2"; shift 2 ;;
         --runner) RUNNER="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
 case "${API}" in
-    device|vmm|alias|tensorrt|g3pool) ;;
-    *) echo "--api must be device, vmm, alias, tensorrt, or g3pool" >&2; exit 1 ;;
+    device|vmm|alias|tensorrt|g3pool|g4t2) ;;
+    *) echo "--api must be device, vmm, alias, tensorrt, g3pool, or g4t2" >&2; exit 1 ;;
 esac
 if [[ "${API}" == "g3pool" && -z "${G3_DEVICE}" ]]; then
     echo "--api g3pool requires --device N (the timing pool needs one idle GPU" \
@@ -91,7 +102,7 @@ if [[ "${API}" == "g3pool" ]]; then
              "make -C tools/g3_probe all" >&2
         exit 1
     fi
-elif [[ "${API}" != "tensorrt" ]]; then
+elif [[ "${API}" != "tensorrt" && "${API}" != "g4t2" ]]; then
     HARNESS="g2_scratch_harness"
     [[ "${API}" == "alias" ]] && HARNESS="g2_alias_harness"
     if [[ ! -x "${OBSERVER}/${HARNESS}" ]]; then
@@ -118,7 +129,12 @@ if [[ "${API}" == "g3pool" ]]; then
         FAILURES=$((FAILURES + 1))
     fi
 else
-    for DEVICE in $(seq 0 $((GPU_COUNT - 1))); do
+    if [[ "${API}" == "g4t2" && -n "${G3_DEVICE}" ]]; then
+        DEVICE_LIST="${G3_DEVICE}"
+    else
+        DEVICE_LIST="$(seq 0 $((GPU_COUNT - 1)))"
+    fi
+    for DEVICE in ${DEVICE_LIST}; do
         case "${API}" in
             device|vmm)
                 if ! /usr/bin/python3 "${OBSERVER}/run_g2_scratch_probe.py" \
@@ -139,6 +155,13 @@ else
                     FAILURES=$((FAILURES + 1))
                 fi
                 ;;
+            g4t2)
+                if ! /usr/bin/python3 "${PROJECT}/tools/g4_dualaddr/run_g4_t2_injection.py" \
+                    --device "${DEVICE}" --runner "${RUNNER}" \
+                    "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; then
+                    FAILURES=$((FAILURES + 1))
+                fi
+                ;;
         esac
     done
 fi
@@ -150,6 +173,10 @@ fi
 
 chown -R "${INVOKING_UID}:${INVOKING_GID}" "${OUTPUT_ROOT}" \
     "${PROJECT}/artifacts/g2/gpu_va_pa_map.csv" 2>/dev/null || true
+if [[ "${API}" == "g4t2" ]]; then
+    chown -R "${INVOKING_UID}:${INVOKING_GID}" "${PROJECT}/artifacts/g4" \
+        2>/dev/null || true
+fi
 
 if [[ "${FAILURES}" -gt 0 ]]; then
     echo "G2_OBSERVER_PROBE_FAILED api=${API} failed_devices=${FAILURES}" >&2

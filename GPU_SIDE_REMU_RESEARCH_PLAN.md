@@ -973,8 +973,32 @@ bank 已知 14/14（GPU0/GPU1）、12/14（GPU2，2 页未连警告）；锚 14/
 获得实测印证：观察与注入不受他人进程影响，仅显存压力可能把分配推出宇宙
 而拒绝 run）；(2) 负载驻留页与 5 个实测同行类页交集为 0——G5 同行 MCU
 需放置规划（受测数据导向 row 类页）或 row-mining 定向补测，G4-T2 出决断
-数据。**下一步 G4-T2**：三卡各一次实机门控 run——在线建快照 + 反向链
-选点 + CUDA XOR 穿链演示（binding 语义区 + TRT internal 区各一次）。
+数据。
+Status（2026-09-20）：**G4-T2 完成——三卡实机门控 run 全部 PASS，双地址链
+闭环（GDDR 侧选点 → VA → TensorRT 字节 → XOR 位翻转 → 恢复 → 零残留）**。
+交付：`tools/g4_dualaddr/run_g4_t2_injection.py`（编排器 + 离线自测）+
+runner 增量 T2 模式（`--injection-work/--injection-release`，legacy 路径不变
+且回归通过）+ `scripts/run_g2_observer_probe.sh --api g4t2`（唯一 sudo 面；
+无 `--device` 时顺序循环三卡，满足串行 eBPF 约束）+ `docs/G4_VALIDATION.md`。
+流程：观察器先挂 → runner 建全部分配+干净推理 → 写 gate 时刻注册表并阻塞 →
+编排器**在线**建 PTE 台账 + gate map + 快照（复用 T1 `run_build` 同一代码路
+径）→ 从快照**反向链选点**（t1 binding：优先 bank 已连页再选 data 输入
+binding；t2 internal：优先 bank 已连页再选最大 TRT 内部分配；字节=驻留区间
+中点；位=固定策略常数）→ 工作文件释放 → runner 对每个目标做活体注册表 VA
+一致性检查、整分配快照、XOR、`after==before^mask`、非目标字节不变、反向
+映射，随后带故障推理（非法输出记 DUE 而非工具失败）、逐字节恢复+整分配比
+对、恢复后 sanity 推理必须复现干净结果；收尾严格台账 + 注入窗口内存活检查
++ gate/final 注册表一致性 + gate/final map 差分（中途重映射检测器）+ 编排器
+独立复验每一行。共驻策略生效：三卡 run 时均有 3 个他人进程（共驻显存
+10.2/4.7/8.8 GiB），记录不拒绝；三卡 PA 段完全不同（0x29a../0x142../0x242..）
+但全在 22 GiB 宇宙内——共驻压力被 per-run 快照+宇宙 fail-closed 按设计吸
+收。实测（各 7 分配/18 map 行/119 eBPF 事件/0 丢失）：t1=data binding 字节
+301056 bit5（50→18），t2=trt-internal-0（bit2），全部 XOR 验证/守卫字节不
+变/反向映射/恢复/sanity 通过；**六次注入推理全部 SDC_NUMERIC**——故障是真
+实语义效应而非仅内存演示；G3 通用锚 0x1f9dc0/0x1fdc80 在三卡选中页上全部
+出现。G4 闭合。**下一步 G5**：GPU 故障注入（SEU/2-bit/3-bit MCU + 行/列
+空间相关；同行 MCU 需先决断放置策略——负载驻留页 ∩ 5 个实测 row 类页 =
+0）。
 
 将：
 
