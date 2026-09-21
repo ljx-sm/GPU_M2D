@@ -1017,6 +1017,26 @@ trial（1000 图带故障推理一遍）的驻留位翻转比例，R = 26,428,42
 SDC_TOP1 > SDC_NUMERIC > BENIGN 逐图比对 clean pass；文献出处节留待用户补。
 **下一步 G5-T3**：campaign 实现（采样器 + runner campaign 模式 + 编排器，
 复用 T2 门控/恢复/收尾骨架）。
+Status（2026-09-21）：**G5-T3 campaign 实现完成，L3×2 trial 冒烟
+G5_CAMPAIGN_VERIFIED**。三件套：`tools/g5_faultinj/fault_model.py`（冻结
+档位表 + 站点采样器，纯 stdlib，重推导自校验）；runner campaign 模式
+（`apps/resnet50_int8_g1_5.cpp`：门控前 CPU 预处理全部 1000 图 → 严格
+clean pass 逐图记录 → 每 trial 全站点同时翻转（逐点 after==before^mask、
+反向链、分配级 guard=pristine^masks）→ 带故障保持的 1000 图推理（输入
+故障随每图重打、输出故障随每次 enqueue 重打、TRT-internal 不重打=权重
+持久/scratch 软翻转）→ 逐图对 clean 记录分类（首 DUE 中止本 trial 余图）
+→ 逆序恢复 + 按类恢复验证（输入绑定对最后评估图精确比对 fail-closed；
+输出绑定 skipped:engine-owned-output；TRT-internal 信息性 mismatch:N）→
+单图 sanity 推理须复现 clean）；`tools/g5_faultinj/run_g5_campaign.py`
+编排器（门控窗口内 snapshot→驻留字节数必须等于冻结 R=26,428,428 否则
+拒跑→采样→构成/PA-byte-bit 去重复核→work.csv；收尾 ledger/map diff/
+registry 稳定/事件流逐条对齐 work/四张结果 CSV 独立复核（含分类从记录
+数值重推导、DUE 块形、事件↔CSV 一致））。一次真实的验证器抓序 bug：
+SITE_RESTORED 逆序（T2 约定）与校验器正向预期不符 → 修校验器并让自测
+独立构造事件流。入口 `scripts/run_g2_observer_probe.sh --api g5campaign
+--level L1..L5 [--trials N] [--seed N]`。冒烟：2 trial/21 站点/图，
+全链 VERIFIED，trial≈0.7 s → 100-trial 档 ≈2 min。遗留：5×100 全量
+campaign 待用户放行后执行。
 
 将：
 
