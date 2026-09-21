@@ -134,15 +134,27 @@ collapses onto L2) or a single 2-bit MCU (0% SBU).
 - Per trial: sample events → XOR **all** sites on device simultaneously →
   1000-image inference with faults held → classify → restore every site
   byte-exactly (byte + whole-allocation compare + guard bytes) → sanity
-  inference must reproduce the clean 1000-image pass. Campaign-close checks
-  inherit the G4-T2 skeleton (registry consistency, gate-vs-final map diff
-  = mid-run remap detector, 0 lost BPF events).
+  inference must reproduce that image's clean output. The sanity inference
+  is single-image (`--sample-index`, the G4-T2 convention): INT8 execution
+  is deterministic, so one strictly-reproduced output plus the byte-level
+  restore proofs above cover no-residue; re-running all 1000 images per
+  trial would add no information. Campaign-close checks inherit the G4-T2
+  skeleton (registry consistency, gate-vs-final map diff = mid-run remap
+  detector, 0 lost BPF events).
 - Classification (vocabulary from G4-T2; final lock in T3): each image is
   compared against the campaign's clean pass — SDC_NUMERIC if any output
   deviates numerically, SDC_TOP1 if any top-1 changes, DUE_INVALID_OUTPUT
   if any invalid output/abort, BENIGN if all outputs bit-identical. Trial
   label = precedence DUE > SDC_TOP1 > SDC_NUMERIC > BENIGN; per-image
   deviation counts are logged for G6.
+- Restore verification is per allocation class (held-fault semantics): the
+  input binding is compared byte-exact against the LAST image the pass
+  evaluated (fail-closed — the pass re-stages it per image); the output
+  bindings are skipped (engine-owned: rewritten by every enqueue, the flip
+  itself is proven by the pre-pass guard compare); TRT-internal regions get
+  an informational compare against pristine (weights return exact; engine
+  scratch may legitimately differ — soft-upset semantics, recorded, the
+  behavioral no-residue proof is the sanity inference).
 
 ## 7. Campaign log (G6 feed)
 

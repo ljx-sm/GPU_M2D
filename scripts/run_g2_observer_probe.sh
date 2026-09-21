@@ -22,6 +22,11 @@
 #                       # over all GPUs SEQUENTIALLY (one eBPF observer at a
 #                       # time). No idle-GPU requirement (post-timing policy);
 #                       # co-tenant state is recorded, never a refusal.
+#   sudo scripts/run_g2_observer_probe.sh --api g5campaign --level L3 \
+#                       [--device N] [--trials N] [--seed N]   # G5 fault-
+#                       # injection campaign of one frozen BER level; same
+#                       # gated skeleton and sequential-device policy as g4t2.
+#                       # One campaign per invocation (one level).
 #
 # Common options:
 #   [--size-mib N] [--hold-seconds N]
@@ -43,6 +48,11 @@
 #   [--binding-bit N] [--internal-bit N]   fixed target-bit policy constants
 #   [--sample-index N]
 #   [--timeout-seconds N]
+# G5-campaign-only options:
+#   --level L1|L2|L3|L4|L5   frozen BER level (required; one level per run)
+#   [--trials N]        trials of the campaign (default 100)
+#   [--seed N]          campaign RNG seed (default 7)
+#   (also honors --table / --sample-index / --timeout-seconds above)
 #
 # The tensorrt mode also regenerates artifacts/g2/gpu_va_pa_map.csv from the
 # newest passing run of each GPU; mappings are never reused across runs.
@@ -71,7 +81,8 @@ while [[ $# -gt 0 ]]; do
         --seed-table|--bank-map-from|--bank-map-pages|--pairs-csv|\
         --rep-uniform|--rep-seed) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
-        --table|--binding-bit|--internal-bit|--sample-index) \
+        --table|--binding-bit|--internal-bit|--sample-index|\
+        --level|--trials|--seed) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --device) G3_DEVICE="$2"; shift 2 ;;
         --runner) RUNNER="$2"; shift 2 ;;
@@ -79,8 +90,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 case "${API}" in
-    device|vmm|alias|tensorrt|g3pool|g4t2) ;;
-    *) echo "--api must be device, vmm, alias, tensorrt, g3pool, or g4t2" >&2; exit 1 ;;
+    device|vmm|alias|tensorrt|g3pool|g4t2|g5campaign) ;;
+    *) echo "--api must be device, vmm, alias, tensorrt, g3pool, g4t2, or g5campaign" >&2; exit 1 ;;
 esac
 if [[ "${API}" == "g3pool" && -z "${G3_DEVICE}" ]]; then
     echo "--api g3pool requires --device N (the timing pool needs one idle GPU" \
@@ -102,7 +113,7 @@ if [[ "${API}" == "g3pool" ]]; then
              "make -C tools/g3_probe all" >&2
         exit 1
     fi
-elif [[ "${API}" != "tensorrt" && "${API}" != "g4t2" ]]; then
+elif [[ "${API}" != "tensorrt" && "${API}" != "g4t2" && "${API}" != "g5campaign" ]]; then
     HARNESS="g2_scratch_harness"
     [[ "${API}" == "alias" ]] && HARNESS="g2_alias_harness"
     if [[ ! -x "${OBSERVER}/${HARNESS}" ]]; then
@@ -129,7 +140,12 @@ if [[ "${API}" == "g3pool" ]]; then
         FAILURES=$((FAILURES + 1))
     fi
 else
-    if [[ "${API}" == "g4t2" && -n "${G3_DEVICE}" ]]; then
+    if [[ "${API}" == "g5campaign" && -z "$(grep -o '\-\-level' <<<"${EXTRA_ARGS[*]+"${EXTRA_ARGS[*]}"}")" ]]; then
+        echo "--api g5campaign requires --level L1|L2|L3|L4|L5 (one frozen BER" \
+             "level per campaign)" >&2
+        exit 1
+    fi
+    if [[ "${API}" == "g4t2" || "${API}" == "g5campaign" ]] && [[ -n "${G3_DEVICE}" ]]; then
         DEVICE_LIST="${G3_DEVICE}"
     else
         DEVICE_LIST="$(seq 0 $((GPU_COUNT - 1)))"
@@ -162,6 +178,13 @@ else
                     FAILURES=$((FAILURES + 1))
                 fi
                 ;;
+            g5campaign)
+                if ! /usr/bin/python3 "${PROJECT}/tools/g5_faultinj/run_g5_campaign.py" \
+                    --device "${DEVICE}" --runner "${RUNNER}" \
+                    "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; then
+                    FAILURES=$((FAILURES + 1))
+                fi
+                ;;
         esac
     done
 fi
@@ -175,6 +198,10 @@ chown -R "${INVOKING_UID}:${INVOKING_GID}" "${OUTPUT_ROOT}" \
     "${PROJECT}/artifacts/g2/gpu_va_pa_map.csv" 2>/dev/null || true
 if [[ "${API}" == "g4t2" ]]; then
     chown -R "${INVOKING_UID}:${INVOKING_GID}" "${PROJECT}/artifacts/g4" \
+        2>/dev/null || true
+fi
+if [[ "${API}" == "g5campaign" ]]; then
+    chown -R "${INVOKING_UID}:${INVOKING_GID}" "${PROJECT}/artifacts/g5" \
         2>/dev/null || true
 fi
 
