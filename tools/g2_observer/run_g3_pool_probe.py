@@ -152,8 +152,18 @@ def drain_until_marker(process: subprocess.Popen[bytes], observer: G2Observer,
         except BlockingIOError:
             chunk = b""
         if chunk:
+            before = len(captured)
             captured.extend(chunk)
-            found = any(line.startswith(marker) for line in captured.splitlines())
+            # Scan only the new tail. Any line that was already decidable
+            # was decided in a previous pass, and a line still too short
+            # to decide must start within len(marker) bytes of the old
+            # end, so this window is exhaustive. A full rescan per chunk
+            # made the reader quadratic in total output: at G5-L9 scale
+            # ~1 GiB flows through this pipe and the back-pressure made
+            # the runner's per-trial time grow linearly with the trial
+            # index (observed 24->190 s/trial, timeout kills at trial 69).
+            window = captured[max(0, before - len(marker)):]
+            found = any(line.startswith(marker) for line in window.splitlines())
             continue
         if process.poll() is not None:
             drain_pipe(process, captured)
