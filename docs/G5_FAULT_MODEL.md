@@ -147,7 +147,16 @@ the design's replication axis is trials, not cards. Extrapolation
 predictions recorded before running: accuracy ≈94.7 / 94.5 / 93.7 /
 93.1% and a ~50% chance of the first DUE at L9 (output-binding hit
 expectation 0.64 per campaign; DUE=0 throughout L1–L5 was constructive —
-output bindings are ~8 B of the 26.4 MiB residency). Solver note:
+output bindings are ~8 B of the 26.4 MiB residency).
+**Measured (2026-09-22, all four VERIFIED, L6–L8 on GPU1, L9 on GPU2):
+accuracy 91.88 / 90.68 / 67.84 / 36.09%, top-1 change 5.08 / 6.72 /
+31.24 / 63.58%, DUE still 0** — the curve broke sharply UPWARD from the
+extrapolation (the low-BER power law does not continue past the knee at
+BER ≈1e-6..5e-6; damage is strongly superlinear above it), and the L9
+DUE coin flip landed on zero hits (P(0|λ=0.64)≈53%, consistent with the
+constructive model). Two L9 attempts were aborted by timeout before the
+successful run; root cause was a quadratic pipe-rescan in the
+orchestrator's drain loop (fixed, commit d817c70), not the experiment. Solver note:
 `resolve_composition` switches to a windowed search above B=3000 (the
 exhaustive grid would cost ~41 s per campaign start at L9); the frozen
 literals were produced by the exhaustive solver, the start-time
