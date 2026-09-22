@@ -1037,6 +1037,26 @@ SITE_RESTORED 逆序（T2 约定）与校验器正向预期不符 → 修校验�
 --level L1..L5 [--trials N] [--seed N]`。冒烟：2 trial/21 站点/图，
 全链 VERIFIED，trial≈0.7 s → 100-trial 档 ≈2 min。遗留：5×100 全量
 campaign 待用户放行后执行。
+Status（2026-09-21）：**全量 campaign 执行完成——5 档 × 3 卡 = 15 个
+campaign、1500 trial、1,500,000 次带故障图像评估全部
+G5_CAMPAIGN_VERIFIED（0 fail-closed、0 丢失 BPF 事件、1500/1500 sanity
+复现 clean）**。用户在 tmux 串行执行（观察器单活约束）；分析器
+`tools/g5_faultinj/analyze_campaign.py`（纯 stdlib，独立于 runner 从四张
+CSV 重算全部指标）。pooled top-1 改变率（±95% CI，二项）：
+L1 0.140%±0.013 / L2 0.242%±0.018 / L3 0.324%±0.020 / L4 0.773%±0.031 /
+L5 1.030%±0.036；数值 SDC 率 63.1%→98.3%→99.9%→~100%；**DUE=0（全部
+1500 trial、105,300 站点）**——构造性解释：输出 binding 仅 ~8 B/26.4 MiB
+驻留（3e-7 占比），均匀采样 105,300 站点从未命中，restore skipped=0 印证；
+精度（clean→L5）95.30%→95.00%；P(trial 含 ≥1 top-1) 39.0%→80.3%→88.3%→
+100%→100%；r2w:w2r ≈ 2:1（量化权重翻转损伤对称偏正确→错误）。三卡一致
+性：L1 逐位相同（确定性分配布局 → 权重站点相同；仅 5 个输入 SBU 位不同
+且输出零效应——INT8 量化吸收单输入元素翻转），L2–L5 卡间差 0.014–0.334
+pp，由重尾 trial（单 trial 最高损坏 163/1000 图）的过散解释。采样特性
+（如实记录）：SBU 站点在驻留字节上均匀（输入占比 2.18% ≈ 驻留占比
+2.28%），但 V/L 图样的锚 mate 落在稀疏驻留页（输入页 602 KiB/2 MiB）外
+时重试 → 输入页在 V/L 站点中占比降至 ~0.5-0.7%——冻结模型的确定性采样
+性质，非偏差 bug。数据：`artifacts/g5/campaign/`（15 formal + 2 smoke run
+目录 + 每档 console log）。**G5 数据采集闭合，进入 G6 分析阶段。**
 
 将：
 
