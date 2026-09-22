@@ -26,6 +26,13 @@ Components:
   a time). One level per invocation. `--table`, `--sample-index`,
   `--timeout-seconds` are honored as in `--api g4t2`.
 
+  Levels L1–L9 live in `fault_model.py` / docs/G5_FAULT_MODEL.md §5.
+  L1–L5 (1e-8..1e-6) are the confirmed core, run three-card in the
+  2026-09-21 campaign; L6–L9 (5e-6..1e-4) are the post-campaign
+  extension ladder, run SINGLE-card (`--device N` explicit) per the
+  verified L1–L5 no-card-effect result. Same derivation rule,
+  semantics, seed and trial protocol for all nine.
+
 ## Flow (what is checked where)
 
 1. Observer attaches before any CUDA context (pre-allocation gate). In

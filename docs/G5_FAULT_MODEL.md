@@ -1,9 +1,12 @@
 # G5 Fault Model — Frozen Parameter Table (G5-T1)
 
-Status: **DRAFT — awaiting user confirmation (2026-09-21)**. This document
-freezes every parameter of the G5 fault-injection campaign so that G5-T3 is
-pure implementation. G5-T3 re-derives the level table with the rule in §5
-and asserts equality against this document.
+Status: **FROZEN — core L1–L5 user-confirmed 2026-09-21**; extension levels
+**L6–L9 added 2026-09-21** after the L1–L5 campaign completed (same
+derivation rule and semantics; single-card execution per the verified
+L1–L5 no-card-effect result; see §5). This document freezes every
+parameter of the G5 fault-injection campaign; the code re-derives the
+level table with the rule in §5 and asserts equality against this
+document at every campaign start.
 
 Provenance of the ratios and spatial patterns: the user's G5-T0 literature
 survey, done 2026-09-21. The reference list will be inserted by the user in
@@ -84,6 +87,17 @@ H/V/L each 1/6 of the 3-bit events, L's four orientations drawn uniformly as
   per-site).
 - All sites of one trial are distinct (byte, bit) pairs — XOR-ing the same
   cell twice would cancel.
+- **Measured sampling property (observed on the L1–L5 campaign data,
+  2026-09-21)**: SBU sites are uniform over resident bytes (input-binding
+  share 2.18% vs its 2.28% residency share — verified), but V/L placements
+  additionally require the anchor mate `base ⊕ mask` to land on a RESIDENT
+  byte, so on sparsely resident pages (the input binding hosts 602,112 of
+  2,097,152 bytes per page) most V/L bases retry and relocate elsewhere:
+  the input-binding share among V/L sites is ~0.5–0.7%. This is a
+  deterministic consequence of the anchor-mate residency rule, not a
+  sampling bug, and is immaterial for this workload (input flips are
+  absorbed by INT8 quantization — measured zero output effect at both L1
+  and L5).
 - Trial-to-trial randomness (the reason for the 100 repetitions): SBU
   byte/bit, MCU base byte/bit, anchor choice, intra-block offsets,
   orientation label, per-site bits. Frozen within a level: B and (s, d, t)
@@ -112,10 +126,33 @@ then more 2-bit. Machine-verified 2026-09-21; G5-T3 re-derives and asserts.
 | L3 | 1e-7 | 21 | 9.93e-8 | 8 | 2 | 3 | 13 | 61.5 / 15.4 / 23.1 |
 | L4 | 5e-7 | 106 | 5.01e-7 | 41 | 13 | 13 | 67 | 61.2 / 19.4 / 19.4 |
 | L5 | 1e-6 | 211 | 9.98e-7 | 79 | 27 | 26 | 132 | 59.8 / 20.5 / 19.7 |
+| L6 | 5e-6 | 1057 | 5.00e-6 | 397 | 132 | 132 | 661 | 60.1 / 20.0 / 20.0 |
+| L7 | 1e-5 | 2114 | 1.00e-5 | 794 | 264 | 264 | 1322 | 60.1 / 20.0 / 20.0 |
+| L8 | 5e-5 | 10571 | 5.00e-5 | 3964 | 1322 | 1321 | 6607 | 60.0 / 20.0 / 20.0 |
+| L9 | 1e-4 | 21143 | 1.00e-4 | 7928 | 2643 | 2643 | 13214 | 60.0 / 20.0 / 20.0 |
 
 (s, d, t) is frozen for all 100 trials of its level — identical bit count
 and identical SBU/MCU composition across a level's trials; only positions
 randomize (the user's repetition design, to isolate spatial randomness).
+
+**Extension levels L6–L9 (added 2026-09-21, after the L1–L5 campaign)**:
+the L1–L5 campaign measured ≤0.30 pp accuracy loss up to BER 1e-6
+(top-1 change rate 0.14%→1.03%, power-law slope ≈0.44 in B; three cards,
+all VERIFIED). To map the degradation region the same ×5/×2 ladder
+continues to 1e-4 with the SAME derivation rule, BER semantics and trial
+protocol; the L1–L5 rows above are untouched. Execution is single-card,
+justified by the verified L1–L5 card consistency (L1 bit-identical
+outcomes across cards; L2–L5 spreads within trial-clustering noise) —
+the design's replication axis is trials, not cards. Extrapolation
+predictions recorded before running: accuracy ≈94.7 / 94.5 / 93.7 /
+93.1% and a ~50% chance of the first DUE at L9 (output-binding hit
+expectation 0.64 per campaign; DUE=0 throughout L1–L5 was constructive —
+output bindings are ~8 B of the 26.4 MiB residency). Solver note:
+`resolve_composition` switches to a windowed search above B=3000 (the
+exhaustive grid would cost ~41 s per campaign start at L9); the frozen
+literals were produced by the exhaustive solver, the start-time
+re-derivation refuses on any disagreement (fail-closed), and the self-test
+cross-checks windowed == exhaustive.
 
 **L1 honesty note (flagged for confirmation)**: B = 2 cannot express the
 60/40 mix — a single 2-bit MCU alone would be 100% MCU. The frozen tuple is

@@ -12,9 +12,12 @@ Implements docs/G5_FAULT_MODEL.md (G5-T1, user-confirmed 2026-09-21):
     the same resident PA page); L = same-row pair + one anchor mate; the
     four L orientations share ONE sampling distribution, the orientation
     is kept as a label;
-  - BER levels 1e-8 .. 1e-6 with B = round(BER * R) and frozen
+  - BER levels 1e-8 .. 1e-4 with B = round(BER * R) and frozen
     compositions (s, d, t) = exhaustive least-squares fit to the 60/20/20
-    event shares (ties toward more SBU, then more 2-bit);
+    event shares (ties toward more SBU, then more 2-bit). L1-L5 are the
+    user-confirmed 2026-09-21 core; L6-L9 (5e-6 .. 1e-4) are the
+    post-campaign extension ladder, same rule, run single-card per the
+    verified L1-L5 no-card-effect result (docs/G5_FAULT_MODEL.md §5);
   - within a level B and (s, d, t) are frozen; only positions randomize
     across the 100 trials (SBU byte/bit, MCU base, anchor choice,
     intra-block offsets, orientation label, per-site bits).
@@ -44,14 +47,37 @@ RESIDENT_BYTES_NOMINAL = 26_428_428
 R_BITS = RESIDENT_BYTES_NOMINAL * 8  # 211,427,424 bits
 
 LEVELS = [
+    # core ladder (user-confirmed 2026-09-21; docs/G5_FAULT_MODEL.md §5)
     {"level": "L1", "ber": 1e-8, "bits": 2, "s": 2, "d": 0, "t": 0},
     {"level": "L2", "ber": 5e-8, "bits": 11, "s": 4, "d": 2, "t": 1},
     {"level": "L3", "ber": 1e-7, "bits": 21, "s": 8, "d": 2, "t": 3},
     {"level": "L4", "ber": 5e-7, "bits": 106, "s": 41, "d": 13, "t": 13},
     {"level": "L5", "ber": 1e-6, "bits": 211, "s": 79, "d": 27, "t": 26},
+    # extension ladder (added 2026-09-21 after the L1-L5 campaign; same
+    # derivation rule, literals produced by the EXHAUSTIVE solver; run
+    # single-card per the verified L1-L5 no-card-effect result)
+    {"level": "L6", "ber": 5e-6, "bits": 1057, "s": 397, "d": 132,
+     "t": 132},
+    {"level": "L7", "ber": 1e-5, "bits": 2114, "s": 794, "d": 264,
+     "t": 264},
+    {"level": "L8", "ber": 5e-5, "bits": 10571, "s": 3964, "d": 1322,
+     "t": 1321},
+    {"level": "L9", "ber": 1e-4, "bits": 21143, "s": 7928, "d": 2643,
+     "t": 2643},
 ]
 
 EVENT_SHARE_TARGET = (0.60, 0.20, 0.20)  # SBU / 2-bit MCU / 3-bit MCU
+
+# Composition solving: exhaustive below EXHAUSTIVE_BITS_LIMIT, windowed
+# above it (the O(B^2) exhaustive grid costs ~41 s at B=21143 and runs at
+# every campaign start through assert_frozen_levels). The window centers
+# on the analytic 60/20/20 optimum (s = 0.375B, d = t = 0.125B). No
+# unsoundness is possible: the frozen literals for L8/L9 were produced by
+# the EXHAUSTIVE solver, so a windowed/exhaustive disagreement at assert
+# time raises ModelError and refuses the campaign (fail-closed).
+# self_test cross-checks windowed == exhaustive on sampled bit counts.
+EXHAUSTIVE_BITS_LIMIT = 3000
+COMPOSITION_WINDOW = 64
 PATTERN_LABELS_2BIT = ("2H", "2V")
 PATTERN_LABELS_3BIT = ("3H", "3V", "L-up-left", "L-up-right",
                        "L-down-left", "L-down-right")
@@ -72,13 +98,29 @@ class ModelError(RuntimeError):
     """The frozen level table no longer matches its derivation rule."""
 
 
-def resolve_composition(bits: int) -> tuple[int, int, int]:
+def resolve_composition(bits: int,
+                        exhaustive_limit: int = EXHAUSTIVE_BITS_LIMIT,
+                        ) -> tuple[int, int, int]:
     """(s, d, t) with s + 2d + 3t = bits minimizing the squared deviation
     of the event shares from (60%, 20%, 20%); ties -> more SBU, then more
-    2-bit. Exhaustive over all feasible tuples."""
+    2-bit. Exhaustive over all feasible tuples for bits <= exhaustive_limit;
+    above that, a +-COMPOSITION_WINDOW box around the analytic optimum
+    (same objective and tie rule; equivalence cross-checked in self_test,
+    and the frozen literals pin the real levels -- see the comment at
+    EXHAUSTIVE_BITS_LIMIT)."""
+    if bits <= exhaustive_limit:
+        s_lo, s_hi = 0, bits
+        d_lo, d_hi = 0, bits // 2
+    else:
+        events_analytic = bits / 1.6
+        s_lo = max(0, int(0.6 * events_analytic) - COMPOSITION_WINDOW)
+        s_hi = min(bits, int(0.6 * events_analytic) + COMPOSITION_WINDOW)
+        d_lo = max(0, int(0.2 * events_analytic) - COMPOSITION_WINDOW)
+        d_hi = min(bits // 2,
+                   int(0.2 * events_analytic) + COMPOSITION_WINDOW)
     best: tuple[tuple[float, int, int], tuple[int, int, int]] | None = None
-    for s in range(bits + 1):
-        for d in range(bits // 2 + 1):
+    for s in range(s_lo, s_hi + 1):
+        for d in range(d_lo, d_hi + 1):
             rest = bits - s - 2 * d
             if rest < 0 or rest % 3:
                 continue
@@ -472,6 +514,10 @@ def self_test() -> int:
     assert_frozen_levels()  # the frozen table matches its derivation rule
     assert resolve_composition(8) == (3, 1, 1)  # exact 60/20/20 block
     assert resolve_composition(2) == (2, 0, 0)
+    # windowed large-B path == exhaustive (forced via a low limit)
+    for bits in (173, 347, 1057, 1444, 2114):
+        assert resolve_composition(bits, exhaustive_limit=100) == \
+            resolve_composition(bits), bits
 
     rows, anchors = _fixture()
     index = ResidencyIndex(rows)
