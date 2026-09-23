@@ -1190,7 +1190,41 @@ GDDR physical fault
 
 ### G7：多模型 / ImageNet-1K 扩展 campaign
 
-Status（2026-09-23）：**G7-T0 准备启动——用户五项决策已冻结**。(1) 六模型
+Status（2026-09-23）：**G7-T0 基础工作全部完成——六模型权重/ONNX/INT8
+引擎/FP32+INT8 clean 评测一次做齐，量化损失表落盘**。下载曲折但全部
+解决（未认证 HF 限流：efficientnet 断点续传复活一次；ViT 从 6 月的 HF
+缓存快照直接 safetensors 装入绕开 timm 的联网 list_repo_files；DeiT-S/
+Swin-T 用 curl 无限续传循环扛过代理 SSL 中断拉完，未动用用户手动下载）。
+Swin ms_in1k 检查点含 17 个 timm 1.0.26 非持久化 buffer（attn_mask 等），
+剔除后 strict 加载通过。引擎构建（熵校准 batch=1、1000 图、4 GiB
+workspace、构建后零输入冒烟）六模型全 PASS：resnet50 28.7 MB/118 s、
+mobilenetv3 10.6 MB/543 s、efficientnet 10.7 MB/461 s、ViT-B 93.9 MB/336 s、
+DeiT-S 33.2 MB/271 s、Swin-T 46.5 MB/464 s（Transformer 引擎全部健康，
+无 PTQ 塌陷）。**Clean 评测（同一 10K 评测集、同一预处理、INT8 双遍
+逐位一致验收）——量化损失分化显著**：
+
+| 模型 | FP32 top-1 | INT8 top-1 | 损失 pp |
+|---|---|---|---|
+| ResNet-50 | 77.36% | 75.06% | 2.30 |
+| MobileNetV3-L | 72.14% | 62.42% | **9.72** |
+| EfficientNet-B0 | 74.90% | 69.15% | 5.75 |
+| ViT-B/16 | 78.38% | 78.20% | **0.18** |
+| DeiT-S | 78.05% | 71.91% | 6.14 |
+| Swin-T | 79.41% | 78.24% | 1.17 |
+
+大参数稠密 GEMM 的 Transformer（ViT-B/Swin-T）熵校准几乎无损，高效
+CNN（MobileNetV3 depthwise+SE+hardswish、EfficientNet）损失 6–10 pp，
+DeiT-S 的蒸馏权重对 INT8 也偏敏感——每条 BER 曲线以各自 INT8 clean 为
+baseline 归一，损失如实记录不掩盖（协议一致：六模型同一熵校准规则，
+不针对单模型换校准器）。10K 图单 pass 实测：FP32 66–160 s、INT8
+35–53 s（G7 每 trial 成本 ≈ G5 的 10 倍图量，9 档 × 100 trial 排期时
+按此折算）。两个工程教训：pkill/pgrep -f 的模式会匹配调用者自身命令
+行（两次咬人：等待循环永不退出）；`g7_models/incoming/` 保留原始
+safetensors 作溯源。**下一步：G5 runner per-workload 参数化**（预处理
+mean/std/插值、engine 路径、评测 split、per-model R 表、宿主 10K 图
+预处理缓冲 ≈6 GB 评估），随后 ResNet-50/Imagenet 九档 campaign 冒烟。
+
+用户五项决策（2026-09-23 冻结）：(1) 六模型
 变体：ResNet-50 / MobileNetV3-Large / EfficientNet-B0 / ViT-B/16 /
 DeiT-S / Swin-T，全部 INT8 PTQ（timm ImageNet-1k 预训练权重）；(2) 校准集
 = val 内 1000 类 × 1 张 = 1000 图；(3) 评测集 = 1000 类 × 10 张 = 10000 图，
