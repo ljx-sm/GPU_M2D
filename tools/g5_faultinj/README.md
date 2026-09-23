@@ -113,3 +113,14 @@ Components:
 importable stdlib-only modules; aggregate analysis scripts must not
 import bcc (run those under any python, run the orchestrator only under
 `/usr/bin/python3`).
+
+- `analyze_campaign.py` — per-run and pooled-per-level tables,
+  recomputed from the four result CSVs (`--min-trials 100` for formal
+  campaigns only).
+- `plot_accuracy_curve.py` — the paper figure (accuracy vs BER, log x,
+  nine levels, trial-level 95% CI error bars). Needs matplotlib, so run
+  it under an env that has it, e.g.
+  `/data1/luojx/miniforge3/envs/vit_fault/bin/python
+  tools/g5_faultinj/plot_accuracy_curve.py`; every plotted number is
+  re-derived from the CSVs at run time and the plotted points are also
+  dumped to `fig_accuracy_vs_ber_points.csv`.
