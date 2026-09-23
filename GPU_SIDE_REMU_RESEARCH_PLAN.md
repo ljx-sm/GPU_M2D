@@ -1188,6 +1188,48 @@ GDDR physical fault
 
 ---
 
+### G7：多模型 / ImageNet-1K 扩展 campaign
+
+Status（2026-09-23）：**G7-T0 准备启动——用户五项决策已冻结**。(1) 六模型
+变体：ResNet-50 / MobileNetV3-Large / EfficientNet-B0 / ViT-B/16 /
+DeiT-S / Swin-T，全部 INT8 PTQ（timm ImageNet-1k 预训练权重）；(2) 校准集
+= val 内 1000 类 × 1 张 = 1000 图；(3) 评测集 = 1000 类 × 10 张 = 10000 图，
+与校准集不交叉（已 fail-closed 校验）；(4) 执行严格单模型串行——先
+ResNet-50/Imagenet 跑出满意结果，再逐个上其余五个；但基础工作（下载 +
+量化 + FP32/INT8 clean）一次性全做；(5) 六个模型 FP32 与 INT8 各跑一遍
+clean（同一 10K 评测集），量化损失先行量化。**冻结不变**：故障模型
+（SBU 60%/MCU 40%、空间形态、构成规则）、BER 语义（B = round(BER×R_bits)，
+R 改为 per-workload 重推导，L1–L9 九档 BER 值跨模型一致以便对比）、门控/
+快照/驻留守卫/翻转/恢复/分类/校验全套协议、seed 7、100 trial。已就绪：
+ImageNet val（本机 /data1/luojx/datasets/imagenet1k，50 000 图全部与官方
+val_map 交叉核验 0 错）；split 构建器
+`tools/g7_prep/build_imagenet_splits.py`（seed 7：calib 1000 + eval 10000，
+不交叉，manifest 落盘）；六模型下载器
+`tools/g7_prep/download_models.py`（含 default_cfg 预处理元数据，runner
+预处理将据此参数化，杜绝第二事实源）。构建链已找到并落地：vit_fault 环境
+内装有 `tensorrt_bindings` 8.6.1（此前"本机无 TensorRT"结论有误——只搜了
+`tensorrt` 模块名），配合本机 `/data1/luojx/REMU/.local/deps/` 下 tensorrt
+8.6.1 运行库 + cuDNN 8.9.7（stage13 同款 LD_LIBRARY_PATH 接线，包装在
+`build_g7_engines.sh`/`eval_g7_clean.sh`）。新工具：`export_g7_onnx.py`
+（三 binding `data/prob/index` 契约、opset 17、INT64_MAX slice 尾哨改写，
+per-model 事实全部来自 model_meta.json）、`build_g7_int8_engine.py`
+（`IInt8EntropyCalibrator2` batch=1、G7 千图校准集、校准缓存按
+onnx+calib+mean/std+插值 哈希、构建后零输入冒烟；stage13 先验：当年七个
+模型 INT8 PTQ 全部健康，vit_b16 95.6% 无 Transformer 塌陷）、
+`eval_g7_clean.py`（FP32 torch 与 INT8 TRT 同一预处理同一 10K 集，
+INT8 双遍逐位一致验收，量化损失先行量化）。待办：其余五模型
+（下载完成后 ONNX 导出→INT8 构建→clean 评测一次跑完）、G5 runner 的
+per-workload 参数化（预处理 mean/std、engine 路径、评测 split、R 表）。**实验前预设假设（实验裁决）**：① 各架构
+"耐受地板"（knee 位置）与塌方斜率不同——大稠密 GEMM 权重块的 Transformer
+同 BER 下单字节腐蚀占比更小，但 LayerNorm/位置编码小参数区可能脆弱；
+② MobileNetV3 depthwise 层每 kernel 字节极少，单字节腐蚀相对影响更大；
+③ INT8 饱和算术的 DUE 防火墙在 Transformer 上同样成立（预期 DUE 全 0）；
+④ r2w:w2r 不对称演化跨架构一致或分化。产出：六条精度-BER 曲线一张图
+（各自 clean 归一 + 绝对值两版）、knee 对比表、第二横轴（权重字节腐蚀
+比例）。
+
+---
+
 ## 7. 每次实验的 Mapping Snapshot
 
 因为 GPU VA / GPU PA 会随 allocation 变化，每次 run 必须重新建表：
