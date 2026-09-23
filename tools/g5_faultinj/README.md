@@ -117,6 +117,11 @@ import bcc (run those under any python, run the orchestrator only under
 - `analyze_campaign.py` — per-run and pooled-per-level tables,
   recomputed from the four result CSVs (`--min-trials 100` for formal
   campaigns only).
+- `analyze_g6_attribution.py` — the G6-T0 attribution tables
+  (docs/G6_ANALYSIS.md): flip-integrity recount, per-allocation
+  residency/site/restore_check attribution, weight corrosion per
+  trial, perturbation-vs-margin percentiles. Allocation ids are
+  normalized across cards (binding ids carry the device index).
 - `plot_accuracy_curve.py` — the paper figure (accuracy vs BER, log x,
   nine levels, trial-level 95% CI error bars). Needs matplotlib, so run
   it under an env that has it, e.g.
