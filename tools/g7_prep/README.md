@@ -44,15 +44,21 @@ ViT-B/16 / DeiT-S / Swin-T, all timm ImageNet-1k pretrained, all
    `/data1/luojx/REMU/.local/deps/modelopt-venv` (never install into
    vit_fault — modelopt would drag torch>=2.8/CUDA13 with it), entropy
    calibration on `calib_canonical.npy`, per-channel weight
-   quantization. → `model_qdq.onnx`.
+   quantization. Per-model recipes (see the protocol section below) are
+   encoded in the wrapper, which then runs the two graph post-steps:
+   `bypass_g7_qdq_activations.py` (mobile/effnet only — swish-output
+   activations back to FP32) and `fix_qdq_for_trt86.py` (all models —
+   TRT 8.6.1 parser/shape-inference normalizations). → final
+   `model_qdq.onnx`.
 5. `dump_g7_calib_npy.py` — feeds the SAME 1000-image calibration set
    through the SAME `preprocess_image()` into
    `calib_canonical.npy` (1000,3,224,224) fp32 for ModelOpt.
-6. `build_g7_engines.sh 0 [models...] --explicit` — engine build.
+6. `build_g7_engines.sh 0 --explicit [models...]` — engine build.
    Explicit path (canonical): `build_g7_explicit_engine.py` parses the
-   Q/DQ ONNX with EXPLICIT_BATCH|STRONGLY_TYPED (no calibrator, no
-   kINT8 flag — the Q/DQ nodes dictate precision), Q/DQ census +
-   per-channel weight verification written into the summary.
+   Q/DQ ONNX with EXPLICIT_BATCH only (the Q/DQ nodes dictate
+   precision; the kINT8 builder flag is STILL required — "int8 is not
+   configured in the builder" otherwise — but no calibrator), Q/DQ
+   census + per-channel weight verification written into the summary.
    Implicit path (fallback, `build_g7_int8_engine.py`):
    IInt8EntropyCalibrator2, batch 1, per-tensor symmetric weights.
    Both → `clean.engine` + `engine_summary.json` (zero-input smoke at
@@ -90,3 +96,54 @@ Q/DQ with per-channel weight quantization (ModelOpt) is the standard
 MinMax discriminator that established this are
 `diag_verbose_build.py` / `diag_canonical_fp32.py` /
 `diag_eval_engine.py` / `inspect_engine_precision.py`.
+
+### Final per-model recipes and results (2026-09-24, 10K clean eval)
+
+Quantization damage attribution (Q/DQ bypass surgery + ORT probes on a
+2000-image held probe subset) showed per-channel INT8 **weights cost
+~0 pp everywhere**; all remaining damage was activation-side and
+concentrated in specific op families. Final contract per model
+(all: entropy calibration, per-channel weights, opset 17, fp32
+high-precision dtype):
+
+| model | recipe beyond base | FP32 | INT8 | loss |
+| --- | --- | --- | --- | --- |
+| resnet50 | none (default: quantize everything quantizable) | 80.61 | 78.50 | 2.11 |
+| mobilenetv3_large_100 | `--op_types_to_quantize Conv Gemm MatMul` + HardSwish-output bypass | 75.64 | 75.15 | 0.49 |
+| efficientnet_b0 | `--op_types_to_quantize Conv Gemm MatMul` + SiLU-output bypass | 77.96 | 77.32 | 0.64 |
+| vit_base_patch16_224 | none (default) | 79.41 | 78.22 | 1.19 |
+| deit_small_patch16_224 | none (default) | 80.26 | 78.75 | 1.51 |
+| swin_tiny_patch4_window7_224 | `--op_types_to_quantize Conv Gemm MatMul --disable_mha_qdq` | 81.63 | 81.17 | 0.46 |
+
+Evidence chain behind the two non-default choices:
+
+- **Swish-output activations** (EffNet SiLU ×16, MobileNetV3
+  HardSwish ×14 tensors) are catastrophically hostile to per-tensor
+  symmetric INT8: bypassing only those tensors recovers -22.65→-0.30 pp
+  (effnet) and -6.05→-0.30 pp (mobile) on the probe; everything else
+  (SE/ReLU/Add/GAP activations, all weights) costs ~0.3 pp combined.
+  `--use_zero_point` does NOT help (60.85 with vs without). The bypass
+  keeps conv **weights INT8 and every other conv-input activation
+  INT8**; only the swish/hard-swish outputs feed their convs in FP32
+  (the "少量非线性算子不量化" exception).
+- **Swin attention region**: TRT 8.6.1 mis-executes Q/DQ around the
+  window-attention machinery (Reshape/Transpose/Squeeze/Softmax
+  cluster) — the quantized graph is 91.0 % in ORT but 0.5 % in TRT;
+  stripping all Q/DQ runs 92.7 % in TRT; bypassing only `attn/`
+  activations restores 91.0 % in TRT. `--disable_mha_qdq` is the
+  recipe-level fix (keeps MLP/patch/downsample MatMuls + all weights
+  quantized).
+
+### TRT 8.6.1 graph-compatibility notes (`fix_qdq_for_trt86.py`)
+
+- SE `ReduceMean(axes const-input) → Q → DQ → Conv` defeats the
+  parser's conv channel inference ("group and kernel shape misalign")
+  → rewritten to native GlobalAveragePool (+Flatten when keepdims=0);
+  bitwise equivalent, verified ORT==TRT.
+- ModelOpt forces opset 19 and Constant-input axes; the swin head
+  `ReduceMean → Gemm` then loses shape inference ("GEMM must have 2D
+  inputs"). Axes-as-INITIALIZER does not help; axes-as-ATTRIBUTE alone
+  is spec-INVALID at opset 19 and TRT executes it as
+  reduce-over-all-dims (swin 81.63→0.51 top-1). Correct fix: restore
+  the attribute AND downgrade the graph opset to 17 (the original
+  export's form) — legal, and TRT 8.6 imports it natively.

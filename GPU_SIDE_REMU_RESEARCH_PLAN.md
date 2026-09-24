@@ -1253,8 +1253,41 @@ onnx+calib+mean/std+插值 哈希、构建后零输入冒烟；stage13 先验：
 `eval_g7_clean.py`（FP32 torch 与 INT8 TRT 同一预处理同一 10K 集，
 INT8 双遍逐位一致验收，量化损失先行量化）。待办：其余五模型
 （下载完成后 ONNX 导出→INT8 构建→clean 评测一次跑完）、G5 runner 的
-per-workload 参数化（预处理 mean/std、engine 路径、评测 split、R 表）。**实验前预设假设（实验裁决）**：① 各架构
-"耐受地板"（knee 位置）与塌方斜率不同——大稠密 GEMM 权重块的 Transformer
+per-workload 参数化（预处理 mean/std、engine 路径、评测 split、R 表）。
+
+Status（2026-09-24 晚）：**协议 v2 定稿——canonical 预处理 + 显式 Q/DQ
+逐通道量化，六模型量化损失全部压到 0.46–2.11 pp**（用户当日批准两项
+协议变更：预处理切 timm canonical；量化切显式 Q/DQ）。两段诊断
+定案：(1) v1 的 FP32 基线被方形拉伸压低（canonical 恢复到论文水位）；
+(2) 显式 Q/DQ 默认配方在 swish 系架构与 Swin 上出了三个独立问题，
+逐一定位并修复——**全部损伤在激活侧**（逐通道 INT8 权重处处 ~0 pp）：
+EffNet SiLU 输出 ×16 张量对逐张量对称 INT8 极端敏感（-22.65 pp 里
+-22.3 pp 集中于此）、MobileNetV3 HardSwish 输出同理（-6.05→-0.30 pp）、
+`--use_zero_point` 无效；Swin 命中 TRT 8.6.1 两个缺陷（窗口注意力区
+Q/DQ 执行错误→`--disable_mha_qdq`；opset 19 下 ReduceMean axes 三态
+无解→属性形式+整图降回 opset 17）。终局配方（README 有证据链）：
+resnet/vit/deit 默认配方；mobile/effnet conv-only + swish 输出旁路；
+swin conv-only + disable_mha_qdq。终表：
+
+| 模型 | FP32 top-1 | INT8 top-1 | 损失 pp |
+| --- | --- | --- | --- |
+| ResNet-50 | 80.61% | 78.50% | 2.11 |
+| MobileNetV3-L | 75.64% | 75.15% | **0.49** |
+| EfficientNet-B0 | 77.96% | 77.32% | **0.64** |
+| ViT-B/16 | 79.41% | 78.22% | 1.19 |
+| DeiT-S | 80.26% | 78.75% | 1.51 |
+| Swin-T | 81.63% | 81.17% | **0.46** |
+
+上表替换 v1 表（v1 的 implicit 引擎保留为 fallback 工件）。工具链新增：
+`dump_g7_calib_npy.py`（canonical 千图校准 npy）、`quantize_g7_qdq.sh`
+（ModelOpt 显式量化 + 按模型配方 + 旁路/修复后处理）、
+`bypass_g7_qdq_activations.py`（swish 输出激活旁路）、
+`fix_qdq_for_trt86.py`（TRT 8.6.1 图规范化）、
+`build_g7_explicit_engine.py`（显式引擎构建，EXPLICIT_BATCH + kINT8 旗标、
+Q/DQ 普查写入 summary）。modelopt 0.47 装在隔离 venv
+（`/data1/luojx/REMU/.local/deps/modelopt-venv`，绝不动 vit_fault）。
+
+**实验前预设假设（实验裁决）**：① 各架构"耐受地板"（knee 位置）与塌方斜率不同——大稠密 GEMM 权重块的 Transformer
 同 BER 下单字节腐蚀占比更小，但 LayerNorm/位置编码小参数区可能脆弱；
 ② MobileNetV3 depthwise 层每 kernel 字节极少，单字节腐蚀相对影响更大；
 ③ INT8 饱和算术的 DUE 防火墙在 Transformer 上同样成立（预期 DUE 全 0）；

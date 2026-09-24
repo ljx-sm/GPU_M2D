@@ -85,9 +85,13 @@ def evaluation_rows() -> list[tuple[str, int]]:
 
 
 def valid_output(probability: float, prediction: int) -> bool:
+    # 1e-6 window: softmax outputs of 1.0 + 1 float-epsilon (1.0000001)
+    # are a rounding artifact of extremely confident predictions, not a
+    # broken output; predictions must stay in range and probabilities
+    # finite.  The CSV writer clamps into [0, 1].
     return bool(
         math.isfinite(probability)
-        and 0.0 <= probability <= 1.0
+        and -1e-6 <= probability <= 1.0 + 1e-6
         and 0 <= prediction < 1000
     )
 
@@ -103,7 +107,7 @@ def prediction_csv(rows: list[dict[str, object]]) -> str:
     writer.writeheader()
     for row in rows:
         formatted = dict(row)
-        formatted["probability"] = f"{float(row['probability']):.9f}"
+        formatted["probability"] = f"{min(1.0, max(0.0, float(row['probability']))):.9f}"
         formatted["valid"] = int(bool(row["valid"]))
         formatted["correct"] = int(bool(row["correct"]))
         writer.writerow(formatted)

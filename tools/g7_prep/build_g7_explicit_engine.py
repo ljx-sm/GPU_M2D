@@ -9,8 +9,9 @@ depthwise+SE/distilled architectures; explicit Q/DQ with per-channel
 weight quantization is the standard <1-2 pp recipe.
 
 Differences from the implicit builder:
-  - network parsed with EXPLICIT_BATCH | STRONGLY_TYPED so the Q/DQ nodes
-    dictate precision (no kINT8 builder flag, no calibrator);
+  - network parsed with EXPLICIT_BATCH only (the Q/DQ nodes dictate
+    precision; the kINT8 builder flag is still required but no calibrator
+    is passed);
   - build identity keyed on the Q/DQ ONNX sha256 instead of a calibration
     cache identity (calibration already happened inside ModelOpt);
   - Q/DQ node census written into the summary (weights per-channel is
@@ -56,9 +57,11 @@ WORKSPACE_BYTES = 4 * 1024**3
 
 def parse_network_strongly_typed(onnx_path: Path, logger):
     builder = trt.Builder(logger)
-    flags = (1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)) | (
-        1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
-    )
+    # Q/DQ networks take their precision from the Q/DQ nodes: TRT 8.6
+    # applies explicit-precision rules automatically when Q/DQ nodes are
+    # present (the old EXPLICIT_PRECISION flag is deprecated no-op), so
+    # EXPLICIT_BATCH alone is the correct creation flag set here.
+    flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
     network = builder.create_network(flags)
     parser = trt.OnnxParser(network, logger)
     if not parser.parse(onnx_path.read_bytes()):
@@ -131,7 +134,7 @@ def build(name: str, physical_gpu: int) -> Path:
     build_identity_source = {
         "qdq_onnx_sha256": qdq_sha256,
         "calib_npy_sha256": calib_provenance["npy_sha256"],
-        "creation_flags": ["EXPLICIT_BATCH", "STRONGLY_TYPED"],
+        "creation_flags": ["EXPLICIT_BATCH"],
         "workspace_bytes": WORKSPACE_BYTES,
         "tensorrt": trt.__version__,
     }
@@ -161,6 +164,10 @@ def build(name: str, physical_gpu: int) -> Path:
     builder, network = parse_network_strongly_typed(qdq_path, logger)
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, WORKSPACE_BYTES)
+    # Q/DQ networks in TRT 8.6 still require kINT8 to be enabled in the
+    # builder ("int8 is not configured in the builder" otherwise); the
+    # ranges themselves come from the Q/DQ nodes, not a calibrator.
+    config.set_flag(trt.BuilderFlag.INT8)
 
     started = time.time()
     serialized = builder.build_serialized_network(network, config)
@@ -206,7 +213,7 @@ def build(name: str, physical_gpu: int) -> Path:
         "build_identity": build_identity,
         "build_identity_source": build_identity_source,
         "workspace_bytes": WORKSPACE_BYTES,
-        "creation_flags": ["EXPLICIT_BATCH", "STRONGLY_TYPED"],
+        "creation_flags": ["EXPLICIT_BATCH"],
         "engine_path": str(engine_path),
         "engine_sha256": sha256_file(engine_path),
         "engine_size_bytes": len(engine_bytes),
