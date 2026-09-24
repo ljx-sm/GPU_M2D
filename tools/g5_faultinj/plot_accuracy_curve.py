@@ -50,12 +50,22 @@ GRID = "#e1e0d9"
 AXIS = "#c3c2b7"
 SERIES = "#2a78d6"
 
-SUBTITLE = ("ResNet-50 (INT8 PTQ, TensorRT) on the RESISC45 1000-image "
-            "eval split\n"
-            "NVIDIA GeForce RTX 4090 — GDDR6X device-memory bit flips "
-            "(SBU 60% / MCU 40% event mix)\n"
-            "100 trials × 1000 images per level; error bars: 95% CI "
-            "over trials; DUE = 0 at all levels")
+WORKLOAD_SUBTITLES = {
+    "g5_resisc45_resnet50": (
+        "ResNet-50 (INT8 PTQ, TensorRT) on the RESISC45 1000-image "
+        "eval split\n"
+        "NVIDIA GeForce RTX 4090 — GDDR6X device-memory bit flips "
+        "(SBU 60% / MCU 40% event mix)\n"
+        "100 trials × 1000 images per level; error bars: 95% CI "
+        "over trials; DUE = 0 at all levels"),
+    "g7_imagenet1k_resnet50": (
+        "ResNet-50 (INT8 PTQ, explicit Q/DQ, TensorRT) on the ImageNet-1K "
+        "10,000-image eval split\n"
+        "NVIDIA GeForce RTX 4090 — GDDR6X device-memory bit flips "
+        "(SBU 60% / MCU 40% event mix)\n"
+        "100 trials × 10,000 images per level; error bars: 95% CI "
+        "over trials"),
+}
 
 
 def per_trial_accuracies(run_dir: Path) -> tuple[list[float], float]:
@@ -86,9 +96,11 @@ def per_trial_accuracies(run_dir: Path) -> tuple[list[float], float]:
             clean_correct / images)
 
 
-def collect(root: Path, min_trials: int) -> dict[str, dict]:
+def collect(root: Path, min_trials: int,
+            workload: str = fault_model.DEFAULT_WORKLOAD) -> dict[str, dict]:
     """level -> {ber, trials, acc, ci, clean} pooled over VERIFIED runs."""
-    levels = fault_model.assert_frozen_levels() or fault_model.LEVELS
+    levels = (fault_model.assert_frozen_levels(workload)
+              or fault_model.WORKLOADS[workload]["levels"])
     order = [entry["level"] for entry in levels]
     by_level: dict[str, list[float]] = defaultdict(list)
     clean_accs: dict[str, list[float]] = defaultdict(list)
@@ -111,7 +123,7 @@ def collect(root: Path, min_trials: int) -> dict[str, dict]:
             raise SystemError(f"no VERIFIED runs for {name} under {root}")
         mean = sum(accs) / len(accs)
         sd = math.sqrt(sum((a - mean) ** 2 for a in accs) / (len(accs) - 1))
-        entry = fault_model.level_by_name(name)
+        entry = fault_model.level_by_name(name, workload)
         out[name] = {
             "ber": entry["ber"],
             "trials": len(accs),
@@ -126,6 +138,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path,
                         default=HERE.parents[1] / "artifacts/g5/campaign")
+    parser.add_argument("--workload", default=fault_model.DEFAULT_WORKLOAD,
+                        choices=sorted(fault_model.WORKLOADS),
+                        help="whose frozen level ladder to plot")
     parser.add_argument("--min-trials", type=int, default=100,
                         help="formal campaigns only (drops smoke runs)")
     parser.add_argument("--outdir", type=Path, default=None,
@@ -138,7 +153,7 @@ def main() -> int:
     import matplotlib.pyplot as plt
     from matplotlib.ticker import FixedLocator
 
-    data = collect(args.root, args.min_trials)
+    data = collect(args.root, args.min_trials, args.workload)
     names = list(data)
     bers = [data[n]["ber"] for n in names]
     accs = [data[n]["acc"] * 100 for n in names]
@@ -174,19 +189,28 @@ def main() -> int:
             markeredgecolor="white", markeredgewidth=0.9, zorder=3,
             linestyle="none")
 
-    # knee marker between L5 and L6 (geometric midpoint of 1e-6 / 5e-6)
+    # knee marker between L5 and L6 (geometric midpoint of 1e-6 / 5e-6) --
+    # only for ladders that actually straddle it with points on both sides
+    # (the G5 nine-level ladder; a G7 five-level ladder must not inherit
+    # the G5 knee as an assumption)
     knee = math.sqrt(1e-6 * 5e-6)
-    ax.axvline(knee, color=AXIS, linewidth=1.0, linestyle=(0, (2, 3)),
-               zorder=1)
-    ax.annotate("knee", xy=(knee, 0.985), xycoords=("data", "axes fraction"),
-                xytext=(3, 0), textcoords="offset points", ha="left",
-                va="top", fontsize=8.5, color=INK_MUTED, style="italic")
+    if min(bers) < knee < max(bers) and \
+            sum(1 for b in bers if b < knee) >= 2 and \
+            sum(1 for b in bers if b > knee) >= 2:
+        ax.axvline(knee, color=AXIS, linewidth=1.0, linestyle=(0, (2, 3)),
+                   zorder=1)
+        ax.annotate("knee", xy=(knee, 0.985),
+                    xycoords=("data", "axes fraction"),
+                    xytext=(3, 0), textcoords="offset points", ha="left",
+                    va="top", fontsize=8.5, color=INK_MUTED, style="italic")
 
     # selective direct labels (values in ink, never in the series color)
     labels_at = {  # level -> (dx, dy) in points, ha
         "L6": (-4, 9), "L7": (0, -14), "L8": (-1, 9), "L9": (10, 0),
     }
     for name, (dx, dy) in labels_at.items():
+        if name not in names:
+            continue
         i = names.index(name)
         ax.annotate(f"{accs[i]:.2f}", xy=(bers[i], accs[i]),
                     xytext=(dx, dy), textcoords="offset points",
@@ -194,8 +218,11 @@ def main() -> int:
                     fontsize=8.5, color=INK_SECONDARY)
 
     ax.set_xscale("log")
-    ax.set_xlim(0.62e-8, 2.6e-4)
-    ax.set_ylim(28, 102)
+    # data-driven window (the G5 hardcode assumed the nine-level ladder's
+    # 1e-8..1e-4 span and the L9 ~36% floor)
+    ax.set_xlim(min(bers) * 0.62, max(bers) * 2.6)
+    y_floor = min(28.0, min(a - c for a, c in zip(accs, cis)) - 4.0)
+    ax.set_ylim(y_floor, 102)
     ax.yaxis.set_major_locator(FixedLocator(list(range(30, 101, 10))))
     ax.set_xlabel("Bit error rate (BER, fraction of resident bits flipped "
                   "per trial)", fontsize=11, color=INK_PRIMARY, labelpad=8)
@@ -218,7 +245,8 @@ def main() -> int:
 
     fig.suptitle("Top-1 accuracy vs. injected GDDR6X bit-error rate",
                  fontsize=13, fontweight="bold", color=INK_PRIMARY, y=0.975)
-    ax.set_title(SUBTITLE, fontsize=8.3, color=INK_SECONDARY, pad=12)
+    ax.set_title(WORKLOAD_SUBTITLES[args.workload], fontsize=8.3,
+                 color=INK_SECONDARY, pad=12)
 
     fig.tight_layout(rect=(0, 0.01, 1, 0.99))
 

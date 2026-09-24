@@ -475,6 +475,21 @@ struct Options {
     std::string campaign_work;
     std::string campaign_release;
     int campaign_gate_timeout_seconds{0};
+    // G7 workload parameterization. Defaults keep the G5 RESISC45 behavior
+    // byte-identical; a G7 invocation overrides them from the model's
+    // model_meta.json (the single source of preprocessing truth) via the
+    // orchestrator.
+    int class_count{kClassCount};
+    std::string preprocess_mode{"legacy"};
+    int resize_scale{224};
+    int resize_interpolation{cv::INTER_CUBIC};
+    std::array<float, 3> canonical_mean{kMean};
+    std::array<float, 3> canonical_std{kStd};
+    // Debug: write the sample-index image's preprocessed float tensor to
+    // this path and exit (pure CPU, before any engine load or CUDA call)
+    // so the canonical preprocessing can be diffed bit-exactly against the
+    // python contract.
+    std::string dump_preprocessed;
 };
 
 struct Sample {
@@ -513,6 +528,43 @@ std::string query_buffer_id(const void* pointer) {
         return std::to_string(buffer_id);
     }
     return "";
+}
+
+std::array<float, 3> parse_rgb_triple(const std::string& value,
+                                      const char* flag_name) {
+    std::array<std::string, 3> parts{};
+    std::size_t position = 0;
+    for (int index = 0; index < 3; ++index) {
+        const std::size_t comma = value.find(',', position);
+        if (index < 2 && comma == std::string::npos) {
+            throw std::invalid_argument(std::string(flag_name) +
+                                        " expects R,G,B: " + value);
+        }
+        parts[static_cast<std::size_t>(index)] =
+            value.substr(position, comma == std::string::npos
+                                       ? std::string::npos
+                                       : comma - position);
+        position = comma + 1;
+    }
+    std::array<float, 3> triple{};
+    for (int index = 0; index < 3; ++index) {
+        // stod (decimal -> double -> float) mirrors numpy's
+        // np.asarray([...], dtype=np.float32) bit-exactly
+        triple[static_cast<std::size_t>(index)] =
+            static_cast<float>(std::stod(parts[static_cast<std::size_t>(index)]));
+    }
+    return triple;
+}
+
+int parse_interpolation(const std::string& value) {
+    if (value == "bicubic") {
+        return cv::INTER_CUBIC;
+    }
+    if (value == "bilinear") {
+        return cv::INTER_LINEAR;
+    }
+    throw std::invalid_argument(
+        "--interp must be bicubic or bilinear (timm vocabulary): " + value);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -567,6 +619,31 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (key == "--output-prefix") {
             options.output_prefix = value;
+        } else if (key == "--class-count") {
+            options.class_count = std::stoi(value);
+            if (options.class_count <= 0) {
+                throw std::invalid_argument("--class-count must be > 0");
+            }
+        } else if (key == "--preprocess") {
+            options.preprocess_mode = value;
+            if (value != "legacy" && value != "canonical") {
+                throw std::invalid_argument(
+                    "--preprocess must be legacy or canonical: " + value);
+            }
+        } else if (key == "--resize-scale") {
+            options.resize_scale = std::stoi(value);
+            if (options.resize_scale < 224) {
+                throw std::invalid_argument(
+                    "--resize-scale must cover the 224 crop");
+            }
+        } else if (key == "--interp") {
+            options.resize_interpolation = parse_interpolation(value);
+        } else if (key == "--mean") {
+            options.canonical_mean = parse_rgb_triple(value, "--mean");
+        } else if (key == "--std") {
+            options.canonical_std = parse_rgb_triple(value, "--std");
+        } else if (key == "--dump-preprocessed") {
+            options.dump_preprocessed = value;
         } else {
             throw std::invalid_argument("unknown argument: " + key);
         }
@@ -581,7 +658,10 @@ Options parse_options(int argc, char** argv) {
             "[--injection-work PATH --injection-release PATH "
             "--injection-gate-timeout-seconds N] "
             "[--campaign-work PATH --campaign-release PATH "
-            "--campaign-gate-timeout-seconds N]");
+            "--campaign-gate-timeout-seconds N] "
+            "[--class-count N --preprocess legacy|canonical --resize-scale N "
+            "--interp bicubic|bilinear --mean R,G,B --std R,G,B "
+            "--dump-preprocessed PATH]");
     }
     if (options.injection_work.empty() != options.injection_release.empty()) {
         throw std::invalid_argument(
@@ -627,6 +707,11 @@ Sample read_sample(const std::string& csv_path, std::size_t sample_index) {
     std::size_t current_index = 0;
     bool first_line = true;
     while (std::getline(input, line)) {
+        // tolerate CRLF rows (the G7 split CSVs are csv-module written);
+        // without this the header check fails and every index shifts by one
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
         if (first_line) {
             first_line = false;
             if (line == "path,label") {
@@ -645,28 +730,99 @@ Sample read_sample(const std::string& csv_path, std::size_t sample_index) {
     throw std::out_of_range("sample index is outside the CSV");
 }
 
-std::vector<float> preprocess(const std::string& path) {
+// Preprocessing policy. Legacy = the G5 RESISC45 squash resize (kept
+// byte-identical; G5 comparability). Canonical = the G7 v2 contract
+// (tools/g7_prep/build_g7_int8_engine.py:preprocess_image): aspect-
+// preserving shorter-edge resize to resize_scale (torchvision int()
+// truncation of the longer edge), INTER_AREA on downscale / the model's
+// own interpolation on upscale, torchvision-exact round() center crop,
+// BGR->RGB, float32 /255, float32 mean/std, CHW.
+struct PreprocessSpec {
+    bool canonical{false};
+    int resize_scale{224};
+    int resize_interpolation{cv::INTER_CUBIC};
+    std::array<float, 3> mean{kMean};  // RGB order
+    std::array<float, 3> std{kStd};    // RGB order
+};
+
+std::vector<float> preprocess(const std::string& path,
+                              const PreprocessSpec& spec) {
     const cv::Mat source = cv::imread(path, cv::IMREAD_COLOR);
     if (source.empty()) {
         throw std::runtime_error("cannot decode image: " + path);
     }
 
-    cv::Mat image;
-    cv::resize(source, image, cv::Size(kInputWidth, kInputHeight), 0, 0,
-               cv::INTER_CUBIC);
-    image.convertTo(image, CV_32FC3, 1.0 / 255.0);
-    cv::subtract(image, cv::Scalar(kMean[2], kMean[1], kMean[0]), image);
-    cv::divide(image, cv::Scalar(kStd[2], kStd[1], kStd[0]), image);
-
     const int plane = kInputHeight * kInputWidth;
     std::vector<float> chw(3U * static_cast<std::size_t>(plane));
+
+    if (!spec.canonical) {
+        cv::Mat image;
+        cv::resize(source, image, cv::Size(kInputWidth, kInputHeight), 0, 0,
+                   cv::INTER_CUBIC);
+        image.convertTo(image, CV_32FC3, 1.0 / 255.0);
+        cv::subtract(image, cv::Scalar(kMean[2], kMean[1], kMean[0]), image);
+        cv::divide(image, cv::Scalar(kStd[2], kStd[1], kStd[0]), image);
+        for (int row = 0; row < kInputHeight; ++row) {
+            const cv::Vec3f* pixels = image.ptr<cv::Vec3f>(row);
+            for (int column = 0; column < kInputWidth; ++column) {
+                const int offset = row * kInputWidth + column;
+                chw[static_cast<std::size_t>(offset)] = pixels[column][2];
+                chw[static_cast<std::size_t>(plane + offset)] = pixels[column][1];
+                chw[static_cast<std::size_t>(2 * plane + offset)] = pixels[column][0];
+            }
+        }
+        return chw;
+    }
+
+    // Canonical v2, statement-for-statement the python contract. Both call
+    // the same OpenCV C++ routines underneath (cv::INTER_AREA here IS
+    // cv2.INTER_AREA), so the output is bit-identical when the arithmetic
+    // order and dtypes match exactly.
+    const int height = source.rows;
+    const int width = source.cols;
+    int new_width = 0;
+    int new_height = 0;
+    if (width <= height) {
+        new_width = spec.resize_scale;
+        new_height = static_cast<int>(
+            static_cast<double>(spec.resize_scale) * height / width);
+    } else {
+        new_width = static_cast<int>(
+            static_cast<double>(spec.resize_scale) * width / height);
+        new_height = spec.resize_scale;
+    }
+    const int resize_interpolation =
+        (new_width < width || new_height < height) ? cv::INTER_AREA
+                                                   : spec.resize_interpolation;
+    cv::Mat resized;
+    cv::resize(source, resized, cv::Size(new_width, new_height), 0, 0,
+               resize_interpolation);
+    // torchvision CenterCrop uses int(round(...)); python round() is
+    // round-half-to-EVEN, which is std::nearbyint under the default FE
+    // rounding mode (std::round would differ on every .5)
+    const int top = std::max(
+        0, static_cast<int>(std::nearbyint((new_height - kInputHeight) / 2.0)));
+    const int left = std::max(
+        0, static_cast<int>(std::nearbyint((new_width - kInputWidth) / 2.0)));
+    const cv::Mat cropped = resized(
+        cv::Range(top, top + kInputHeight), cv::Range(left, left + kInputWidth));
+    cv::Mat rgb;
+    cv::cvtColor(cropped, rgb, cv::COLOR_BGR2RGB);
+
+    // float32 chain in the python order: *np.float32(1/255), then
+    // (x - mean) / std -- separate statements so the compiler cannot
+    // contract them into an FMA (numpy runs each ufunc separately too)
+    const float inv_255 = static_cast<float>(1.0 / 255.0);
     for (int row = 0; row < kInputHeight; ++row) {
-        const cv::Vec3f* pixels = image.ptr<cv::Vec3f>(row);
+        const cv::Vec3b* pixels = rgb.ptr<cv::Vec3b>(row);
         for (int column = 0; column < kInputWidth; ++column) {
             const int offset = row * kInputWidth + column;
-            chw[static_cast<std::size_t>(offset)] = pixels[column][2];
-            chw[static_cast<std::size_t>(plane + offset)] = pixels[column][1];
-            chw[static_cast<std::size_t>(2 * plane + offset)] = pixels[column][0];
+            for (int channel = 0; channel < 3; ++channel) {
+                float value =
+                    static_cast<float>(pixels[column][channel]) * inv_255;
+                value = (value - spec.mean[channel]) / spec.std[channel];
+                chw[static_cast<std::size_t>(channel * plane + offset)] = value;
+            }
         }
     }
     return chw;
@@ -712,8 +868,13 @@ std::size_t checked_element_count(const std::vector<std::size_t>& shape) {
 }
 
 std::vector<BindingInfo> inspect_bindings(const nvinfer1::ICudaEngine& engine) {
-    if (!engine.hasImplicitBatchDimension() || engine.getMaxBatchSize() < 1) {
-        throw std::invalid_argument("G1.5 expects the existing implicit-batch engine");
+    // G5 engines are implicit-batch (maxBatchSize contract); G7 explicit
+    // Q/DQ engines carry the batch dim inside every binding shape. Both
+    // expose the same data/prob/index contract, and for both the
+    // per-binding element counts are checked against the runner's tensors
+    // after inspection.
+    if (engine.hasImplicitBatchDimension() && engine.getMaxBatchSize() < 1) {
+        throw std::invalid_argument("implicit-batch engine has maxBatchSize < 1");
     }
 
     std::vector<BindingInfo> bindings;
@@ -763,12 +924,25 @@ gpu_m2d::TensorDescriptor make_descriptor(
     };
 }
 
+// G5 implicit-batch engines use enqueue(batchSize, ...); G7 explicit
+// Q/DQ engines carry the batch dimension inside the binding shapes and
+// use enqueueV2. Both paths feed the identical data/prob/index contract.
+bool enqueue_inference(nvinfer1::IExecutionContext& context,
+                       std::vector<void*>& binding_pointers,
+                       cudaStream_t stream) {
+    if (context.getEngine().hasImplicitBatchDimension()) {
+        return context.enqueue(1, binding_pointers.data(), stream, nullptr);
+    }
+    return context.enqueueV2(binding_pointers.data(), stream, nullptr);
+}
+
 Prediction run_inference(nvinfer1::IExecutionContext& context,
                          std::vector<void*>& binding_pointers,
                          int probability_index,
                          int class_index,
-                         CudaStream& stream) {
-    if (!context.enqueue(1, binding_pointers.data(), stream.get(), nullptr)) {
+                         CudaStream& stream,
+                         std::int32_t class_count) {
+    if (!enqueue_inference(context, binding_pointers, stream.get())) {
         throw std::runtime_error("TensorRT enqueue returned false");
     }
 
@@ -785,7 +959,7 @@ Prediction run_inference(nvinfer1::IExecutionContext& context,
                "copy class index to host");
     check_cuda(cudaStreamSynchronize(stream.get()), "synchronize inference stream");
     if (!std::isfinite(prediction.probability) || prediction.class_index < 0 ||
-        prediction.class_index >= kClassCount) {
+        prediction.class_index >= class_count) {
         throw std::runtime_error("TensorRT inference produced an invalid output");
     }
     return prediction;
@@ -1052,6 +1226,10 @@ std::vector<Sample> read_all_samples(const std::string& csv_path) {
     std::string line;
     bool first_line = true;
     while (std::getline(input, line)) {
+        // tolerate CRLF rows (see read_sample)
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
         if (first_line) {
             first_line = false;
             if (line == "path,label") {
@@ -1096,6 +1274,7 @@ ImageOutcome run_campaign_image(nvinfer1::IExecutionContext& context,
                                 int input_index, const float* input_host,
                                 std::size_t input_bytes, int probability_index,
                                 int class_index, CudaStream& stream,
+                                std::int32_t class_count,
                                 void* input_base, std::size_t input_size,
                                 const std::vector<InjectionTarget>& input_sites,
                                 void* probability_base,
@@ -1114,7 +1293,7 @@ ImageOutcome run_campaign_image(nvinfer1::IExecutionContext& context,
             input_base, input_size, site.byte_offset,
             static_cast<std::uint8_t>(site.bit_in_byte)));
     }
-    if (!context.enqueue(1, binding_pointers.data(), stream.get(), nullptr)) {
+    if (!enqueue_inference(context, binding_pointers, stream.get())) {
         throw std::runtime_error("TensorRT enqueue returned false");
     }
     check_cuda(cudaStreamSynchronize(stream.get()),
@@ -1144,7 +1323,7 @@ ImageOutcome run_campaign_image(nvinfer1::IExecutionContext& context,
     check_cuda(cudaStreamSynchronize(stream.get()), "synchronize readback");
     outcome.valid = std::isfinite(outcome.probability) &&
                     outcome.class_index >= 0 &&
-                    outcome.class_index < kClassCount;
+                    outcome.class_index < class_count;
     return outcome;
 }
 
@@ -1328,12 +1507,38 @@ int main(int argc, char** argv) {
 
         // CPU-only preparation happens before the gate so the gated window
         // contains nothing but CUDA work.
+        PreprocessSpec preprocess_spec;
+        preprocess_spec.canonical = options.preprocess_mode == "canonical";
+        preprocess_spec.resize_scale = options.resize_scale;
+        preprocess_spec.resize_interpolation = options.resize_interpolation;
+        preprocess_spec.mean = options.canonical_mean;
+        preprocess_spec.std = options.canonical_std;
         const Sample sample = read_sample(options.sample_csv, options.sample_index);
-        const std::vector<float> input = preprocess(sample.path);
+        const std::vector<float> input =
+            preprocess(sample.path, preprocess_spec);
+        // Preprocessing parity escape hatch: dump the sample-index image's
+        // tensor and exit before any engine load or CUDA call, so the
+        // canonical C++ port can be diffed bit-exactly against the python
+        // contract offline.
+        if (!options.dump_preprocessed.empty()) {
+            std::ofstream dump(options.dump_preprocessed, std::ios::binary);
+            if (!dump) {
+                throw std::runtime_error("cannot write preprocessed dump: " +
+                                         options.dump_preprocessed);
+            }
+            dump.write(reinterpret_cast<const char*>(input.data()),
+                       static_cast<std::streamsize>(input.size() *
+                                                    sizeof(float)));
+            std::cout << "GPU_M2D_PREPROCESS_DUMP_PASS"
+                      << " image=" << sample.path
+                      << " floats=" << input.size() << '\n';
+            return 0;
+        }
         const std::vector<char> engine_bytes = read_binary_file(options.engine_path);
-        // G5 campaign: stage every evaluation image's preprocessed input on
-        // the host BEFORE the gate (CPU-only work; the gated window stays
-        // CUDA-only). ~600 MB host for the 1000-image pass.
+        // G5/G7 campaign: stage every evaluation image's preprocessed input
+        // on the host BEFORE the gate (CPU-only work; the gated window
+        // stays CUDA-only). ~600 MB host for the G5 1000-image pass,
+        // ~5.6 GiB for the G7 10000-image pass.
         std::vector<Sample> campaign_samples;
         std::vector<float> campaign_input;
         if (!options.campaign_work.empty()) {
@@ -1344,7 +1549,8 @@ int main(int argc, char** argv) {
             }
             campaign_input.reserve(campaign_samples.size() * input.size());
             for (const Sample& eval_sample : campaign_samples) {
-                const std::vector<float> staged = preprocess(eval_sample.path);
+                const std::vector<float> staged =
+                    preprocess(eval_sample.path, preprocess_spec);
                 campaign_input.insert(campaign_input.end(), staged.begin(),
                                       staged.end());
             }
@@ -1483,7 +1689,7 @@ int main(int argc, char** argv) {
                        "copy clean input to device");
             clean = run_inference(
                 *context, binding_pointers, probability_binding.index,
-                class_binding.index, stream);
+                class_binding.index, stream, options.class_count);
             observer.event("CLEAN_INFERENCE_END");
         } else {
             // G5 clean pass: every image, strict -- an invalid output in the
@@ -1501,7 +1707,7 @@ int main(int argc, char** argv) {
                     *context, binding_pointers, input_binding.index,
                     &campaign_input[image_index * input_binding.element_count],
                     input_binding.size_bytes, probability_binding.index,
-                    class_binding.index, stream,
+                    class_binding.index, stream, options.class_count,
                     binding_pointers[input_binding.index],
                     input_binding.size_bytes, {}, clean_probability_base,
                     probability_binding.size_bytes, {}, clean_class_base,
@@ -1771,7 +1977,8 @@ int main(int argc, char** argv) {
                     *context, binding_pointers, input_binding.index,
                     &campaign_input[image_index * input_binding.element_count],
                     input_binding.size_bytes, probability_binding.index,
-                    class_binding.index, stream, input_base,
+                    class_binding.index, stream, options.class_count,
+                    input_base,
                     input_binding.size_bytes, input_sites, probability_base,
                     probability_binding.size_bytes, probability_sites,
                     class_base, class_binding.size_bytes, class_sites);
@@ -1971,7 +2178,7 @@ int main(int argc, char** argv) {
                                 "trial_index=" + std::to_string(trial_index));
             const Prediction sanity = run_inference(
                 *context, binding_pointers, probability_binding.index,
-                class_binding.index, stream);
+                class_binding.index, stream, options.class_count);
             const bool sanity_matches =
                 sanity.class_index ==
                     campaign_clean[options.sample_index].class_index &&
@@ -2089,7 +2296,7 @@ int main(int argc, char** argv) {
 
         injected = run_inference(
             *context, binding_pointers, probability_binding.index,
-            class_binding.index, stream);
+            class_binding.index, stream, options.class_count);
         observer.event("INJECTED_INFERENCE_END");
         write_result(options.output_prefix + "_result.csv", options, sample, run_id,
                      mapped, flip, clean, injected);
@@ -2205,7 +2412,7 @@ int main(int argc, char** argv) {
         try {
             injected = run_inference(
                 *context, binding_pointers, probability_binding.index,
-                class_binding.index, stream);
+                class_binding.index, stream, options.class_count);
             g4_injected_valid = true;
         } catch (const std::exception&) {
             // An invalid numeric output is an honest DUE outcome of the
@@ -2269,7 +2476,7 @@ int main(int argc, char** argv) {
         observer.event("SANITY_INFERENCE_BEGIN");
         const Prediction sanity = run_inference(
             *context, binding_pointers, probability_binding.index,
-            class_binding.index, stream);
+            class_binding.index, stream, options.class_count);
         observer.event("SANITY_INFERENCE_END");
         if (sanity.class_index != clean.class_index ||
             std::fabs(sanity.probability - clean.probability) > kSanityTolerance) {

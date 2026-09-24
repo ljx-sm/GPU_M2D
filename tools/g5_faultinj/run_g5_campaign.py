@@ -471,6 +471,12 @@ def resident_bytes_of(snapshot_rows: list[dict]) -> int:
     return total
 
 
+class _BootstrapComplete(Exception):
+    """Raised by the measure-only --bootstrap path once bootstrap.json is
+    written and the gated child has been terminated (no trials, no flips;
+    skips every post-run trial verification)."""
+
+
 # --------------------------------------------------------------------------
 # driver
 # --------------------------------------------------------------------------
@@ -492,10 +498,13 @@ def parse_args() -> argparse.Namespace:
                         help="sanity image index inside the sample CSV")
     parser.add_argument("--table", type=Path,
                         default=PROJECT / "artifacts/g3/table_v4")
-    parser.add_argument("--level",
-                        choices=[entry["level"] for entry in fault_model.LEVELS],
-                        help="frozen BER level (docs/G5_FAULT_MODEL.md §5); "
-                             "required unless --self-test")
+    parser.add_argument("--workload", default=fault_model.DEFAULT_WORKLOAD,
+                        choices=sorted(fault_model.WORKLOADS),
+                        help="frozen fault-model workload (its level table "
+                             "and nominal R guard)")
+    parser.add_argument("--level", default=None,
+                        help="frozen BER level of the selected workload; "
+                             "required unless --bootstrap")
     parser.add_argument("--trials", type=int, default=100,
                         help="trials of this campaign (default 100)")
     parser.add_argument("--seed", type=int, default=7,
@@ -505,6 +514,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-seconds", type=float, default=3600.0,
                         help="wall-clock budget for the runner (the full "
                              "campaign runs inside it)")
+    parser.add_argument("--prelude-seconds", type=float, default=600.0,
+                        help="budget for the runner's CPU prelude (host "
+                             "preprocessing of every evaluation image) "
+                             "before the pre-allocation gate; the G7 10K "
+                             "ImageNet pass needs more than the G5 default")
+    parser.add_argument("--bootstrap", action="store_true",
+                        help="measure-only run: attach the observer, build "
+                             "the per-run snapshot, record the live "
+                             "resident-byte total R (for freezing a new "
+                             "workload's level table), then stop -- no "
+                             "trials, no flips")
+    # Runner passthrough (G7 workload parameterization; unset flags are
+    # omitted so the runner defaults keep the G5 behavior byte-identical).
+    parser.add_argument("--class-count", type=int, default=None)
+    parser.add_argument("--preprocess", choices=("legacy", "canonical"),
+                        default=None)
+    parser.add_argument("--resize-scale", type=int, default=None)
+    parser.add_argument("--interp", choices=("bicubic", "bilinear"),
+                        default=None)
+    parser.add_argument("--mean", default=None,
+                        help="R,G,B canonical-mode mean (model_meta.json)")
+    parser.add_argument("--std", default=None,
+                        help="R,G,B canonical-mode std (model_meta.json)")
     parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
     parser.add_argument("--output-root", type=Path,
                         default=PROJECT / "artifacts/g5/campaign")
@@ -515,8 +547,10 @@ def finalize(failures: list[str], run_dir: Path, summary_output: Path,
              test_log: Path, event_output: Path, observer: G2Observer,
              args: argparse.Namespace, run_id: str, device_uuid: str,
              started_ns: int, extra: dict[str, Any], uid: int, gid: int,
+             status_override: str | None = None,
              ) -> int:
-    status = "FAIL_CLOSED" if failures else "G5_CAMPAIGN_VERIFIED"
+    status = status_override or ("FAIL_CLOSED" if failures
+                                 else "G5_CAMPAIGN_VERIFIED")
     summary = {
         "schema_version": G5_SCHEMA,
         "status": status,
@@ -532,6 +566,7 @@ def finalize(failures: list[str], run_dir: Path, summary_output: Path,
         "device": args.device,
         "device_uuid": device_uuid,
         "target_tgid": observer.target_tgid,
+        "workload": args.workload,
         "level": args.level,
         "trials_requested": args.trials,
         "seed": args.seed,
@@ -557,6 +592,8 @@ def finalize(failures: list[str], run_dir: Path, summary_output: Path,
     summary_output.write_text(json.dumps(summary, indent=2, sort_keys=True)
                               + "\n", encoding="utf-8")
     outputs = [event_output, test_log, summary_output]
+    if args.bootstrap:
+        outputs.append(run_dir / "bootstrap.json")
     for name in ("gpu_va_pa_map.csv", "gpu_va_pa_map_gate.csv",
                  "work.csv", "work_detail.json",
                  "g1_5_g5_site_result.csv", "g1_5_g5_trial_result.csv",
@@ -572,7 +609,8 @@ def finalize(failures: list[str], run_dir: Path, summary_output: Path,
             if candidate.is_file():
                 outputs.append(candidate)
     chown_outputs(outputs + [run_dir], uid, gid)
-    print(f"device={args.device} level={args.level} status={status} "
+    print(f"device={args.device} workload={args.workload} "
+          f"level={args.level or 'bootstrap'} status={status} "
           f"run={run_id}")
     print(f"summary={summary_output}")
     for failure in failures:
@@ -588,8 +626,14 @@ def run_once(args: argparse.Namespace) -> int:
         raise RuntimeError(f"runner missing or not executable: {args.runner}")
     if args.trials < 1:
         raise RuntimeError("--trials must be >= 1")
-    fault_model.assert_frozen_levels()
-    level = fault_model.level_by_name(args.level)
+    workload_entry = fault_model.workload_by_name(args.workload)
+    r_nominal = workload_entry["resident_bytes_nominal"]
+    if not args.bootstrap:
+        # a real campaign runs fail-closed against the frozen level table;
+        # the bootstrap run exists precisely to MEASURE R for a workload
+        # whose table is not frozen yet (empty levels, R placeholder 0)
+        fault_model.assert_frozen_levels(args.workload)
+        level = fault_model.level_by_name(args.level, args.workload)
     trt_runtime_dir = Path(os.environ.get(
         "GPU_M2D_REMU_ROOT", "/data1/luojx/REMU")) / \
         ".local/deps/tensorrt-8.6.1/tensorrt_libs"
@@ -605,8 +649,9 @@ def run_once(args: argparse.Namespace) -> int:
 
     cotenancy = cotenancy_snapshot(args.device)
     device_uuid = query_device_uuid(args.device)
+    level_tag = args.level if args.level else "bootstrap"
     run_dir = args.output_root / \
-        f"run_{args.level}_gpu{args.device}_{time.time_ns()}"
+        f"run_{level_tag}_gpu{args.device}_{time.time_ns()}"
     run_dir.mkdir(parents=True, exist_ok=True)
     os.chown(run_dir, uid, gid)
     event_output = run_dir / "events.csv"
@@ -631,12 +676,29 @@ def run_once(args: argparse.Namespace) -> int:
         part for part in (str(trt_runtime_dir), str(opencv_lib_dir),
                           os.environ.get("LD_LIBRARY_PATH", "")) if part)
 
+    # G7 workload parameterization: forward only the flags the operator set
+    # so an unset --workload default keeps the G5 runner argv byte-identical
+    runner_passthrough: list[str] = []
+    if args.class_count is not None:
+        runner_passthrough += ["--class-count", str(args.class_count)]
+    if args.preprocess is not None:
+        runner_passthrough += ["--preprocess", args.preprocess]
+    if args.resize_scale is not None:
+        runner_passthrough += ["--resize-scale", str(args.resize_scale)]
+    if args.interp is not None:
+        runner_passthrough += ["--interp", args.interp]
+    if args.mean is not None:
+        runner_passthrough += ["--mean", args.mean]
+    if args.std is not None:
+        runner_passthrough += ["--std", args.std]
+
     observer = G2Observer(contract, contract_hash, 0, event_output)
     process: subprocess.Popen[bytes] | None = None
     started_ns = time.time_ns()
     captured = bytearray()
     failures: list[str] = []
-    extra: dict[str, Any] = {"cotenancy_at_start": cotenancy}
+    extra: dict[str, Any] = {"cotenancy_at_start": cotenancy,
+                             "runner_passthrough": runner_passthrough}
     try:
         process = subprocess.Popen(
             [
@@ -653,6 +715,7 @@ def run_once(args: argparse.Namespace) -> int:
                 "--campaign-release", str(release.resolve()),
                 "--campaign-gate-timeout-seconds",
                 str(max(600, int(args.timeout_seconds))),
+                *runner_passthrough,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -663,10 +726,11 @@ def run_once(args: argparse.Namespace) -> int:
         )
         observer.set_target_tgid(process.pid)
         # In campaign mode the runner preprocesses every evaluation image
-        # BEFORE this marker (CPU-only), so the wait budget is minutes.
+        # BEFORE this marker (CPU-only), so the wait budget is minutes
+        # (the G7 10K ImageNet prelude needs more than the G5 default).
         prelude, gate_ready = read_until_marker(
             process, b"GPU_M2D_EVENT,event=WAIT_PRE_ALLOC_GATE,",
-            min(args.timeout_seconds, 600.0))
+            min(args.timeout_seconds, args.prelude_seconds))
         captured.extend(prelude)
         if not gate_ready:
             process.terminate()
@@ -733,10 +797,62 @@ def run_once(args: argparse.Namespace) -> int:
         # resident-byte total must equal the nominal R or the campaign
         # refuses (fail-closed) -- the table must be re-derived instead.
         resident_bytes = resident_bytes_of(result.rows)
-        if resident_bytes != fault_model.RESIDENT_BYTES_NOMINAL:
+
+        if args.bootstrap:
+            # measure-only: record this engine's live R so its workload's
+            # level table can be derived and frozen; no trials, no flips.
+            # The runner sits blocked at the campaign gate having already
+            # written the clean-pass CSV (the baseline-validation
+            # artifact) -- terminate it now.
+            bootstrap_output = run_dir / "bootstrap.json"
+            bootstrap_output.write_text(json.dumps({
+                "schema_version": "gpu-m2d.g5.bootstrap.v1",
+                "workload": args.workload,
+                "resident_bytes": resident_bytes,
+                "resident_bits": resident_bytes * 8,
+                "device": args.device,
+                "device_uuid": device_uuid,
+                "engine_path": str(args.engine),
+                "engine_sha256": sha256(args.engine),
+                "runner_path": str(args.runner),
+                "runner_sha256": sha256(args.runner),
+                "runner_passthrough": runner_passthrough,
+                "snapshot_manifest": result.manifest,
+                "snapshot_rows": len(result.rows),
+                "allocation_count": len(registry),
+                "started_wall_time_ns": started_ns,
+                "measured_wall_time_ns": time.time_ns(),
+            }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.chmod(bootstrap_output, 0o644)
+            print(f"bootstrap: workload={args.workload} "
+                  f"resident_bytes={resident_bytes} "
+                  f"R_bits={resident_bytes * 8}")
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=30)
+            for _ in range(20):
+                observer.poll(50)
+            drain_pipe(process, captured)
+            extra.update({
+                "bootstrap_output": str(bootstrap_output),
+                "bootstrap_sha256": sha256(bootstrap_output),
+                "resident_bytes": resident_bytes,
+                "snapshot_dir": str(snapshot_dir),
+                "snapshot_sha256": result.manifest.get("snapshot_sha256",
+                                                       ""),
+                "snapshot_manifest": result.manifest,
+                "g1_5_run_id": g1_5_run_id,
+                "registry_allocation_count": len(registry),
+            })
+            raise _BootstrapComplete()
+
+        if resident_bytes != r_nominal:
             raise RuntimeError(
                 f"snapshot residency {resident_bytes} bytes != frozen "
-                f"R {fault_model.RESIDENT_BYTES_NOMINAL} -- the level "
+                f"R {r_nominal} of workload {args.workload} -- the level "
                 "table must be re-derived (docs/G5_FAULT_MODEL.md §5)")
 
         anchors = fault_model.load_anchors(args.table)
@@ -744,7 +860,7 @@ def run_once(args: argparse.Namespace) -> int:
         print(f"anchors: {anchor_pages} pages with valid consensus masks")
         campaign = fault_model.sample_campaign(
             args.level, args.trials, result.rows, anchors, args.seed,
-            resident_bytes_expected=fault_model.RESIDENT_BYTES_NOMINAL)
+            resident_bytes_expected=r_nominal, workload=args.workload)
         model_failures = verify_work_model(level, campaign)
         if model_failures:
             raise RuntimeError("sampled campaign violates the frozen model: "
@@ -920,6 +1036,8 @@ def run_once(args: argparse.Namespace) -> int:
             "nvidia_module_sha256": contract["nvidia_module_sha256"],
             "nvidia_uvm_module_sha256": contract["nvidia_uvm_module_sha256"],
         })
+    except _BootstrapComplete:
+        pass
     finally:
         gate.unlink(missing_ok=True)
         release.unlink(missing_ok=True)
@@ -936,7 +1054,10 @@ def run_once(args: argparse.Namespace) -> int:
 
     return finalize(failures, run_dir, summary_output, test_log,
                     event_output, observer, args, run_id, device_uuid,
-                    started_ns, extra, uid, gid)
+                    started_ns, extra, uid, gid,
+                    status_override=("G5_BOOTSTRAP_MEASURED"
+                                     if args.bootstrap and not failures
+                                     else None))
 
 
 # --------------------------------------------------------------------------
@@ -1188,9 +1309,10 @@ def main() -> int:
     args = parse_args()
     if args.self_test:
         return self_test()
-    if args.level is None:
+    if args.level is None and not args.bootstrap:
         raise SystemExit("run_g5_campaign.py: error: --level is required "
-                         "for a campaign (one frozen BER level per run)")
+                         "for a campaign (one frozen BER level per run); "
+                         "--bootstrap is the only level-less mode")
     if os.geteuid() != 0:
         raise PermissionError(
             "run through sudo; the CUDA child is dropped to the invoking user")

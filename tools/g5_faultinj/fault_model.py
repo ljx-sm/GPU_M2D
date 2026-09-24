@@ -40,31 +40,70 @@ import random
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# frozen level table (docs/G5_FAULT_MODEL.md §5; machine-verified 2026-09-21)
+# frozen level tables, one per workload (docs/G5_FAULT_MODEL.md §5 for the
+# G5 table; each G7 workload's R is MEASURED by a bootstrap run of that
+# engine and only then frozen here -- the campaign residency guard refuses
+# any live snapshot that disagrees with the frozen R)
 # ---------------------------------------------------------------------------
 
-RESIDENT_BYTES_NOMINAL = 26_428_428
-R_BITS = RESIDENT_BYTES_NOMINAL * 8  # 211,427,424 bits
+WORKLOADS = {
+    # G5: ResNet-50/RESISC45 implicit-engine campaign (machine-verified
+    # 2026-09-21)
+    "g5_resisc45_resnet50": {
+        "resident_bytes_nominal": 26_428_428,
+        "levels": [
+            # core ladder (user-confirmed 2026-09-21; docs/G5_FAULT_MODEL.md §5)
+            {"level": "L1", "ber": 1e-8, "bits": 2, "s": 2, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-8, "bits": 11, "s": 4, "d": 2, "t": 1},
+            {"level": "L3", "ber": 1e-7, "bits": 21, "s": 8, "d": 2, "t": 3},
+            {"level": "L4", "ber": 5e-7, "bits": 106, "s": 41, "d": 13,
+             "t": 13},
+            {"level": "L5", "ber": 1e-6, "bits": 211, "s": 79, "d": 27,
+             "t": 26},
+            # extension ladder (added 2026-09-21 after the L1-L5 campaign;
+            # same derivation rule, literals produced by the EXHAUSTIVE
+            # solver; run single-card per the verified L1-L5 no-card-effect
+            # result)
+            {"level": "L6", "ber": 5e-6, "bits": 1057, "s": 397, "d": 132,
+             "t": 132},
+            {"level": "L7", "ber": 1e-5, "bits": 2114, "s": 794, "d": 264,
+             "t": 264},
+            {"level": "L8", "ber": 5e-5, "bits": 10571, "s": 3964, "d": 1322,
+             "t": 1321},
+            {"level": "L9", "ber": 1e-4, "bits": 21143, "s": 7928, "d": 2643,
+             "t": 2643},
+        ],
+    },
+    # G7: ResNet-50/ImageNet-1K explicit-engine campaign workload. R was
+    # MEASURED by the bootstrap run
+    # artifacts/g7/campaign/run_bootstrap_gpu0_1790260933358547193 (2026-09-24,
+    # GPU 0, engine sha256 0368bffd..., clean pass 7850/10000 = 78.50% --
+    # bit-identical to the python INT8 eval) and the five user-selected BER
+    # levels (1e-7 .. 1e-5, 2026-09-24) derived from it; all B < 3000 so the
+    # compositions are exhaustive-solver literals.
+    "g7_imagenet1k_resnet50": {
+        "resident_bytes_nominal": 34_959_884,
+        "levels": [
+            {"level": "L1", "ber": 1e-7, "bits": 28, "s": 11, "d": 4,
+             "t": 3},
+            {"level": "L2", "ber": 5e-7, "bits": 140, "s": 53, "d": 18,
+             "t": 17},
+            {"level": "L3", "ber": 1e-6, "bits": 280, "s": 105, "d": 35,
+             "t": 35},
+            {"level": "L4", "ber": 5e-6, "bits": 1398, "s": 523, "d": 175,
+             "t": 175},
+            {"level": "L5", "ber": 1e-5, "bits": 2797, "s": 1049, "d": 349,
+             "t": 350},
+        ],
+    },
+}
 
-LEVELS = [
-    # core ladder (user-confirmed 2026-09-21; docs/G5_FAULT_MODEL.md §5)
-    {"level": "L1", "ber": 1e-8, "bits": 2, "s": 2, "d": 0, "t": 0},
-    {"level": "L2", "ber": 5e-8, "bits": 11, "s": 4, "d": 2, "t": 1},
-    {"level": "L3", "ber": 1e-7, "bits": 21, "s": 8, "d": 2, "t": 3},
-    {"level": "L4", "ber": 5e-7, "bits": 106, "s": 41, "d": 13, "t": 13},
-    {"level": "L5", "ber": 1e-6, "bits": 211, "s": 79, "d": 27, "t": 26},
-    # extension ladder (added 2026-09-21 after the L1-L5 campaign; same
-    # derivation rule, literals produced by the EXHAUSTIVE solver; run
-    # single-card per the verified L1-L5 no-card-effect result)
-    {"level": "L6", "ber": 5e-6, "bits": 1057, "s": 397, "d": 132,
-     "t": 132},
-    {"level": "L7", "ber": 1e-5, "bits": 2114, "s": 794, "d": 264,
-     "t": 264},
-    {"level": "L8", "ber": 5e-5, "bits": 10571, "s": 3964, "d": 1322,
-     "t": 1321},
-    {"level": "L9", "ber": 1e-4, "bits": 21143, "s": 7928, "d": 2643,
-     "t": 2643},
-]
+DEFAULT_WORKLOAD = "g5_resisc45_resnet50"
+
+# Back-compat aliases: offline analysis imports these module attributes.
+RESIDENT_BYTES_NOMINAL = WORKLOADS[DEFAULT_WORKLOAD]["resident_bytes_nominal"]
+R_BITS = RESIDENT_BYTES_NOMINAL * 8  # 211,427,424 bits
+LEVELS = WORKLOADS[DEFAULT_WORKLOAD]["levels"]
 
 EVENT_SHARE_TARGET = (0.60, 0.20, 0.20)  # SBU / 2-bit MCU / 3-bit MCU
 
@@ -138,26 +177,38 @@ def resolve_composition(bits: int,
     return best[1]
 
 
-def assert_frozen_levels() -> None:
-    """Re-derive the table from the BERs and refuse on any drift."""
-    for entry in LEVELS:
-        bits = round(entry["ber"] * R_BITS)
+def workload_by_name(name: str) -> dict:
+    try:
+        return WORKLOADS[name]
+    except KeyError:
+        raise ModelError(
+            f"unknown workload {name!r}; expected one of "
+            f"{sorted(WORKLOADS)}") from None
+
+
+def assert_frozen_levels(workload: str = DEFAULT_WORKLOAD) -> None:
+    """Re-derive the workload's table from its BERs and R; refuse on drift."""
+    entry = workload_by_name(workload)
+    r_bits = entry["resident_bytes_nominal"] * 8
+    for row in entry["levels"]:
+        bits = round(row["ber"] * r_bits)
         composition = resolve_composition(bits)
-        if bits != entry["bits"] or composition != (entry["s"], entry["d"],
-                                                    entry["t"]):
+        if bits != row["bits"] or composition != (row["s"], row["d"],
+                                                  row["t"]):
             raise ModelError(
-                f"{entry['level']}: derived ({bits}, {composition}) != frozen "
-                f"({entry['bits']}, "
-                f"({entry['s']}, {entry['d']}, {entry['t']})); "
-                "docs/G5_FAULT_MODEL.md §5 must be re-derived and re-confirmed")
+                f"{workload}/{row['level']}: derived ({bits}, {composition}) "
+                f"!= frozen ({row['bits']}, "
+                f"({row['s']}, {row['d']}, {row['t']})); the level table "
+                "must be re-derived and re-confirmed")
 
 
-def level_by_name(name: str) -> dict:
-    for entry in LEVELS:
+def level_by_name(name: str, workload: str = DEFAULT_WORKLOAD) -> dict:
+    levels = workload_by_name(workload)["levels"]
+    for entry in levels:
         if entry["level"] == name:
             return entry
-    raise ModelError(f"unknown level {name}; expected one of "
-                     f"{[e['level'] for e in LEVELS]}")
+    raise ModelError(f"unknown level {name} in workload {workload}; expected "
+                     f"one of {[e['level'] for e in levels]}")
 
 
 # ---------------------------------------------------------------------------
@@ -420,10 +471,11 @@ def sample_trial(level: dict, trial_index: int, index: ResidencyIndex,
 def sample_campaign(level_name: str, trials: int, snapshot_rows: list[dict],
                     anchors: dict[int, list[int]], seed: int,
                     resident_bytes_expected: int | None = None,
+                    workload: str = DEFAULT_WORKLOAD,
                     ) -> list[list[dict]]:
     """The full work list for one campaign (level, N trials, one seed)."""
-    assert_frozen_levels()
-    level = level_by_name(level_name)
+    assert_frozen_levels(workload)
+    level = level_by_name(level_name, workload)
     index = ResidencyIndex(snapshot_rows)
     if resident_bytes_expected is not None and \
             index.total_bytes != resident_bytes_expected:
@@ -511,7 +563,9 @@ def _fixture() -> tuple[list[dict], dict[int, list[int]]]:
 def self_test() -> int:
     import tempfile
 
-    assert_frozen_levels()  # the frozen table matches its derivation rule
+    # every workload's frozen table matches its derivation rule
+    for workload_name in WORKLOADS:
+        assert_frozen_levels(workload_name)
     assert resolve_composition(8) == (3, 1, 1)  # exact 60/20/20 block
     assert resolve_composition(2) == (2, 0, 0)
     # windowed large-B path == exhaustive (forced via a low limit)

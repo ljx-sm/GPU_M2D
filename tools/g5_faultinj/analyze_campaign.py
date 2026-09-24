@@ -118,13 +118,16 @@ def pooled(runs: list[dict]) -> dict:
     n_top1 = sum(r["top1"] for r in runs)
     n_invalid = sum(r["invalid"] for r in runs)
     total_images = sum(r["total_images"] for r in runs)
-    p = n_top1 / n_valid
+    # an all-DUE level has n_valid == 0 (first invalid aborts the trial);
+    # report 0/NaN rather than divide by zero
+    p = n_top1 / n_valid if n_valid else 0.0
     ci = 1.96 * math.sqrt(p * (1 - p) / n_valid) if n_valid else 0.0
     return {
         "trials": sum(r["trials"] for r in runs),
         "total_images": total_images,
         "top1_rate": p, "top1_ci": ci,
-        "numeric_rate": (n_top1 + sum(r["numeric"] for r in runs)) / n_valid,
+        "numeric_rate": ((n_top1 + sum(r["numeric"] for r in runs)) / n_valid
+                         if n_valid else float("nan")),
         "invalid_rate": n_invalid / total_images,
         "acc_clean": sum(r["clean_acc"] for r in runs) / len(runs),
         "acc_inj": sum(r["inj_acc_due_wrong"] for r in runs) / len(runs),
@@ -158,7 +161,10 @@ def main() -> int:
 
     by_level: dict[str, list[dict]] = defaultdict(list)
     for run in runs:
-        by_level[run["level"]].append(run)
+        if "trials" in run:
+            # bootstrap / refused runs carry level=None and no trials;
+            # they are reported above but never pooled
+            by_level[run["level"]].append(run)
 
     print(f"campaign runs analyzed: {len(runs)}")
     bad = [r for r in runs if r["status"] != "G5_CAMPAIGN_VERIFIED"]

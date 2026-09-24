@@ -27,6 +27,10 @@
 #                       # injection campaign of one frozen BER level; same
 #                       # gated skeleton and sequential-device policy as g4t2.
 #                       # One campaign per invocation (one level).
+#                       # --bootstrap instead of --level: measure-only run
+#                       # (observer + per-run snapshot + record this
+#                       # engine's resident-byte total R into bootstrap.json,
+#                       # then stop -- no trials, no flips).
 #
 # Common options:
 #   [--size-mib N] [--hold-seconds N]
@@ -49,9 +53,17 @@
 #   [--sample-index N]
 #   [--timeout-seconds N]
 # G5-campaign-only options:
-#   --level L1|L2|L3|L4|L5   frozen BER level (required; one level per run)
+#   --level L1|...      frozen BER level (required unless --bootstrap)
 #   [--trials N]        trials of the campaign (default 100)
 #   [--seed N]          campaign RNG seed (default 7)
+#   [--workload NAME]   fault-model workload (g5_resisc45_resnet50 |
+#                       g7_imagenet1k_resnet50)
+#   [--bootstrap]       measure-only R run; no --level (see above)
+#   G7 runner passthrough (unset flags keep the G5 defaults byte-identical):
+#   [--engine PATH] [--sample-csv PATH] [--output-root DIR]
+#   [--class-count N] [--preprocess legacy|canonical] [--resize-scale N]
+#   [--interp bicubic|bilinear] [--mean R,G,B] [--std R,G,B]
+#   [--prelude-seconds N]   host-preprocessing budget (G7 10K needs more)
 #   (also honors --table / --sample-index / --timeout-seconds above)
 #
 # The tensorrt mode also regenerates artifacts/g2/gpu_va_pa_map.csv from the
@@ -68,6 +80,7 @@ API="device"
 RUNNER="${PROJECT}/build-g1.5/gpu_m2d_resnet50_int8_g1_5"
 EXTRA_ARGS=()
 G3_DEVICE=""
+CUSTOM_OUTPUT_ROOT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --api) API="$2"; shift 2 ;;
@@ -84,6 +97,12 @@ while [[ $# -gt 0 ]]; do
         --table|--binding-bit|--internal-bit|--sample-index|\
         --level|--trials|--seed) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --engine|--sample-csv|--workload|--class-count|\
+        --preprocess|--resize-scale|--interp|--mean|--std|\
+        --prelude-seconds) \
+            EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --output-root) CUSTOM_OUTPUT_ROOT="$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+        --bootstrap) EXTRA_ARGS+=("$1"); shift 1 ;;
         --device) G3_DEVICE="$2"; shift 2 ;;
         --runner) RUNNER="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
@@ -140,10 +159,13 @@ if [[ "${API}" == "g3pool" ]]; then
         FAILURES=$((FAILURES + 1))
     fi
 else
-    if [[ "${API}" == "g5campaign" && -z "$(grep -o '\-\-level' <<<"${EXTRA_ARGS[*]+"${EXTRA_ARGS[*]}"}")" ]]; then
-        echo "--api g5campaign requires --level L1|L2|L3|L4|L5 (one frozen BER" \
-             "level per campaign)" >&2
-        exit 1
+    if [[ "${API}" == "g5campaign" ]]; then
+        if [[ -z "$(grep -o '\-\-bootstrap' <<<"${EXTRA_ARGS[*]+"${EXTRA_ARGS[*]}"}")" ]] && \
+           [[ -z "$(grep -o '\-\-level' <<<"${EXTRA_ARGS[*]+"${EXTRA_ARGS[*]}"}")" ]]; then
+            echo "--api g5campaign requires --level (one frozen BER level per" \
+                 "campaign) unless --bootstrap is given" >&2
+            exit 1
+        fi
     fi
     if [[ "${API}" == "g4t2" || "${API}" == "g5campaign" ]] && [[ -n "${G3_DEVICE}" ]]; then
         DEVICE_LIST="${G3_DEVICE}"
@@ -203,6 +225,10 @@ fi
 if [[ "${API}" == "g5campaign" ]]; then
     chown -R "${INVOKING_UID}:${INVOKING_GID}" "${PROJECT}/artifacts/g5" \
         2>/dev/null || true
+    if [[ -n "${CUSTOM_OUTPUT_ROOT}" ]]; then
+        chown -R "${INVOKING_UID}:${INVOKING_GID}" "${CUSTOM_OUTPUT_ROOT}" \
+            2>/dev/null || true
+    fi
 fi
 
 if [[ "${FAILURES}" -gt 0 ]]; then
