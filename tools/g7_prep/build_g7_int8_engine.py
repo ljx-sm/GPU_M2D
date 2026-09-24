@@ -9,10 +9,12 @@ identity, byte-atomic engine write, binding contract [data, prob, index].
 
 G7 differences (all parameterized, no second source of truth):
   - calibration set  = g7_calib_1000_perclass1.csv (1000 classes x 1);
-  - mean/std/interpolation come from each model's model_meta.json
+  - mean/std/interpolation/crop_pct come from each model's model_meta.json
     (written by download_models.py);
-  - square resize to 224 with the model's own interpolation
-    (bicubic -> INTER_CUBIC, bilinear -> INTER_LINEAR).
+  - timm-canonical preprocessing (v2, 2026-09-24): aspect-preserving resize
+    of the shorter edge to int(224/crop_pct) with the model's own
+    interpolation, then center crop 224.  The former square-resize policy
+    cost 0.8-3.7 pp top-1 vs paper on all six models (diag_canonical_fp32).
 
 Environment wiring (same as run_stage13_int8_build_one.sh) -- the wrapper
 build_g7_engines.sh sets it; running this file directly requires:
@@ -149,14 +151,47 @@ def preprocess_image(
     mean: np.ndarray,
     std: np.ndarray,
     interpolation: int,
+    resize_scale: int = 224,
+    crop_size: int = 224,
 ) -> np.ndarray:
     """The G7 preprocessing contract (identical in calibration, clean
-    evaluation, and later the fault-injection runner): square resize to
-    224 with the model's own interpolation, RGB, /255, mean/std."""
+    evaluation, and later the fault-injection runner): timm-canonical
+    Resize(int(224/crop_pct)) + CenterCrop(224) in cv2, RGB, /255,
+    mean/std.
+
+    Aspect-preserving resize of the shorter edge to ``resize_scale`` --
+    the longer-edge target follows torchvision's int() truncation -- with
+    INTER_AREA on downscale (cv2's antialiased downscaler; plain
+    INTER_CUBIC aliasing costs ~1 pp top-1) and the model's own
+    interpolation on upscale, then torchvision-exact round() center crop
+    ``crop_size``.
+    """
     image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if image_bgr is None:
         raise RuntimeError(f"cannot read image: {image_path}")
-    image_bgr = cv2.resize(image_bgr, (224, 224), interpolation=interpolation)
+    height, width = image_bgr.shape[:2]
+    if width <= height:
+        new_width = resize_scale
+        new_height = int(resize_scale * height / width)
+    else:
+        new_width = int(resize_scale * width / height)
+        new_height = resize_scale
+    # cv2's INTER_CUBIC/INTER_LINEAR do not antialias on downscale (PIL
+    # always does); measured on resnet50/10K that aliasing costs ~1 pp
+    # top-1 (79.26 vs 80.55).  INTER_AREA is cv2's antialiased downscaler
+    # and matches the PIL-canonical reference within split noise; the
+    # model's own interpolation is kept for the (rare) upscale case.
+    if new_width < width or new_height < height:
+        resize_interpolation = cv2.INTER_AREA
+    else:
+        resize_interpolation = interpolation
+    image_bgr = cv2.resize(image_bgr, (new_width, new_height),
+                           interpolation=resize_interpolation)
+    # torchvision CenterCrop uses int(round(...)) -- match it exactly (floor
+    # here shifts the crop by one pixel on odd differences)
+    top = max(0, int(round((new_height - crop_size) / 2.0)))
+    left = max(0, int(round((new_width - crop_size) / 2.0)))
+    image_bgr = image_bgr[top : top + crop_size, left : left + crop_size]
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
     image_rgb *= np.float32(1.0 / 255.0)
     image_rgb = (image_rgb - mean) / std
@@ -171,12 +206,14 @@ class EntropyCalibrator(trt.IInt8EntropyCalibrator2):
         std: tuple[float, float, float],
         interpolation: int,
         cache_path: Path,
+        resize_scale: int = 224,
     ) -> None:
         super().__init__()
         self.image_paths = image_paths
         self.mean = np.asarray(mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.asarray(std, dtype=np.float32).reshape(1, 1, 3)
         self.interpolation = interpolation
+        self.resize_scale = resize_scale
         self.cache_path = cache_path
         self.next_image = 0
         self.cuda = CudaRuntime()
@@ -200,7 +237,9 @@ class EntropyCalibrator(trt.IInt8EntropyCalibrator2):
         if self.next_image >= len(self.image_paths):
             return None
         image_path = self.image_paths[self.next_image]
-        host = preprocess_image(image_path, self.mean, self.std, self.interpolation)
+        host = preprocess_image(
+            image_path, self.mean, self.std, self.interpolation, self.resize_scale
+        )
         self.cuda.copy_host_to_device(self.device_input, host)
         self.next_image += 1
         if (
@@ -352,6 +391,10 @@ def build(name: str, physical_gpu: int, parse_only: bool = False) -> Path | None
     if interpolation_name not in INTERPOLATION_CV:
         raise RuntimeError(f"{name}: unknown interpolation {interpolation_name}")
     interpolation = INTERPOLATION_CV[interpolation_name]
+    # timm-canonical: Resize(int(input_size / crop_pct)) via floor, then
+    # CenterCrop(input_size)  (crop_pct lives in model_meta.json)
+    crop_pct = float(meta["crop_pct"])
+    resize_scale = int(INPUT_SHAPE[2] // crop_pct)
 
     calibration_paths = read_calibration_paths()
     calibration_csv_sha256 = sha256_file(CALIBRATION_CSV)
@@ -363,6 +406,8 @@ def build(name: str, physical_gpu: int, parse_only: bool = False) -> Path | None
                 "mean": mean,
                 "std": std,
                 "interpolation": interpolation_name,
+                "preprocessing_policy": "canonical_aspect_resize_center_crop_v2",
+                "resize_scale": resize_scale,
                 "tensorrt": trt.__version__,
                 "int8_calibrator": "IInt8EntropyCalibrator2",
             },
@@ -413,7 +458,7 @@ def build(name: str, physical_gpu: int, parse_only: bool = False) -> Path | None
         raise RuntimeError("selected GPU does not report fast INT8 support")
 
     calibrator = EntropyCalibrator(
-        calibration_paths, mean, std, interpolation, cache_path
+        calibration_paths, mean, std, interpolation, cache_path, resize_scale
     )
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, WORKSPACE_BYTES)
@@ -454,10 +499,13 @@ def build(name: str, physical_gpu: int, parse_only: bool = False) -> Path | None
         "calibration_cache_sha256": sha256_file(cache_path),
         "calibration_identity": calibration_identity,
         "preprocessing": {
+            "policy": "canonical_aspect_resize_center_crop_v2",
             "mean": list(mean),
             "std": list(std),
             "interpolation": interpolation_name,
             "input_size": meta["input_size"],
+            "crop_pct": meta["crop_pct"],
+            "resize_scale": resize_scale,
         },
         "build_identity": build_identity,
         "workspace_bytes": WORKSPACE_BYTES,

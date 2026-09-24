@@ -2,13 +2,16 @@
 # GPU_M2D G7: environment wiring + INT8 engine build for the six
 # ImageNet-1k models (replicates REMU run_stage13_int8_build_one.sh).
 #
-# usage: build_g7_engines.sh PHYSICAL_GPU [MODEL ...]
+# usage: build_g7_engines.sh PHYSICAL_GPU [--explicit] [MODEL ...]
 #   PHYSICAL_GPU  0|1|2 (engine build is not a timing run; pick an idle card)
+#   --explicit    canonical v2 path: build from the ModelOpt Q/DQ ONNX
+#                 (model_qdq.onnx; STRONGLY_TYPED, per-channel weights).
+#                 Default (implicit): entropy-calibrated per-tensor path.
 #   MODEL         optional subset, default all six
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "usage: $0 PHYSICAL_GPU [MODEL ...]" >&2
+    echo "usage: $0 PHYSICAL_GPU [--explicit] [MODEL ...]" >&2
     exit 2
 fi
 physical_gpu=$1
@@ -17,6 +20,12 @@ case "${physical_gpu}" in
     0|1|2) ;;
     *) echo "physical GPU must be 0, 1, or 2" >&2; exit 2 ;;
 esac
+
+builder=build_g7_int8_engine.py
+if [[ "${1:-}" == "--explicit" ]]; then
+    builder=build_g7_explicit_engine.py
+    shift
+fi
 
 root=/data1/luojx/GPU_M2D
 python=/data1/luojx/miniforge3/envs/vit_fault/bin/python
@@ -31,14 +40,14 @@ export CUDA_VISIBLE_DEVICES=${physical_gpu}
 export LD_LIBRARY_PATH=${trt_lib}:${cudnn_lib}:/usr/local/cuda-12.4/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
-echo "physical_gpu=${physical_gpu}"
+echo "physical_gpu=${physical_gpu} builder=${builder}"
 # co-tenancy is recorded, never acted on (shared-server policy)
 nvidia-smi --id="${physical_gpu}" --query-gpu=index,uuid,name,memory.free,memory.total --format=csv,noheader,nounits
 
 if [[ $# -ge 1 ]]; then
-    exec "${python}" "${root}/tools/g7_prep/build_g7_int8_engine.py" \
+    exec "${python}" "${root}/tools/g7_prep/${builder}" \
         --device "${physical_gpu}" "$@"
 else
-    exec "${python}" "${root}/tools/g7_prep/build_g7_int8_engine.py" \
+    exec "${python}" "${root}/tools/g7_prep/${builder}" \
         --device "${physical_gpu}"
 fi

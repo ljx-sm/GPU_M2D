@@ -116,6 +116,7 @@ def fp32_pass(
     mean: np.ndarray,
     std: np.ndarray,
     interpolation: int,
+    resize_scale: int,
 ) -> tuple[list[dict[str, object]], float]:
     classifier = timm.create_model(name, pretrained=False)
     state_dict = torch.load(
@@ -128,7 +129,7 @@ def fp32_pass(
     started = time.time()
     with torch.inference_mode():
         for sample_id, (image_path, target) in enumerate(rows_in):
-            host = preprocess_image(image_path, mean, std, interpolation)
+            host = preprocess_image(image_path, mean, std, interpolation, resize_scale)
             data = torch.from_numpy(host).cuda()
             logits = classifier(data)
             probabilities = torch.softmax(logits, dim=1)
@@ -158,12 +159,13 @@ def int8_pass_once(
     mean: np.ndarray,
     std: np.ndarray,
     interpolation: int,
+    resize_scale: int = 224,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     probability_host = np.zeros((1,), dtype=np.float32)
     index_host = np.full((1,), -1, dtype=np.int32)
     for sample_id, (image_path, target) in enumerate(rows_in):
-        host = preprocess_image(image_path, mean, std, interpolation)
+        host = preprocess_image(image_path, mean, std, interpolation, resize_scale)
         cuda.copy_host_to_device(bindings[0], host)
         if not context.execute_v2(bindings):
             raise RuntimeError(f"TensorRT execute_v2 returned false at sample {sample_id}")
@@ -192,6 +194,7 @@ def int8_double_pass(
     mean: np.ndarray,
     std: np.ndarray,
     interpolation: int,
+    resize_scale: int,
 ) -> tuple[list[dict[str, object]], float, float]:
     model_dir = WEIGHTS_ROOT / name
     build_summary = json.loads(
@@ -224,10 +227,14 @@ def int8_double_pass(
     bindings = [cuda.malloc(3 * 224 * 224 * 4), cuda.malloc(4), cuda.malloc(4)]
     try:
         started1 = time.time()
-        run1 = int8_pass_once(context, bindings, cuda, rows_in, mean, std, interpolation)
+        run1 = int8_pass_once(
+            context, bindings, cuda, rows_in, mean, std, interpolation, resize_scale
+        )
         elapsed1 = time.time() - started1
         started2 = time.time()
-        run2 = int8_pass_once(context, bindings, cuda, rows_in, mean, std, interpolation)
+        run2 = int8_pass_once(
+            context, bindings, cuda, rows_in, mean, std, interpolation, resize_scale
+        )
         elapsed2 = time.time() - started2
     finally:
         for pointer in bindings:
@@ -252,16 +259,19 @@ def evaluate_one(name: str) -> dict[str, object]:
     mean = np.asarray(meta["mean"], dtype=np.float32).reshape(1, 1, 3)
     std = np.asarray(meta["std"], dtype=np.float32).reshape(1, 1, 3)
     interpolation = INTERPOLATION_CV[str(meta["interpolation"])]
+    resize_scale = int(INPUT_SHAPE[2] // float(meta["crop_pct"]))
     rows_in = evaluation_rows()
 
-    fp32_rows, fp32_elapsed = fp32_pass(name, rows_in, mean, std, interpolation)
+    fp32_rows, fp32_elapsed = fp32_pass(
+        name, rows_in, mean, std, interpolation, resize_scale
+    )
     fp32_top1 = sum(bool(row["correct"]) for row in fp32_rows) / len(fp32_rows)
     fp32_valid = sum(bool(row["valid"]) for row in fp32_rows)
     if fp32_valid != len(fp32_rows):
         raise RuntimeError(f"{name}: FP32 pass produced invalid outputs")
 
     int8_rows, int8_elapsed1, int8_elapsed2 = int8_double_pass(
-        name, rows_in, mean, std, interpolation
+        name, rows_in, mean, std, interpolation, resize_scale
     )
     int8_top1 = sum(bool(row["correct"]) for row in int8_rows) / len(int8_rows)
     agreement = sum(
@@ -291,11 +301,14 @@ def evaluate_one(name: str) -> dict[str, object]:
         "evaluation_manifest_sha256": sha256_file(EVAL_CSV),
         "images": len(rows_in),
         "preprocessing": {
+            "policy": "canonical_aspect_resize_center_crop_v2, RGB, /255, mean/std "
+                      "(identical FP32/INT8)",
             "mean": meta["mean"],
             "std": meta["std"],
             "interpolation": meta["interpolation"],
             "input_size": meta["input_size"],
-            "policy": "square resize 224, RGB, /255, mean/std (identical FP32/INT8)",
+            "crop_pct": meta["crop_pct"],
+            "resize_scale": resize_scale,
         },
         "fp32": {
             "implementation": "torch/timm",
@@ -304,7 +317,9 @@ def evaluate_one(name: str) -> dict[str, object]:
             "predictions_sha256": sha256_file(eval_dir / "fp32_predictions.csv"),
         },
         "int8": {
-            "implementation": "tensorrt-8.6.1-entropy-ptq",
+            "implementation": json.loads(
+                (model_dir / "engine_summary.json").read_text(encoding="utf-8")
+            ).get("precision", "tensorrt-8.6.1"),
             "top1_accuracy": int8_top1,
             "elapsed_seconds_run1": int8_elapsed1,
             "elapsed_seconds_run2": int8_elapsed2,

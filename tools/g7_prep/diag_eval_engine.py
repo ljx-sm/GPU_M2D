@@ -48,6 +48,7 @@ def main() -> int:
     mean = np.asarray(meta["mean"], dtype=np.float32).reshape(1, 1, 3)
     std = np.asarray(meta["std"], dtype=np.float32).reshape(1, 1, 3)
     interpolation = INTERPOLATION_CV[str(meta["interpolation"])]
+    resize_scale = int(224 // float(meta["crop_pct"]))
 
     logger = trt.Logger(trt.Logger.WARNING)
     trt.init_libnvinfer_plugins(logger, "")
@@ -60,7 +61,9 @@ def main() -> int:
     bindings = [cuda.malloc(3 * 224 * 224 * 4), cuda.malloc(4), cuda.malloc(4)]
     rows_in = evaluation_rows()
     try:
-        rows = int8_pass_once(context, bindings, cuda, rows_in, mean, std, interpolation)
+        rows = int8_pass_once(
+            context, bindings, cuda, rows_in, mean, std, interpolation, resize_scale
+        )
     finally:
         for pointer in bindings:
             cuda.free(pointer)
