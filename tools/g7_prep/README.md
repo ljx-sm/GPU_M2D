@@ -108,11 +108,11 @@ high-precision dtype):
 
 | model | recipe beyond base | FP32 | INT8 | loss |
 | --- | --- | --- | --- | --- |
-| resnet50 | none (default: quantize everything quantizable) | 80.61 | 78.50 | 2.11 |
+| resnet50 | none (base recipe) | 80.61 | 78.50 | 2.11 |
 | mobilenetv3_large_100 | `--op_types_to_quantize Conv Gemm MatMul` + HardSwish-output bypass | 75.64 | 75.15 | 0.49 |
 | efficientnet_b0 | `--op_types_to_quantize Conv Gemm MatMul` + SiLU-output bypass | 77.96 | 77.32 | 0.64 |
-| vit_base_patch16_224 | none (default) | 79.41 | 78.22 | 1.19 |
-| deit_small_patch16_224 | none (default) | 80.26 | 78.75 | 1.51 |
+| vit_base_patch16_224 | none (base recipe) | 79.41 | 78.22 | 1.19 |
+| deit_small_patch16_224 | none (base recipe) | 80.26 | 78.75 | 1.51 |
 | swin_tiny_patch4_window7_224 | `--op_types_to_quantize Conv Gemm MatMul --disable_mha_qdq` | 81.63 | 81.17 | 0.46 |
 
 Evidence chain behind the two non-default choices:
@@ -133,6 +133,48 @@ Evidence chain behind the two non-default choices:
   activations restores 91.0 % in TRT. `--disable_mha_qdq` is the
   recipe-level fix (keeps MLP/patch/downsample MatMuls + all weights
   quantized).
+
+### ModelOpt auto-excludes the batch-1 classifier head (GEMV heuristic, all six models)
+
+Found 2026-09-24 during the G7 fault-surface census: the ONE weighted
+op left FP32 in every `model_qdq.onnx` is the classifier-head Gemm —
+in all six models, with NO exclusion flag anywhere in our recipes.
+Cause (ModelOpt 0.47.0, in the isolated venv): `enable_gemv_detection_
+for_trt` is **default-on** (`modelopt/onnx/quantization/int8.py:167`)
+and is NOT exposed as a CLI flag, so our CLI run necessarily carried
+it. `find_nodes_from_matmul_to_exclude` (`graph_utils.py:1413`) drops
+any weighted MatMul/Gemm whose output is rank<3 with a dim==1 into
+`nodes_to_exclude`, and `int8.py:249-251` filters those out of
+`nodes_to_quantize` — "GEMV cannot utilize TensorCores; the perf of
+adding Q/DQ layers is not good in TRT" (a perf heuristic, not a
+precision policy) — **even when Gemm is explicitly requested** via
+`--op_types_to_quantize Conv Gemm MatMul` (mobilenet/effnet/swin do;
+their heads are still FP32). Our exports are fixed batch-1 (the G5
+host contract, step 3), so every head Gemm outputs `(1,1000)` and
+trips the rule.
+
+Verified by counterfactual on the real artifacts (modelopt venv,
+2026-09-24): production-equivalent defaults reproduce the shipped
+`model_qdq.onnx` exactly (QL/DQL 108/108, head weight a raw FP32
+initializer); the single-flag delta `enable_gemv_detection_for_trt=
+False` yields 110/110 with `classifier.fc.weight` behind a
+per-channel DequantizeLinear. That single-flag difference eliminates
+every other candidate cause (op lists, post-processing, adjacency).
+
+Accepted as-is (engines frozen; the losses in the table above were
+measured WITH the FP32 head, so the head is not a damage source, and
+anyone running ModelOpt ONNX PTQ on a batch-1 export gets the same
+graph). Consequences to remember:
+
+- unquantized head-weight bytes: resnet50 8,192,000 (97.1% of its
+  FP32 constant surface; 23.4% of the campaign residency R=34,959,884)
+  / mobilenet, effnet 5,120,000 each (LARGER than their entire INT8
+  backbone) / vit, swin 3,072,000 / deit 1,536,000;
+- the FP32 head is part of the G7 fault surface and one of the
+  explicit-Q/DQ engine's overflow→NaN (DUE) pathways; fatal-surface
+  decompositions are per-model and must be redone for each engine;
+- a fully-quantized-head variant would need the python-API flag above
+  or a batch>1 / dynamic-batch export — out of scope for G7.
 
 ### TRT 8.6.1 graph-compatibility notes (`fix_qdq_for_trt86.py`)
 
