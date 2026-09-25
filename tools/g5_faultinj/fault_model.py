@@ -96,6 +96,41 @@ WORKLOADS = {
              "t": 350},
         ],
     },
+    # G7-v2: ResNet-50/ImageNet-1K on the HEAD-QUANTIZED v2 engine
+    # (user decision 2026-09-24: every weighted op INT8 per-channel,
+    # including the classifier-head Gemm; quantizer wrapper
+    # tools/g7_prep/quantize_g7_qdq_head.py). The BER ladder is the
+    # G5 core ladder for a directly comparable curve.
+    # R was MEASURED by the bootstrap run
+    # artifacts/g7/campaign/run_bootstrap_gpu0_1790310201539047669
+    # (engine sha256 cc516d3afcda...,
+    # snapshot allocations=7, pa_pages=16, rows=20);
+    # L1-L5 frozen by tools/g7_prep/freeze_g7v2_levels.py.
+    # EXTENDED 2026-09-25 (user decision) with L6 3e-6, L7 5e-6,
+    # L8 7e-6, L9 1e-5 by tools/g7_prep/extend_g7v2_levels.py,
+    # derived from the SAME R (engine and bootstrap above still
+    # match -- no re-bootstrap). All B < 3000 so every literal is
+    # an exhaustive-solver literal.
+    "g7v2_imagenet1k_resnet50": {
+        "resident_bytes_nominal": 28_832_268,
+        "levels": [
+            {"level": "L1", "ber": 1e-08, "bits": 2, "s": 2, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-08, "bits": 12, "s": 5, "d": 2, "t": 1},
+            {"level": "L3", "ber": 1e-07, "bits": 23, "s": 8, "d": 3, "t": 3},
+            {"level": "L4", "ber": 5e-07, "bits": 115, "s": 43, "d": 15,
+             "t": 14},
+            {"level": "L5", "ber": 1e-06, "bits": 231, "s": 86, "d": 29,
+             "t": 29},
+            {"level": "L6", "ber": 3e-06, "bits": 692, "s": 260, "d": 87,
+             "t": 86},
+            {"level": "L7", "ber": 5e-06, "bits": 1153, "s": 433, "d": 144,
+             "t": 144},
+            {"level": "L8", "ber": 7e-06, "bits": 1615, "s": 605, "d": 202,
+             "t": 202},
+            {"level": "L9", "ber": 1e-05, "bits": 2307, "s": 865, "d": 289,
+             "t": 288},
+        ],
+    },
 }
 
 DEFAULT_WORKLOAD = "g5_resisc45_resnet50"

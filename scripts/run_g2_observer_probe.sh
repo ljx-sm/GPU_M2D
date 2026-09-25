@@ -57,7 +57,11 @@
 #   [--trials N]        trials of the campaign (default 100)
 #   [--seed N]          campaign RNG seed (default 7)
 #   [--workload NAME]   fault-model workload (g5_resisc45_resnet50 |
-#                       g7_imagenet1k_resnet50)
+#                       g7_imagenet1k_resnet50 | g7v2_imagenet1k_resnet50 --
+#                       the v2 head-quantized engine; run --bootstrap first,
+#                       then freeze its level table with
+#                       tools/g7_prep/freeze_g7v2_levels.py; L6-L9 were
+#                       appended by tools/g7_prep/extend_g7v2_levels.py)
 #   [--bootstrap]       measure-only R run; no --level (see above)
 #   G7 runner passthrough (unset flags keep the G5 defaults byte-identical):
 #   [--engine PATH] [--sample-csv PATH] [--output-root DIR]
