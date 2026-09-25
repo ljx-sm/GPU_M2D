@@ -8,8 +8,11 @@ tables:
 
   - per-image: top-1 change rate / numeric SDC rate / DUE rate
     (binomial 95% CI on the pooled top-1 rate), vs the clean pass;
-  - accuracy vs ground truth (clean vs injected; DUE counted as wrong
-    in the primary number, evaluated-only as the bracket);
+  - accuracy vs ground truth (clean vs injected; the PRIMARY injected
+    accuracy averages only normally-completed trials -- trials aborted
+    by DUE are excluded from the mean entirely and reported through the
+    separate DUE columns (user decision 2026-09-25); DUE-counted-wrong
+    and evaluated-only stay in the per-run dict as brackets);
   - right->wrong vs wrong->right decomposition of top-1 changes;
   - mean |dProbability| over valid outputs;
   - trial-level: P(trial has >=1 top-1 change), P(trial DUE);
@@ -24,8 +27,11 @@ import argparse
 import csv
 import json
 import math
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+import fault_model
 
 PROB_TOL = 1.0e-6
 
@@ -35,12 +41,20 @@ def load_rows(path: Path) -> list[dict]:
         return list(csv.DictReader(source))
 
 
+def run_workload(summary: dict) -> str:
+    """The run's workload; summaries predating the workload parameter
+    (the G5 core campaigns) are g5_resisc45_resnet50 by construction."""
+    return summary.get("workload") or fault_model.DEFAULT_WORKLOAD
+
+
 def analyze_run(run_dir: Path) -> dict | None:
     summary = json.loads((run_dir / "summary.json").read_text())
     level = summary["level"]
     device = summary["device"]
+    workload = run_workload(summary)
     if summary["status"] != "G5_CAMPAIGN_VERIFIED":
         return {"level": level, "device": device, "status": summary["status"],
+                "workload": workload,
                 "failures": summary.get("failures", [])}
 
     clean_rows = load_rows(run_dir / "g1_5_g5_clean_pass.csv")
@@ -57,6 +71,7 @@ def analyze_run(run_dir: Path) -> dict | None:
     n_inj_correct = n_r2w = n_w2r = n_swap = 0
     prob_delta_sum = 0.0
     prob_delta_max = 0.0
+    correct_per_trial: dict[int, int] = defaultdict(int)
     trials_top1 = set()
     trials_due = set()
     for row in img_rows:
@@ -76,6 +91,7 @@ def analyze_run(run_dir: Path) -> dict | None:
         prob_delta_max = max(prob_delta_max, delta)
         if inj == label[image]:
             n_inj_correct += 1
+            correct_per_trial[trial] += 1
         if inj != clean:
             n_top1 += 1
             trials_top1.add(trial)
@@ -90,13 +106,21 @@ def analyze_run(run_dir: Path) -> dict | None:
 
     n_trials = len(trials)
     per_trial_images = images
+    # primary accuracy: mean over the normally-completed trials only (a
+    # DUE trial contributes to the DUE columns, never to the accuracy);
+    # the two bracket conventions below stay available in the dict
+    n_nondue_trials = n_trials - len(trials_due)
+    nondue_correct = sum(count for trial, count in correct_per_trial.items()
+                         if trial not in trials_due)
     return {
         "level": level, "device": device,
-        "status": summary["status"],
+        "status": summary["status"], "workload": workload,
         "trials": n_trials, "images": images,
         "total_images": n_trials * per_trial_images,
         "sites": summary.get("total_sites"),
         "clean_acc": clean_correct / images,
+        "inj_acc_nondue": (nondue_correct / (n_nondue_trials * per_trial_images)
+                           if n_nondue_trials else float("nan")),
         "inj_acc_due_wrong": n_inj_correct / (n_trials * per_trial_images),
         "inj_acc_eval_only": n_inj_correct / n_valid if n_valid else float("nan"),
         "top1": n_top1, "numeric": n_numeric, "invalid": n_invalid,
@@ -130,7 +154,7 @@ def pooled(runs: list[dict]) -> dict:
                          if n_valid else float("nan")),
         "invalid_rate": n_invalid / total_images,
         "acc_clean": sum(r["clean_acc"] for r in runs) / len(runs),
-        "acc_inj": sum(r["inj_acc_due_wrong"] for r in runs) / len(runs),
+        "acc_inj": sum(r["inj_acc_nondue"] for r in runs) / len(runs),
         "r2w_per_1000": sum(r["r2w"] for r in runs) / sum(r["trials"] for r in runs),
         "w2r_per_1000": sum(r["w2r"] for r in runs) / sum(r["trials"] for r in runs),
         "trials_top1": sum(r["trials_top1"] for r in runs),
@@ -149,15 +173,46 @@ def main() -> int:
     parser.add_argument("--min-trials", type=int, default=1,
                         help="skip runs with fewer trials (e.g. 100 keeps "
                              "formal campaigns and drops smoke runs)")
+    parser.add_argument("--workload", default=None,
+                        choices=sorted(fault_model.WORKLOADS),
+                        help="keep only runs of this workload -- REQUIRED "
+                             "(enforced) when a campaign root holds more "
+                             "than one workload's runs (e.g. "
+                             "artifacts/g7/campaign: the v1 and v2 ladders "
+                             "share level names L1..L5 with DIFFERENT BERs, "
+                             "so pooling them silently mixes engines and "
+                             "BER points)")
     args = parser.parse_args()
 
     runs = []
+    skipped_workload = 0
+    seen_workloads: dict[str, int] = {}
     for run_dir in sorted(args.root.glob("run_*")):
         if (run_dir / "summary.json").is_file():
             result = analyze_run(run_dir)
-            if result and result.get("trials", 0) >= args.min_trials:
+            if not result:
+                continue
+            wl = result.get("workload", "?")
+            seen_workloads[wl] = seen_workloads.get(wl, 0) + 1
+            if args.workload and wl != args.workload:
+                skipped_workload += 1
+                continue
+            if result.get("trials", 0) >= args.min_trials:
                 result["dir"] = run_dir.name
                 runs.append(result)
+    if args.workload and skipped_workload:
+        print(f"runs of other workloads skipped: {skipped_workload}")
+    if args.workload is None and len(seen_workloads) > 1:
+        # fail-closed: level names collide at DIFFERENT BERs across
+        # workloads, so pooling a whole root silently mixes engines and
+        # BER points (the help text always required --workload here; the
+        # code now refuses instead of trusting the caller)
+        detail = ", ".join(f"{w} ({n} runs)"
+                           for w, n in sorted(seen_workloads.items()))
+        print(f"REFUSING to pool {args.root}: runs of multiple workloads "
+              f"({detail}); their level names collide at different BERs. "
+              "Pass --workload explicitly.", file=sys.stderr)
+        return 2
 
     by_level: dict[str, list[dict]] = defaultdict(list)
     for run in runs:
@@ -186,14 +241,16 @@ def main() -> int:
                   f" {run['numeric_rate']*100:8.3f}%"
                   f" {run['invalid_rate']*100:5.3f}%"
                   f" {run['clean_acc']*100:7.2f}%"
-                  f" {run['inj_acc_due_wrong']*100:6.2f}%"
+                  f" {run['inj_acc_nondue']*100:6.2f}%"
                   f" {run['r2w']:3}/{run['w2r']:<3}"
                   f" {run['mean_dprob']:8.5f}"
                   f" {run['trials_top1']:5}/{run['trials']:3}"
                   f" {run['trials_due']:4}/{run['trials']:3}")
 
+    devices = sorted({r["device"] for r in runs})
     print()
-    print("pooled per level (3 cards):")
+    print(f"pooled per level ({len(devices)} card"
+          f"{'s' if len(devices) != 1 else ''}):")
     print(f"{'lvl':3} {'trials':6} {'top1 rate [95% CI]':>24} "
           f"{'numeric%':>9} {'DUE%':>6} {'cleanAcc':>8} {'injAcc':>7} "
           f"{'mean|dP|':>8} {'P(trial top1)':>13} {'P(trial DUE)':>12}")
@@ -213,15 +270,19 @@ def main() -> int:
               f" {p['trials_top1']/p['trials']*100:12.1f}%"
               f" {p['trials_due']/p['trials']*100:11.1f}%")
 
-    print()
-    print("card spread (max-min across cards, top-1 rate in pp):")
+    spread_lines = []
     for level in sorted(by_level):
         good = [r for r in by_level[level]
                 if r["status"] == "G5_CAMPAIGN_VERIFIED"]
         if len(good) == 3:
             rates = [r["top1_rate"] * 100 for r in good]
-            print(f"  {level}: {max(rates) - min(rates):.4f} pp "
-                  f"({', '.join(f'{x:.4f}' for x in rates)})")
+            spread_lines.append(f"  {level}: {max(rates) - min(rates):.4f} pp "
+                                f"({', '.join(f'{x:.4f}' for x in rates)})")
+    if spread_lines:
+        print()
+        print("card spread (max-min across cards, top-1 rate in pp):")
+        for line in spread_lines:
+            print(line)
 
     print()
     print("restore echoes (allocation-level, summed over runs):")
