@@ -533,6 +533,15 @@ def write_merged_csv(path: Path, fields: list[str], rows: list[list[str]],
         writer.writerows(rows)
 
 
+def sha256_if_present(path: Path) -> str:
+    """Hash of an OPTIONAL level artifact: a level whose every segment
+    died mid-trial has no final va-pa map at all (the closing ledger
+    only runs on a clean exit), and the summary must record that as an
+    empty hash instead of dying -- the per-segment evidence lives in
+    segment_details regardless."""
+    return sha256(path) if path.is_file() else ""
+
+
 def merge_campaign_outputs(level_dir: Path, segments: list[dict],
                            args: argparse.Namespace, images_total: int
                            ) -> dict:
@@ -614,13 +623,20 @@ def merge_campaign_outputs(level_dir: Path, segments: list[dict],
     if len(set(seen)) != len(seen):
         raise RuntimeError("merged trial_index values are not unique")
 
-    # shared-evidence files come from segment 0 (fresh process each
-    # segment: its own registry/maps/clean pass; the summary's
-    # segment_details carries every segment's own paths and hashes)
+    # shared-evidence files come from the FIRST segment that has each
+    # file (fresh process each segment: its own registry/maps/clean
+    # pass; the summary's segment_details carries every segment's own
+    # paths and hashes). A crashed segment never wrote its FINAL va-pa
+    # map -- the process died before the closing ledger ran -- so the
+    # final map comes from the first cleanly-finished segment, while
+    # the gate map / clean pass / registry, which every segment writes
+    # before the campaign gate, still come from segment 0.
     for name in standard_names[len(MERGE_CSV_SPECS):]:
-        source = segments[0]["dir"] / name
-        if source.is_file():
-            os.link(source, level_dir / name)
+        for segment in segments:
+            source = segment["dir"] / name
+            if source.is_file():
+                os.link(source, level_dir / name)
+                break
     with (level_dir / "harness.log").open("w", encoding="utf-8") as sink:
         for segment in segments:
             sink.write(f"===== {segment['dir'].name} "
@@ -1678,9 +1694,10 @@ def run_once(args: argparse.Namespace) -> int:
         "clean_pass_output": str(clean_output),
         "clean_pass_sha256": sha256(clean_output),
         "map_output": str(level_dir / "gpu_va_pa_map.csv"),
-        "map_output_sha256": sha256(level_dir / "gpu_va_pa_map.csv"),
+        "map_output_sha256": sha256_if_present(level_dir / "gpu_va_pa_map.csv"),
         "map_gate_output": str(level_dir / "gpu_va_pa_map_gate.csv"),
-        "map_gate_output_sha256": sha256(level_dir / "gpu_va_pa_map_gate.csv"),
+        "map_gate_output_sha256": sha256_if_present(
+            level_dir / "gpu_va_pa_map_gate.csv"),
         "contract_sha256": contract_hash,
         "nvidia_module_sha256": contract["nvidia_module_sha256"],
         "nvidia_uvm_module_sha256": contract["nvidia_uvm_module_sha256"],
@@ -2101,6 +2118,15 @@ def self_test() -> int:
                              CLEAN_PASS_FIELDS,
                              [["0", "a.jpg", "7", "7", "0.5"],
                               ["1", "b.jpg", "7", "7", "0.5"]])
+        # a crashed segment wrote only its GATE map (the FINAL map needs
+        # a clean exit -- the closing ledger never ran); the clean
+        # segment wrote both. Regression for the 2026-09-28 L2 chain
+        # abort: the level's final map must come from the first CLEAN
+        # segment, and hashing the level's maps for the summary extras
+        # must never raise on the crashed-first-segment shape.
+        (seg0_dir / "gpu_va_pa_map_gate.csv").write_text("gate-map-0\n")
+        (seg1_dir / "gpu_va_pa_map_gate.csv").write_text("gate-map-1\n")
+        (seg1_dir / "gpu_va_pa_map.csv").write_text("final-map-1\n")
         merge_args = argparse.Namespace(trials=7, device=0, seed=7)
         segments = [
             {"segment": 0, "dir": seg0_dir, "name": "s0", "seed": 7,
@@ -2127,6 +2153,13 @@ def self_test() -> int:
                                     SITE_RESULT_FIELDS)
         assert {row[5].split("-")[0] for row in site_rows} == \
             {f"t{i:03d}" for i in [0, 1, 3, 4, 5, 6]}
+        assert (level_dir / "gpu_va_pa_map.csv").read_text() == \
+            "final-map-1\n"  # donor = first segment that HAS the file
+        assert (level_dir / "gpu_va_pa_map_gate.csv").read_text() == \
+            "gate-map-0\n"  # every segment has the gate map -> segment 0
+        assert sha256_if_present(level_dir / "gpu_va_pa_map.csv") == \
+            sha256(seg1_dir / "gpu_va_pa_map.csv")
+        assert sha256_if_present(level_dir / "never-written.csv") == ""
         detail = json.loads((level_dir / "work_detail.json").read_text())
         assert detail["trials"] == 7 and len(detail["segments"]) == 2
         assert len(detail["sites"]) == 7 * level["bits"]

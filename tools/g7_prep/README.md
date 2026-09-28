@@ -312,7 +312,15 @@ tail is dropped at merge — those slots were re-sampled).
 carries `process_fatal_trials`/`process_fatal_count`/`segments`;
 `analyze_campaign.py` prints the per-run `pf` column and the pooled
 P(trial crash) reliability column. Every other death shape fails the
-level closed (exit 2).
+level closed (exit 2). Merge provenance note (fixed after the first
+L2 chain abort, 2026-09-28): a crashed segment never writes its FINAL
+va-pa map (the closing ledger only runs on a clean exit), so the level
+directory takes each shared-evidence file from the first segment that
+actually has it, and the summary hashes optional level artifacts as
+"" instead of raising -- the first efficientnet L2 restart proved the
+protocol end-to-end (trial-91 PROCESS_FATAL, segment_001 finished the
+remaining 8 trials, merge + verification clean) and then died on
+exactly this bookkeeping gap.
 
 **Host-image cache (same day).** Each restart segment's prelude
 re-preprocessed the 10K ImageNet pass on the host (~3 min CPU), which
