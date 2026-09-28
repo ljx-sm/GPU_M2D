@@ -78,6 +78,46 @@ WORKLOAD_SUBTITLES = {
         "100 trials × 10,000 images per level; DUE-aborted trials excluded "
         "from the mean (DUE rate reported separately);\n"
         "error bars: 95% CI over the averaged trials"),
+    "g7v2_imagenet1k_mobilenetv3_large_100": (
+        "MobileNetV3-Large-100 (INT8 PTQ, explicit Q/DQ, head quantized, "
+        "TensorRT) on the ImageNet-1K 10,000-image eval split\n"
+        "NVIDIA GeForce RTX 4090 — GDDR6X device-memory bit flips "
+        "(SBU 60% / MCU 40% event mix)\n"
+        "100 trials × 10,000 images per level; DUE-aborted trials excluded "
+        "from the mean (DUE rate reported separately);\n"
+        "error bars: 95% CI over the averaged trials"),
+    "g7v2_imagenet1k_efficientnet_b0": (
+        "EfficientNet-B0 (INT8 PTQ, explicit Q/DQ, head quantized, "
+        "TensorRT) on the ImageNet-1K 10,000-image eval split\n"
+        "NVIDIA GeForce RTX 4090 — GDDR6X device-memory bit flips "
+        "(SBU 60% / MCU 40% event mix)\n"
+        "100 trials × 10,000 images per level; DUE-aborted trials excluded "
+        "from the mean (DUE rate reported separately);\n"
+        "error bars: 95% CI over the averaged trials"),
+    "g7v2_imagenet1k_vit_base_patch16_224": (
+        "ViT-Base/16 (INT8 PTQ, explicit Q/DQ, head quantized, TensorRT) "
+        "on the ImageNet-1K 10,000-image eval split\n"
+        "NVIDIA GeForce RTX 4090 — GDDR6X device-memory bit flips "
+        "(SBU 60% / MCU 40% event mix)\n"
+        "100 trials × 10,000 images per level; DUE-aborted trials excluded "
+        "from the mean (DUE rate reported separately);\n"
+        "error bars: 95% CI over the averaged trials"),
+    "g7v2_imagenet1k_deit_small_patch16_224": (
+        "DeiT-Small/16 (INT8 PTQ, explicit Q/DQ, head quantized, TensorRT) "
+        "on the ImageNet-1K 10,000-image eval split\n"
+        "NVIDIA GeForce RTX 4090 — GDDR6X device-memory bit flips "
+        "(SBU 60% / MCU 40% event mix)\n"
+        "100 trials × 10,000 images per level; DUE-aborted trials excluded "
+        "from the mean (DUE rate reported separately);\n"
+        "error bars: 95% CI over the averaged trials"),
+    "g7v2_imagenet1k_swin_tiny_patch4_window7_224": (
+        "Swin-Tiny (INT8 PTQ, explicit Q/DQ, head quantized, TensorRT) "
+        "on the ImageNet-1K 10,000-image eval split\n"
+        "NVIDIA GeForce RTX 4090 — GDDR6X device-memory bit flips "
+        "(SBU 60% / MCU 40% event mix)\n"
+        "100 trials × 10,000 images per level; DUE-aborted trials excluded "
+        "from the mean (DUE rate reported separately);\n"
+        "error bars: 95% CI over the averaged trials"),
 }
 
 

@@ -131,6 +131,90 @@ WORKLOADS = {
              "t": 288},
         ],
     },
+    # G7-v2 five-model extension (user decision 2026-09-27): the SAME v2
+    # head-quantized INT8 engine family, protocol, and settings as the
+    # ResNet-50 campaign above, on the other five G7 engines; seven-level
+    # ladder L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5 (the
+    # ResNet-50 curve's L3-L9 BERs). The five entries below are
+    # PLACEHOLDERS: each R is MEASURED by that engine's own bootstrap run
+    # and then frozen in place by tools/g7_prep/freeze_g7v2_workload.py
+    # (which refuses to silently re-freeze). Until then
+    # resident_bytes_nominal stays 0 with all-zero literals --
+    # assert_frozen_levels refuses the workload (fail-closed: no campaign
+    # can run on an unfrozen table; only --bootstrap, which never samples,
+    # accepts it) and self_test skips it.
+    "g7v2_imagenet1k_mobilenetv3_large_100": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # PLACEHOLDER (R unfrozen) -- fill via
+    # tools/g7_prep/freeze_g7v2_workload.py after this engine's
+    # --bootstrap run.
+    "g7v2_imagenet1k_efficientnet_b0": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # PLACEHOLDER (R unfrozen) -- fill via
+    # tools/g7_prep/freeze_g7v2_workload.py after this engine's
+    # --bootstrap run.
+    "g7v2_imagenet1k_vit_base_patch16_224": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # PLACEHOLDER (R unfrozen) -- fill via
+    # tools/g7_prep/freeze_g7v2_workload.py after this engine's
+    # --bootstrap run.
+    "g7v2_imagenet1k_deit_small_patch16_224": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # PLACEHOLDER (R unfrozen) -- fill via
+    # tools/g7_prep/freeze_g7v2_workload.py after this engine's
+    # --bootstrap run.
+    "g7v2_imagenet1k_swin_tiny_patch4_window7_224": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
 }
 
 DEFAULT_WORKLOAD = "g5_resisc45_resnet50"
@@ -598,8 +682,13 @@ def _fixture() -> tuple[list[dict], dict[int, list[int]]]:
 def self_test() -> int:
     import tempfile
 
-    # every workload's frozen table matches its derivation rule
+    # every workload's frozen table matches its derivation rule; unfrozen
+    # PLACEHOLDERS (R=0, awaiting their own bootstrap measurement) are
+    # skipped HERE only -- assert_frozen_levels still refuses them when
+    # asked, so no campaign can ever run on a placeholder table
     for workload_name in WORKLOADS:
+        if WORKLOADS[workload_name]["resident_bytes_nominal"] == 0:
+            continue
         assert_frozen_levels(workload_name)
     assert resolve_composition(8) == (3, 1, 1)  # exact 60/20/20 block
     assert resolve_composition(2) == (2, 0, 0)
