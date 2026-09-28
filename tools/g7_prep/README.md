@@ -323,9 +323,13 @@ SHA-256(sample CSV content + preprocessing spec + image count + tensor
 size + the runner binary itself); the key, header fields, and blob
 checksum are all verified on load, and ANY miss/mismatch/I-O error
 falls back to fresh preprocessing and rewrites the file (pure
-optimization, zero effect on the gated window or trial semantics — the
-cache is shared by every workload with the same CSV + spec, so all
-five models reuse one file). SHA-256 is a self-contained FIPS
-implementation verified against the standard known-answer vectors
-("", "abc", 1M×'a'). A relaunch now costs ~1.5 min (observer + snapshot
-+ clean pass) instead of ~4.5.
+optimization, zero effect on the gated window or trial semantics).
+The key includes the FULL preprocessing spec, and the five extension
+models do NOT share one — three distinct specs exist (verified against
+model_meta.json): mobilenet/efficientnet 256 + ImageNet mean/std,
+deit/swin 248 + ImageNet, vit 248 + 0.5-mean (ResNet-50's 235 is a
+fourth, already complete). Each spec gets its own ~5.6 GiB file, ~17
+GiB total. SHA-256 is a self-contained FIPS implementation verified
+against the standard known-answer vectors ("", "abc", 1M×'a'). A
+relaunch now costs ~1.5 min (observer + snapshot + clean pass) instead
+of ~4.5.
