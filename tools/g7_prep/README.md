@@ -189,3 +189,61 @@ graph). Consequences to remember:
   reduce-over-all-dims (swin 81.63→0.51 top-1). Correct fix: restore
   the attribute AND downgrade the graph opset to 17 (the original
   export's form) — legal, and TRT 8.6 imports it natively.
+
+## G7-v2 fault-surface scoping — MobileNetV3 only (2026-09-27, user decision)
+
+**Incident.** The first MobileNetV3 L1 campaign (seed 7) aborted on
+trial 0 with `GPU_M2D_G1_5_FAIL: synchronize inference stream failed:
+an illegal memory access`; two diagnostic reruns (seeds 8, 10) died the
+same way after 40 / 14 trials. Offline re-sampling reproduced every
+crash site exactly.
+
+**Root cause (proven, 3/3 runs).** `trt-internal-5` (246,272 B, one of
+the two `create_execution_context`-phase TRT private buffers, 2.64 % of
+R = 9,336,232 B) holds device-resident per-kernel execution parameters.
+A flip at an address-bearing offset (observed fatal: 19 / 93,034 /
+~121.6 K) corrupts a kernel argument → CUDA illegal memory access on
+the FIRST injected inference → runner process death. Benign offsets
+(observed: 100.2 K / 223 K / 228 K — scalar arguments) complete and
+restore normally (seed 8 trials 6/16/37 each took 2 internal-5 hits and
+survived). Every flip in the weights (`trt-internal-0`), scratch
+(`trt-internal-7`), deserialize constants (`trt-internal-1/2/4`), and
+the input binding survived and restored across all runs. Aggregate
+internal-5 hit rate matched the event-based prediction exactly (0.2
+bits/trial; 10.9 % of trials) — the sampler is behaving, the buffer is
+simply process-fatal to hit. ResNet-50's counterpart buffer was
+22,528 B (0.08 % of its R) and never fatal over 900 trials / ~230 K
+sites, which is why the problem only surfaced now.
+
+**Decision (user, 2026-09-27).** Shrink the injection surface for THIS
+workload only: exclude the two ctx-phase TRT private control-state
+allocations (`trt-internal-5` 246,272 B + `trt-internal-6` 2,048 B =
+248,320 B = 2.66 % of R). They are runtime control state, not model
+data; corrupting them measures a process-fatal reliability event, not
+an output-observable fault, and at L4+ the full surface makes
+P(fatal per trial) → 1 (no campaign possible). ResNet-50 stays as run
+(no re-run needed); the remaining four extension models keep
+FULL-surface injection until they individually show the same failure
+(一个一个来 — no blanket policy). The full-surface protocol remains
+the control experiment for the paper appendix: the shrink rationale
+(this section) plus the three diagnostic run dirs
+(`artifacts/g7/campaign/run_L1_gpu0_*`, 2026-09-27) are the evidence.
+
+**Mechanics.** The scoping lives in the frozen workload entry:
+`surface_excludes: ("trt-internal-5", "trt-internal-6")` +
+`resident_bytes_nominal` = the INJECTION SURFACE R = 9,087,912 B
+(full 9,336,232 − 248,320). `fault_model.surface_rows_for()` is the
+single filter point (sampling in `sample_campaign`, the residency
+guard and work_detail/summary echo in `run_g5_campaign.py` all go
+through it; bootstrap records keep the FULL measured R).
+`freeze_g7v2_workload.py` derives R_eff from the bootstrap's
+`g1_5_allocations.csv` (fail-closed: sizes must reconcile with the
+measured R) and refuses any silent re-freeze — this re-freeze went
+through an explicit placeholder reset.
+
+**Ladder shift** (BERs unchanged; bits = BER × R_eff × 8):
+L1 7→7, L2 37→36, L3 75→73, L4 224→218, L5 373→364, L6 523→509,
+L7 747→727. Final surface: weights `trt-internal-0` 6,414,240 B
+(70.6 %) + deserialize constants `trt-internal-1/2/3/4` 246,272 B
+(2.7 %) + scratch `trt-internal-7` 1,825,280 B (20.1 %) + input
+binding 602,112 B (6.6 %) + prob/index 8 B.

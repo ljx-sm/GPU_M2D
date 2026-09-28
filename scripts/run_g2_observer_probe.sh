@@ -66,7 +66,9 @@
 #                       tools/g7_prep/freeze_g7v2_levels.py (resnet50;
 #                       L6-L9 appended by extend_g7v2_levels.py) or
 #                       tools/g7_prep/freeze_g7v2_workload.py (five-model
-#                       extension, seven-level ladder 1e-7 .. 1e-5))
+#                       extension, seven-level ladder 1e-7 .. 1e-5);
+#                       mobilenetv3's frozen R is its EXCLUSION-scoped
+#                       injection surface -- fault_model.surface_rows_for)
 #   [--bootstrap]       measure-only R run; no --level (see above)
 #   G7 runner passthrough (unset flags keep the G5 defaults byte-identical):
 #   [--engine PATH] [--sample-csv PATH] [--output-root DIR]

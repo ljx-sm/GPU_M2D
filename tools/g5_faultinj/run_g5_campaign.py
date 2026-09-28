@@ -796,7 +796,26 @@ def run_once(args: argparse.Namespace) -> int:
         # The frozen level table is derived from R: the live snapshot's
         # resident-byte total must equal the nominal R or the campaign
         # refuses (fail-closed) -- the table must be re-derived instead.
+        # For a workload with surface_excludes (runtime CONTROL state
+        # proven process-fatal, not output-observable) the frozen R is
+        # the EXCLUSION-FILTERED total, so the guard below and the
+        # sampler both work on the injection surface, never the raw
+        # residency; bootstrap records keep the FULL measured R.
         resident_bytes = resident_bytes_of(result.rows)
+        surface_rows = fault_model.surface_rows_for(args.workload,
+                                                    result.rows)
+        surface_bytes = resident_bytes_of(surface_rows)
+        excludes = workload_entry.get("surface_excludes", ())
+        if excludes:
+            extra.update({
+                "surface_excludes": list(excludes),
+                "surface_resident_bytes": surface_bytes,
+                "excluded_resident_bytes": resident_bytes - surface_bytes,
+            })
+            print(f"fault surface: excluding {', '.join(excludes)} "
+                  f"({resident_bytes - surface_bytes:,} B of "
+                  f"{resident_bytes:,} B); injection surface "
+                  f"{surface_bytes:,} B")
 
         if args.bootstrap:
             # measure-only: record this engine's live R so its workload's
@@ -849,17 +868,17 @@ def run_once(args: argparse.Namespace) -> int:
             })
             raise _BootstrapComplete()
 
-        if resident_bytes != r_nominal:
+        if surface_bytes != r_nominal:
             raise RuntimeError(
-                f"snapshot residency {resident_bytes} bytes != frozen "
-                f"R {r_nominal} of workload {args.workload} -- the level "
-                "table must be re-derived (docs/G5_FAULT_MODEL.md §5)")
+                f"snapshot injection-surface residency {surface_bytes} bytes "
+                f"!= frozen R {r_nominal} of workload {args.workload} -- the "
+                "level table must be re-derived (docs/G5_FAULT_MODEL.md §5)")
 
         anchors = fault_model.load_anchors(args.table)
         anchor_pages = len(anchors)
         print(f"anchors: {anchor_pages} pages with valid consensus masks")
         campaign = fault_model.sample_campaign(
-            args.level, args.trials, result.rows, anchors, args.seed,
+            args.level, args.trials, surface_rows, anchors, args.seed,
             resident_bytes_expected=r_nominal, workload=args.workload)
         model_failures = verify_work_model(level, campaign)
         if model_failures:
@@ -870,7 +889,7 @@ def run_once(args: argparse.Namespace) -> int:
               f"B={level['bits']} (s,d,t)=({level['s']},{level['d']},"
               f"{level['t']}), {args.trials} trials, {total_sites} sites")
         fault_model.write_work_csv(work_output, campaign)
-        work_detail_output.write_text(json.dumps({
+        work_detail = {
             "schema": "gpu-m2d.g5.campaign.work.v1",
             "run_id": run_id,
             "device": args.device,
@@ -884,7 +903,12 @@ def run_once(args: argparse.Namespace) -> int:
                                         level["t"]],
             "snapshot_manifest": result.manifest,
             "sites": [site for sites in campaign for site in sites],
-        }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        }
+        if excludes:
+            work_detail["surface_excludes"] = list(excludes)
+            work_detail["surface_resident_bytes"] = surface_bytes
+        work_detail_output.write_text(json.dumps(
+            work_detail, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.chmod(work_output, 0o644)
         os.chmod(work_detail_output, 0o644)
 

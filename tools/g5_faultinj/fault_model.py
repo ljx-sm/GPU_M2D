@@ -43,7 +43,12 @@ from pathlib import Path
 # frozen level tables, one per workload (docs/G5_FAULT_MODEL.md §5 for the
 # G5 table; each G7 workload's R is MEASURED by a bootstrap run of that
 # engine and only then frozen here -- the campaign residency guard refuses
-# any live snapshot that disagrees with the frozen R)
+# any live snapshot that disagrees with the frozen R). A workload may
+# additionally declare surface_excludes (allocation_ids held OUT of the
+# injection surface after diagnostic runs proved their corruption is
+# process-fatal, not output-observable); its frozen R is then the
+# EXCLUSION-FILTERED total and sampling/guards go through
+# surface_rows_for below.
 # ---------------------------------------------------------------------------
 
 WORKLOADS = {
@@ -131,28 +136,51 @@ WORKLOADS = {
              "t": 288},
         ],
     },
-    # G7-v2 five-model extension (user decision 2026-09-27): the SAME v2
-    # head-quantized INT8 engine family, protocol, and settings as the
-    # ResNet-50 campaign above, on the other five G7 engines; seven-level
-    # ladder L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5 (the
-    # ResNet-50 curve's L3-L9 BERs). The five entries below are
-    # PLACEHOLDERS: each R is MEASURED by that engine's own bootstrap run
-    # and then frozen in place by tools/g7_prep/freeze_g7v2_workload.py
-    # (which refuses to silently re-freeze). Until then
-    # resident_bytes_nominal stays 0 with all-zero literals --
-    # assert_frozen_levels refuses the workload (fail-closed: no campaign
-    # can run on an unfrozen table; only --bootstrap, which never samples,
-    # accepts it) and self_test skips it.
+    # G7-v2 five-model extension (user decision 2026-09-27):
+    # MobileNetV3-Large-100/ImageNet-1K on the SAME head-quantized v2 INT8
+    # engine family as g7v2_imagenet1k_resnet50 (every weighted
+    # op INT8 per-channel, classifier head included); seven-level
+    # ladder L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5
+    # (the ResNet-50 curve's L3-L9 BERs).
+    # The bootstrap run
+    # artifacts/g7/campaign/run_bootstrap_gpu0_1790566515139607618
+    # (engine /data1/luojx/g7_models/mobilenetv3_large_100/clean.engine,
+    # sha256 860f36c1ff3b..., snapshot allocations=11, pa_pages=6, rows=14)
+    # measured the FULL residency R=9,336,232 B.
+    # FAULT-SURFACE SCOPING (user decision 2026-09-27, this
+    # workload only): the create_execution_context-phase TRT
+    # private control-state allocation(s)
+    # trt-internal-5, trt-internal-6 (248,320 B total) are
+    # EXCLUDED from the injection surface -- the 2026-09-27
+    # three-seed diagnostic L1 runs proved flips at
+    # address-bearing offsets there kill the runner process
+    # (CUDA illegal memory access on the first injected
+    # inference: a process-fatal reliability event, not an
+    # output-observable fault), while flips in the weights,
+    # scratch, deserialize constants, and input binding all
+    # survived and restored. The frozen R below is the
+    # INJECTION SURFACE 9,336,232 - 248,320 =
+    # 9,087,912 B; full-surface injection remains the
+    # control experiment (paper appendix), and every other
+    # workload keeps full-surface injection. The seven levels
+    # are derived from this surface R; every literal is an
+    # EXHAUSTIVE-solver literal. Frozen in place by
+    # tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_mobilenetv3_large_100": {
-        "resident_bytes_nominal": 0,
+        "resident_bytes_nominal": 9_087_912,
+        "surface_excludes": ("trt-internal-5", "trt-internal-6"),
         "levels": [
-            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L1", "ber": 1e-07, "bits": 7, "s": 2, "d": 1, "t": 1},
+            {"level": "L2", "ber": 5e-07, "bits": 36, "s": 14, "d": 5, "t": 4},
+            {"level": "L3", "ber": 1e-06, "bits": 73, "s": 28, "d": 9, "t": 9},
+            {"level": "L4", "ber": 3e-06, "bits": 218, "s": 83, "d": 27,
+             "t": 27},
+            {"level": "L5", "ber": 5e-06, "bits": 364, "s": 137, "d": 46,
+             "t": 45},
+            {"level": "L6", "ber": 7e-06, "bits": 509, "s": 191, "d": 63,
+             "t": 64},
+            {"level": "L7", "ber": 1e-05, "bits": 727, "s": 272, "d": 91,
+             "t": 91},
         ],
     },
     # PLACEHOLDER (R unfrozen) -- fill via
@@ -328,6 +356,24 @@ def level_by_name(name: str, workload: str = DEFAULT_WORKLOAD) -> dict:
             return entry
     raise ModelError(f"unknown level {name} in workload {workload}; expected "
                      f"one of {[e['level'] for e in levels]}")
+
+
+def surface_rows_for(workload: str, snapshot_rows: list[dict]) -> list[dict]:
+    """Snapshot rows restricted to the workload's INJECTION SURFACE: the
+    full dual-addressing residency minus the workload's surface_excludes
+    allocations. Those are runtime CONTROL state (TensorRT
+    create_execution_context-phase private buffers) whose corruption is
+    PROCESS-FATAL rather than output-observable -- a workload declares the
+    field only after diagnostic runs proved that failure mode (see the
+    entry that uses it); every other workload keeps the FULL residency
+    (the G5/G7 protocol default: inject everywhere resident). The frozen
+    R of a scoped workload is the surface total, so residency guards must
+    compare against THIS function's output, never the raw snapshot."""
+    excludes = set(workload_by_name(workload).get("surface_excludes", ()))
+    if not excludes:
+        return snapshot_rows
+    return [row for row in snapshot_rows
+            if row["allocation_id"] not in excludes]
 
 
 # ---------------------------------------------------------------------------
@@ -592,10 +638,14 @@ def sample_campaign(level_name: str, trials: int, snapshot_rows: list[dict],
                     resident_bytes_expected: int | None = None,
                     workload: str = DEFAULT_WORKLOAD,
                     ) -> list[list[dict]]:
-    """The full work list for one campaign (level, N trials, one seed)."""
+    """The full work list for one campaign (level, N trials, one seed).
+    Sampling draws from the workload's INJECTION SURFACE only
+    (surface_rows_for: full residency minus the workload's
+    surface_excludes control-state allocations); resident_bytes_expected
+    is the SURFACE total that the frozen table was derived from."""
     assert_frozen_levels(workload)
     level = level_by_name(level_name, workload)
-    index = ResidencyIndex(snapshot_rows)
+    index = ResidencyIndex(surface_rows_for(workload, snapshot_rows))
     if resident_bytes_expected is not None and \
             index.total_bytes != resident_bytes_expected:
         raise ModelError(
@@ -788,6 +838,21 @@ def self_test() -> int:
         raise AssertionError("residency mismatch must refuse")
     except ModelError:
         pass
+
+    # fault-surface scoping: a workload with surface_excludes never
+    # samples those allocations (and never aliases the caller's list);
+    # a workload without the field keeps the FULL residency, identity
+    fake_rows = [{"allocation_id": "trt-internal-0"},
+                 {"allocation_id": "trt-internal-5"},
+                 {"allocation_id": "trt-internal-6"},
+                 {"allocation_id": "trt-internal-7"}]
+    for workload_name, entry in WORKLOADS.items():
+        excludes = set(entry.get("surface_excludes", ()))
+        scoped = surface_rows_for(workload_name, fake_rows)
+        assert [r["allocation_id"] for r in scoped] == \
+            [r["allocation_id"] for r in fake_rows
+             if r["allocation_id"] not in excludes]
+        assert (scoped is fake_rows) == (not excludes)
 
     print("g5 fault model self-test: PASS")
     return 0
