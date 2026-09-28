@@ -232,19 +232,39 @@ WORKLOADS = {
             {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
         ],
     },
-    # PLACEHOLDER (R unfrozen) -- fill via
-    # tools/g7_prep/freeze_g7v2_workload.py after this engine's
-    # --bootstrap run.
+    # G7-v2 five-model extension (user decision 2026-09-27):
+    # DeiT-Small/16/ImageNet-1K on the SAME head-quantized v2 INT8
+    # engine family as g7v2_imagenet1k_resnet50 (every weighted
+    # op INT8 per-channel, classifier head included); seven-level
+    # ladder L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5
+    # (the ResNet-50 curve's L3-L9 BERs).
+    # R was MEASURED by the
+    # bootstrap run
+    # artifacts/g7/campaign/run_bootstrap_gpu0_1790614692011387809
+    # (engine /data1/luojx/g7_models/deit_small_patch16_224/clean.engine,
+    # sha256 f226170b14ae...,
+    # snapshot allocations=8, pa_pages=14, rows=19)
+    # and the seven levels derived from it; every literal is an
+    # EXHAUSTIVE-solver literal (bits past the 3000-bit windowed
+    # threshold were forced exhaustive at freeze time and
+    # cross-checked against the windowed path). Frozen in place
+    # by tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_deit_small_patch16_224": {
-        "resident_bytes_nominal": 0,
+        "resident_bytes_nominal": 26_010_832,
         "levels": [
-            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L1", "ber": 1e-07, "bits": 21, "s": 8, "d": 2, "t": 3},
+            {"level": "L2", "ber": 5e-07, "bits": 104, "s": 39, "d": 13,
+             "t": 13},
+            {"level": "L3", "ber": 1e-06, "bits": 208, "s": 78, "d": 26,
+             "t": 26},
+            {"level": "L4", "ber": 3e-06, "bits": 624, "s": 234, "d": 78,
+             "t": 78},
+            {"level": "L5", "ber": 5e-06, "bits": 1040, "s": 390, "d": 130,
+             "t": 130},
+            {"level": "L6", "ber": 7e-06, "bits": 1457, "s": 547, "d": 182,
+             "t": 182},
+            {"level": "L7", "ber": 1e-05, "bits": 2081, "s": 781, "d": 260,
+             "t": 260},
         ],
     },
     # PLACEHOLDER (R unfrozen) -- fill via
