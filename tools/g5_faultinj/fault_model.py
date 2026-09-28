@@ -189,45 +189,32 @@ WORKLOADS = {
     # op INT8 per-channel, classifier head included); seven-level
     # ladder L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5
     # (the ResNet-50 curve's L3-L9 BERs).
-    # The bootstrap run
+    # R was MEASURED by the
+    # bootstrap run
     # artifacts/g7/campaign/run_bootstrap_gpu0_1790587477121124681
     # (engine /data1/luojx/g7_models/efficientnet_b0/clean.engine,
-    # sha256 fad423ace879..., snapshot allocations=8, pa_pages=10, rows=15)
-    # measured the FULL residency R=17,144,232 B.
-    # FAULT-SURFACE SCOPING (user decision 2026-09-27, this
-    # workload only): the create_execution_context-phase TRT
-    # private control-state allocation(s)
-    # trt-internal-2, trt-internal-3, trt-internal-4 (9,944,064 B total) are
-    # EXCLUDED from the injection surface -- the 2026-09-27
-    # three-seed diagnostic L1 runs proved flips at
-    # address-bearing offsets there kill the runner process
-    # (CUDA illegal memory access on the first injected
-    # inference: a process-fatal reliability event, not an
-    # output-observable fault), while flips in the weights,
-    # scratch, deserialize constants, and input binding all
-    # survived and restored. The frozen R below is the
-    # INJECTION SURFACE 17,144,232 - 9,944,064 =
-    # 7,200,168 B; full-surface injection remains the
-    # control experiment (paper appendix), and every other
-    # workload keeps full-surface injection. The seven levels
-    # are derived from this surface R; every literal is an
-    # EXHAUSTIVE-solver literal. Frozen in place by
-    # tools/g7_prep/freeze_g7v2_workload.py.
+    # sha256 fad423ace879...,
+    # snapshot allocations=8, pa_pages=10, rows=15)
+    # and the seven levels derived from it; every literal is an
+    # EXHAUSTIVE-solver literal (bits past the 3000-bit windowed
+    # threshold were forced exhaustive at freeze time and
+    # cross-checked against the windowed path). Frozen in place
+    # by tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_efficientnet_b0": {
-        "resident_bytes_nominal": 7_200_168,
-        "surface_excludes": ("trt-internal-2", "trt-internal-3", "trt-internal-4"),
+        "resident_bytes_nominal": 17_144_232,
         "levels": [
-            {"level": "L1", "ber": 1e-07, "bits": 6, "s": 3, "d": 0, "t": 1},
-            {"level": "L2", "ber": 5e-07, "bits": 29, "s": 11, "d": 3, "t": 4},
-            {"level": "L3", "ber": 1e-06, "bits": 58, "s": 23, "d": 7, "t": 7},
-            {"level": "L4", "ber": 3e-06, "bits": 173, "s": 65, "d": 21,
-             "t": 22},
-            {"level": "L5", "ber": 5e-06, "bits": 288, "s": 108, "d": 36,
-             "t": 36},
-            {"level": "L6", "ber": 7e-06, "bits": 403, "s": 151, "d": 51,
-             "t": 50},
-            {"level": "L7", "ber": 1e-05, "bits": 576, "s": 216, "d": 72,
-             "t": 72},
+            {"level": "L1", "ber": 1e-07, "bits": 14, "s": 6, "d": 1, "t": 2},
+            {"level": "L2", "ber": 5e-07, "bits": 69, "s": 26, "d": 8, "t": 9},
+            {"level": "L3", "ber": 1e-06, "bits": 137, "s": 52, "d": 17,
+             "t": 17},
+            {"level": "L4", "ber": 3e-06, "bits": 411, "s": 154, "d": 52,
+             "t": 51},
+            {"level": "L5", "ber": 5e-06, "bits": 686, "s": 256, "d": 86,
+             "t": 86},
+            {"level": "L6", "ber": 7e-06, "bits": 960, "s": 360, "d": 120,
+             "t": 120},
+            {"level": "L7", "ber": 1e-05, "bits": 1372, "s": 515, "d": 172,
+             "t": 171},
         ],
     },
     # PLACEHOLDER (R unfrozen) -- fill via

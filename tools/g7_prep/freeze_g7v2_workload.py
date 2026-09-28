@@ -112,22 +112,22 @@ LADDER = [("L1", 1e-7), ("L2", 5e-7), ("L3", 1e-6), ("L4", 3e-6),
 # trt-internal-5 (246,272 B) fatal/benign interleaved; excluded with
 # trt-internal-6 (2,048 B, same class) = 248,320 B = 2.66% of R.
 #
-# EfficientNet-B0 (2026-09-28): full-surface L1 completed (100 trials,
-# VERIFIED); L2 died at trial 83 on its first injected inference. The
-# dying trial's 69 flips were 43x internal-4 + 22x internal-0 + 3x
-# binding + 1x internal-2; the only structurally IMA-capable hits are
-# the ctx-phase ones (weights/constants/bindings are data, with
-# 2,747 / 4 / 217 prior benign hits respectively). This engine's
-# ctx-phase pool is internal-2 + internal-3 + internal-4 =
-# 9,944,064 B = 58.0% of R (mobilenet's 246 KB counterpart is 9.9 MB
-# here); observed fatal density ~1/4,200 pool bits puts L2 death at
-# p ~ 1%/trial (observed: trial 83) and L4+ at p -> 1, so no
-# full-surface campaign is possible above L1.
+# EfficientNet-B0 (2026-09-28): briefly scoped at 58.0% (commit
+# b8bf6e5) and REVERTED the same day (user decision): the estimated
+# full-surface process-crash rate is only ~0.2%/1%/5.5%/17% of trials
+# at L1/L2/L4/L7 (fatal density ~1/4,200 ctx-pool bits -- one death
+# per ~4,228 exposed pool bits, calibrated on the L2 run), far below
+# the mobilenet regime (~1 death per handful of pool bits, 40-100% at
+# L4+), while a 58% exclusion would leave an injection surface that is
+# 91% weights by construction. Protocol chosen instead: FULL surface +
+# the campaign restart protocol (per-trial flush, crash counted as a
+# PROCESS_FATAL outcome, relaunch for the remaining trials) -- the
+# crash rate becomes a measured reliability curve, no bits discarded.
+# A model joins THIS table only when scoping is genuinely the last
+# resort (crash rate so high the restart protocol cannot keep up).
 EXCLUDES: dict[str, tuple[str, ...]] = {
     "g7v2_imagenet1k_mobilenetv3_large_100":
         ("trt-internal-5", "trt-internal-6"),
-    "g7v2_imagenet1k_efficientnet_b0":
-        ("trt-internal-2", "trt-internal-3", "trt-internal-4"),
 }
 
 

@@ -248,7 +248,7 @@ L7 747→727. Final surface: weights `trt-internal-0` 6,414,240 B
 (2.7 %) + scratch `trt-internal-7` 1,825,280 B (20.1 %) + input
 binding 602,112 B (6.6 %) + prob/index 8 B.
 
-### EfficientNet-B0 (2026-09-28): same failure class, 22x the exposure
+### EfficientNet-B0 (2026-09-28): same failure class, 400x lower density -> full surface + restart protocol
 
 Full-surface protocol ran as decided: **L1 completed** (100 trials,
 VERIFIED, 14 bits/trial), **L2 died at trial 83** on its first injected
@@ -264,21 +264,32 @@ This engine's `create_execution_context`-phase private pool is
 246 KB `internal-5` is 9.9 MB here, **58.0 % of R**. Weights,
 deserialize constants, and input bindings are data and structurally
 cannot produce an IMA (2,747 / 4 / 217 benign hits respectively), so
-the fatal flip is in the ctx-phase pool; observed fatal density
-~1/4,200 pool bits → L2 death p ≈ 1 %/trial (observed: trial 83),
-L4+ p → 1 — no full-surface campaign above L1 is possible. Same rule
-as MobileNetV3, applied per model (user decision 2026-09-28): exclude
-the ctx-phase set, 9,944,064 B, R_eff = 7,200,168 B (42.0 %), new
-surface = weights 6,579,104 B (91.4 %) + deserialize constants
-18,944 B + input binding 602,112 B + prob/index 8 B; ladder bits
-L1..L7 = 6/29/58/173/288/403/576 (was 14/69/137/411/686/960/1372 at
-full R). The completed full-surface L1 run was moved to
-`artifacts/g7/fullsurface_control/efficientnet_b0/` — it is the
-appendix control point (full-surface L1 survives; full-surface L2+
-does not) and must never pool with the scoped-surface runs.
+the fatal flip is in the ctx-phase pool. Calibrated fatal density:
+one death per ~4,228 exposed pool bits (~2.4e-4; L1 observed 0/100 vs
+predicted 0.2, L2 observed 1/84 = 1.19 % vs predicted 0.94 %).
+
+**Crash-rate evaluation vs MobileNetV3 (user decision 2026-09-28).**
+MobileNetV3's pool density is ~1 fatal bit per handful (L4+ at 40-100 %
+of trials) AND the pool is only 2.66 % of R — scoping there removed a
+prohibitive hazard at negligible cost. EfficientNet-B0 is the opposite
+regime: pool share huge, density ~400x lower. Estimated full-surface
+per-trial crash rates: L1 0.19 %, L2 0.94 %, L3 1.9 %, L4 5.5 %,
+L5 9.0 %, L6 12.3 %, L7 17.1 % (~18 process relaunches at L7). A
+58 % exclusion (briefly frozen in commit b8bf6e5, reverted the same
+day) would leave an injection surface that is 91 % weights by
+construction — it changes the experiment's meaning, not just its
+risk. Chosen protocol: **FULL surface + campaign restart** (runner
+flushes results per trial; a process-fatal trial is recorded as a
+PROCESS_FATAL outcome like DUE — excluded from the accuracy mean,
+counted in its own column; the orchestrator relaunches the remaining
+trials in a fresh gated process, which is statistically equivalent
+because trials are independent spatial draws). The crash rate becomes
+a measured reliability curve vs BER at zero discarded bits; the L1 run
+of the reverted scoping is the full-surface data already in the pool.
 
 Paper note: the ctx-pool share of residency varies wildly across
 engines (ResNet-50 0.08 %, MobileNetV3 2.6 %, EfficientNet-B0 58 %) —
-TensorRT sizes its device-side control state by kernel count and
-graph complexity, and that share decides whether full-surface
-injection is merely risky or mathematically impossible.
+TensorRT sizes its device-side control state by kernel count and graph
+complexity. That share, combined with the pool's fatal density,
+decides the protocol: scope when the pool is small AND deadly
+(mobilenet), restart when it is large AND sparse (efficientnet).
