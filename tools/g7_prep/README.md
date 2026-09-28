@@ -293,3 +293,23 @@ TensorRT sizes its device-side control state by kernel count and graph
 complexity. That share, combined with the pool's fatal density,
 decides the protocol: scope when the pool is small AND deadly
 (mobilenet), restart when it is large AND sparse (efficientnet).
+
+**Implementation (2026-09-28).** The restart protocol is landed and
+self-tested. Runner (`apps/resnet50_int8_g1_5.cpp`): the three result
+CSVs are streamed through `G5ResultStreams` and flushed after every
+completed trial, so a trial is on disk iff it reached TRIAL_END.
+Orchestrator (`tools/g5_faultinj/run_g5_campaign.py`): one BER level =
+a segment loop (`execute_segment`); a mid-trial death is classified by
+`analyze_process_death` (recoverable ONLY as the IMA signature + every
+prior trial TRIAL_END + exactly one open trial whose complete flip set
+is the event-stream tail), the dead segment's completed prefix is
+fully re-verified, the dying trial becomes PROCESS_FATAL on its global
+execution-order slot, and a fresh gated segment relaunches for the
+remaining slots (seed `--seed + k`; a crashed segment's never-run work
+tail is dropped at merge — those slots were re-sampled).
+`merge_campaign_outputs` renumbers local trials to global slots
+(single clean segment = byte-identical hardlink). `summary.json`
+carries `process_fatal_trials`/`process_fatal_count`/`segments`;
+`analyze_campaign.py` prints the per-run `pf` column and the pooled
+P(trial crash) reliability column. Every other death shape fails the
+level closed (exit 2).

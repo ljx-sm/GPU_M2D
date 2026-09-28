@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """GPU_M2D G5: dual-addressing fault-injection campaign (one BER level).
 
-One campaign = one runner process = one bootstrap. The flow extends the
-G4-T2 gated skeleton (observer attaches pre-context; gate-time registry;
-ONLINE per-run snapshot; byte-exact restore; strict closing ledger) with
-the G5 trial loop of docs/G5_FAULT_MODEL.md §6:
+One campaign = one BER level = one or more runner PROCESSES (segments).
+The flow extends the G4-T2 gated skeleton (observer attaches pre-context;
+gate-time registry; ONLINE per-run snapshot; byte-exact restore; strict
+closing ledger) with the G5 trial loop of docs/G5_FAULT_MODEL.md §6:
 
   1. the eBPF observer attaches before any CUDA context exists (the
      runner blocks at the pre-allocation gate; in campaign mode it has
@@ -44,6 +44,25 @@ the cell every enqueue; the flip itself was proven by the pre-pass
 guard compare); TRT-internal -- "exact" or informational "mismatch:N"
 (engine scratch churn; the sanity inference is the behavioral no-residue
 proof).
+
+RESTART PROTOCOL (user decision 2026-09-28, EfficientNet-B0 and every
+later full-surface workload): a flip in TRT create_execution_context-
+phase CONTROL state kills the runner PROCESS with a CUDA illegal memory
+access mid-trial -- a process-fatal reliability event, not an
+output-observable fault. The runner flushes the three result CSVs after
+every COMPLETED trial (a trial is on disk iff it reached TRIAL_END), so
+nothing completed is lost; the orchestrator then verifies the dead
+segment's completed-trial prefix, counts the dying trial as PROCESS_FATAL
+(excluded from the accuracy mean exactly like a DUE, reported separately
+as the crash-rate-vs-BER reliability curve), and relaunches a FRESH
+gated segment (new observer, snapshot, and sampling of the remaining
+trial slots -- trials are independent draws of the same frozen model, so
+segments pool statistically; segment k seeds from --seed + k and its
+trial numbering is shifted to its global execution-order slots at merge
+time). Only the illegal-memory-access signature mid-trial is recoverable;
+every other death, and any prefix-verification failure, fails the whole
+level closed (exit 2). A --bootstrap run is exempt: single flat run,
+measure-only.
 
 Fail-closed: any ledger failure, snapshot problem, residency mismatch
 with the frozen R, composition/distinctness violation, result
@@ -141,6 +160,13 @@ TRIAL_EVENT_NAMES = {"TRIAL_BEGIN", "SITE_FLIPPED", "TRIAL_INJECTED_END",
                      "TRIAL_SANITY_END", "TRIAL_END"}
 
 OUTCOMES = ("BENIGN", "SDC_TOP1", "SDC_NUMERIC", "DUE_INVALID_OUTPUT")
+# Restart protocol: the trial the runner process DIED on (CUDA illegal
+# memory access from a flip in TRT runtime control state). Like a DUE it
+# is excluded from the accuracy mean; it is reported separately as the
+# crash-rate reliability curve (summary.process_fatal_* fields).
+PROCESS_FATAL = "PROCESS_FATAL"
+# the dead-process output must contain every needle to be restartable
+RECOVERABLE_DEATH_NEEDLES = ("GPU_M2D_G1_5_FAIL", "illegal memory access")
 IMAGE_OUTCOMES = ("IMAGE_BENIGN", "IMAGE_SDC_NUMERIC", "IMAGE_SDC_TOP1",
                   "IMAGE_DUE")
 PROBABILITY_TOLERANCE = 1.0e-6
@@ -402,6 +428,252 @@ def parse_all_events(output: str) -> list[tuple[str, dict[str, str]]]:
     return events
 
 
+def analyze_process_death(output: str, campaign: list[list[dict]]
+                          ) -> tuple[dict | None, list[str]]:
+    """Classify a runner process that died mid-campaign (restart
+    protocol). RECOVERABLE -- and the only restartable class -- is the
+    process-fatal fault: the output carries the CUDA illegal-memory-
+    access failure signature, every trial before the dying one reached
+    TRIAL_END, and the dying trial (the LAST TRIAL_BEGIN, exactly one
+    open) has its complete SITE_FLIPPED set with nothing after it (the
+    death hits the trial's first injected inference). Returns
+    ({completed, dying}, []) or (None, reasons); the caller fail-closes
+    on any other death shape."""
+    reasons: list[str] = []
+    for needle in RECOVERABLE_DEATH_NEEDLES:
+        if needle not in output:
+            reasons.append(f"failure signature {needle!r} absent")
+    trial_events = [(name, fields) for name, fields in
+                    parse_all_events(output) if name in TRIAL_EVENT_NAMES]
+    begins = [fields["trial_index"] for name, fields in trial_events
+              if name == "TRIAL_BEGIN"]
+    ended = {fields["trial_index"] for name, fields in trial_events
+             if name == "TRIAL_END"}
+    if begins != [str(index) for index in range(len(begins))]:
+        reasons.append("TRIAL_BEGIN stream not contiguous from 0 "
+                       f"(work-file contract): {begins[:8]}")
+        return None, reasons
+    open_trials = [trial for trial in begins if trial not in ended]
+    if len(open_trials) != 1 or open_trials[0] != begins[-1]:
+        reasons.append(f"expected exactly one open (dying) trial that is "
+                       f"the last begun; open={open_trials}")
+        return None, reasons
+    completed = len(begins) - 1
+    if not 0 <= completed < len(campaign):
+        reasons.append(f"dying position {completed} outside the sampled "
+                       f"{len(campaign)} trials")
+        return None, reasons
+    dying_at = len(trial_events) - 1
+    while trial_events[dying_at][0] != "TRIAL_BEGIN":
+        dying_at -= 1
+    tail = [name for name, _ in trial_events[dying_at + 1:]]
+    expected_tail = ["SITE_FLIPPED"] * len(campaign[completed])
+    if tail != expected_tail:
+        reasons.append(f"dying trial's event tail {tail[:8]}... != its "
+                       f"complete {len(campaign[completed])}-site flip set "
+                       "(the death must hit the first injected inference)")
+        return None, reasons
+    if reasons:
+        return None, reasons
+    return {"completed": completed, "dying": int(begins[-1])}, []
+
+
+# --------------------------------------------------------------------------
+# restart-protocol merge (offline-testable)
+# --------------------------------------------------------------------------
+
+# canonical result file -> (header fields, trial_index column, target_id
+# column or None); the trial column is renumbered to global slots and a
+# target_id's t%03d prefix along with it
+MERGE_CSV_SPECS: dict[str, tuple[list[str], int, int | None]] = {
+    "g1_5_g5_site_result.csv": (SITE_RESULT_FIELDS, 2, 5),
+    "g1_5_g5_trial_result.csv": (TRIAL_RESULT_FIELDS, 2, None),
+    "g1_5_g5_image_detail.csv": (IMAGE_DETAIL_FIELDS, 2, None),
+    "work.csv": (fault_model.WORK_FIELDS, 0, 3),
+}
+
+
+def shift_trial_fields(fields: list[str], delta: int, trial_col: int,
+                       target_col: int | None = None) -> list[str]:
+    """One CSV row with its trial_index (and target_id's t%03d prefix)
+    shifted to the trial's GLOBAL execution-order slot."""
+    shifted = list(fields)
+    global_index = int(shifted[trial_col]) + delta
+    shifted[trial_col] = str(global_index)
+    if target_col is not None:
+        head, sep, rest = shifted[target_col].partition("-")
+        if not head.startswith("t") or not sep:
+            raise RuntimeError(f"malformed target_id "
+                               f"{shifted[target_col]!r}")
+        shifted[target_col] = f"t{global_index:03d}-{rest}"
+    return shifted
+
+
+def read_result_csv(path: Path, fields: list[str]) -> list[list[str]]:
+    """Raw rows (list of field lists) of a result CSV, '#' comments and
+    header validated against the expected field list."""
+    if not path.is_file():
+        raise RuntimeError(f"missing CSV: {path}")
+    with path.open(encoding="utf-8", newline="") as source:
+        lines = [line for line in source if not line.startswith("#")]
+    reader = csv.reader(lines)
+    header = next(reader, None)
+    if header != fields:
+        raise RuntimeError(f"unexpected header in {path}: {header}")
+    return [row for row in reader if row]
+
+
+def write_merged_csv(path: Path, fields: list[str], rows: list[list[str]],
+                     comment: str | None = None) -> None:
+    with path.open("w", encoding="utf-8", newline="") as sink:
+        if comment is not None:
+            sink.write(f"# {comment}\n")
+        writer = csv.writer(sink, lineterminator="\n")
+        writer.writerow(fields)
+        writer.writerows(rows)
+
+
+def merge_campaign_outputs(level_dir: Path, segments: list[dict],
+                           args: argparse.Namespace, images_total: int
+                           ) -> dict:
+    """Merge the verified per-segment result CSVs into the level run's
+    CANONICAL files at level_dir root, renumbering every trial to its
+    global execution-order slot (segment-local trials are contiguous
+    from 0 -- the runner's work-file contract; segment k starts at slot
+    completed_0..k-1 + one slot per earlier PROCESS_FATAL). A segment's
+    dying trial keeps its slot but contributes no result rows. A crashed
+    segment's work file still lists every slot it was ASSIGNED (the
+    process died mid-way); only the trials it consumed -- completed plus
+    the dying one -- map to global slots, the never-run tail was
+    re-sampled by a later segment and is dropped here. A single clean
+    segment is hardlinked (delta 0, byte-identical). Fail-closed on any
+    count/shape disagreement."""
+    if not segments:
+        raise RuntimeError("merge: no segments")
+    single = (len(segments) == 1 and segments[0]["crashed_trial"] is None)
+    standard_names = list(MERGE_CSV_SPECS) + [
+        "g1_5_g5_clean_pass.csv", "g1_5_allocations.csv",
+        "g1_5_allocations_gate.csv", "gpu_va_pa_map.csv",
+        "gpu_va_pa_map_gate.csv", "events.csv",
+    ]
+    if single:
+        for name in standard_names + ["work_detail.json", "harness.log"]:
+            source = segments[0]["dir"] / name
+            if source.is_file():
+                os.link(source, level_dir / name)
+        trial_rows = read_result_csv(level_dir / "g1_5_g5_trial_result.csv",
+                                     TRIAL_RESULT_FIELDS)
+        return {"mode": "hardlink",
+                "trial_rows": [dict(zip(TRIAL_RESULT_FIELDS, row))
+                               for row in trial_rows],
+                "site_rows": None, "image_rows": None}
+
+    def consumed_of(segment: dict) -> int:
+        return segment["completed"] + \
+            (1 if segment["crashed_trial"] is not None else 0)
+
+    merged: dict[str, list[list[str]]] = {name: [] for name in MERGE_CSV_SPECS}
+    for segment in segments:
+        delta = segment["first_trial"]
+        consumed = consumed_of(segment)
+        for name, (fields, trial_col, target_col) in MERGE_CSV_SPECS.items():
+            rows = read_result_csv(segment["dir"] / name, fields)
+            merged[name].extend(
+                shift_trial_fields(row, delta, trial_col, target_col)
+                for row in rows if int(row[trial_col]) < consumed)
+    for name, (fields, _, _) in MERGE_CSV_SPECS.items():
+        write_merged_csv(level_dir / name, fields, merged[name],
+                         comment=("gpu-m2d g5 campaign merged over restart "
+                                  "segments; trials renumbered to global "
+                                  "execution-order slots"
+                                  if name == "work.csv" else None))
+
+    # count sanity, fail-closed
+    completed_total = sum(seg["completed"] for seg in segments)
+    sites_expected = sum(len(sites) for seg in segments
+                         for sites in seg["campaign"][:seg["completed"]])
+    bits = segments[0]["extra"]["level"]["bits"]
+    if len(merged["g1_5_g5_trial_result.csv"]) != completed_total:
+        raise RuntimeError(f"merged trial rows "
+                           f"{len(merged['g1_5_g5_trial_result.csv'])} != "
+                           f"completed trials {completed_total}")
+    if len(merged["g1_5_g5_site_result.csv"]) != sites_expected:
+        raise RuntimeError(f"merged site rows "
+                           f"{len(merged['g1_5_g5_site_result.csv'])} != "
+                           f"completed sites {sites_expected}")
+    if len(merged["g1_5_g5_image_detail.csv"]) != \
+            completed_total * images_total:
+        raise RuntimeError(f"merged image rows "
+                           f"{len(merged['g1_5_g5_image_detail.csv'])} != "
+                           f"{completed_total} trials x {images_total}")
+    if len(merged["work.csv"]) != args.trials * bits:
+        raise RuntimeError(f"merged work rows {len(merged['work.csv'])} != "
+                           f"{args.trials} trials x {bits} bits -- the "
+                           "consumed-slot partition is inconsistent")
+    seen = [row[2] for row in merged["g1_5_g5_trial_result.csv"]]
+    if len(set(seen)) != len(seen):
+        raise RuntimeError("merged trial_index values are not unique")
+
+    # shared-evidence files come from segment 0 (fresh process each
+    # segment: its own registry/maps/clean pass; the summary's
+    # segment_details carries every segment's own paths and hashes)
+    for name in standard_names[len(MERGE_CSV_SPECS):]:
+        source = segments[0]["dir"] / name
+        if source.is_file():
+            os.link(source, level_dir / name)
+    with (level_dir / "harness.log").open("w", encoding="utf-8") as sink:
+        for segment in segments:
+            sink.write(f"===== {segment['dir'].name} "
+                       f"(seed {segment['seed']}, trials "
+                       f"{segment['first_trial']}.."
+                       f"{segment['first_trial'] + segment['trials'] - 1}"
+                       f" of {args.trials}) =====\n")
+            log = segment["dir"] / "harness.log"
+            if log.is_file():
+                sink.write(log.read_text(encoding="utf-8",
+                                         errors="replace"))
+
+    # merged work detail: the level's frozen echo + per-segment provenance
+    # + the CONSUMED trials' sites renumbered to their global slots
+    # (exactly args.trials x bits after the partition check above)
+    sites_global: list[dict] = []
+    for segment in segments:
+        delta = segment["first_trial"]
+        for sites in segment["campaign"][:consumed_of(segment)]:
+            for site in sites:
+                shifted = dict(site)
+                shifted["trial_index"] = site["trial_index"] + delta
+                head, sep, rest = site["target_id"].partition("-")
+                shifted["target_id"] = (f"t{shifted['trial_index']:03d}-"
+                                        + rest if sep else site["target_id"])
+                sites_global.append(shifted)
+    work_detail = {
+        "schema": "gpu-m2d.g5.campaign.work.v1",
+        "run_id": level_dir.name,
+        "device": args.device,
+        "level": segments[0]["extra"]["level"],
+        "seed": args.seed,
+        "trial_seed_rule": "random.Random(seed * 100003 + trial_index); "
+                           "segment k samples with seed + k",
+        "trials": args.trials,
+        "segments": [{
+            "segment": seg["segment"], "dir": seg["dir"].name,
+            "seed": seg["seed"], "trials": seg["trials"],
+            "first_trial": seg["first_trial"],
+            "completed": seg["completed"],
+            "crashed_trial": seg["crashed_trial"],
+        } for seg in segments],
+        "sites": sites_global,
+    }
+    (level_dir / "work_detail.json").write_text(json.dumps(
+        work_detail, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {"mode": "merged",
+            "trial_rows": [dict(zip(TRIAL_RESULT_FIELDS, row))
+                           for row in merged["g1_5_g5_trial_result.csv"]],
+            "site_rows": merged["g1_5_g5_site_result.csv"],
+            "image_rows": merged["g1_5_g5_image_detail.csv"]}
+
+
 def expected_trial_sequence(campaign: list[list[dict]]
                             ) -> list[tuple[str, dict[str, str]]]:
     sequence: list[tuple[str, dict[str, str]]] = []
@@ -423,14 +695,30 @@ def expected_trial_sequence(campaign: list[list[dict]]
 
 
 def verify_event_structure(output: str, campaign: list[list[dict]],
-                           site_rows: list[dict]) -> list[str]:
+                           site_rows: list[dict],
+                           partial_trial: list[dict] | None = None
+                           ) -> list[str]:
     """The observed trial event stream must be exactly the sequence the
     work file prescribes (flip order, restore order, per-trial bracket),
-    and every SITE_FLIPPED must agree with the site result CSV."""
+    and every SITE_FLIPPED must agree with the site result CSV.
+
+    partial_trial (restart protocol): the trial the runner process DIED
+    on. The expected stream then additionally ends with that trial's
+    TRIAL_BEGIN plus its COMPLETE SITE_FLIPPED set and nothing after --
+    the illegal-memory-access death hits the trial's first injected
+    inference, before TRIAL_INJECTED_END or any restore. The dying
+    trial's site rows do not exist (never flushed) so the CSV-agreement
+    check skips them."""
     failures: list[str] = []
     observed = [(name, fields) for name, fields in
                 parse_all_events(output) if name in TRIAL_EVENT_NAMES]
     expected = expected_trial_sequence(campaign)
+    if partial_trial is not None:
+        dying = str(partial_trial[0]["trial_index"])
+        expected.append(("TRIAL_BEGIN", {"trial_index": dying}))
+        for site in partial_trial:
+            expected.append(("SITE_FLIPPED", {"target_id":
+                                              site["target_id"]}))
     if len(observed) != len(expected):
         failures.append(f"trial event count {len(observed)} != expected "
                         f"{len(expected)}")
@@ -471,10 +759,10 @@ def resident_bytes_of(snapshot_rows: list[dict]) -> int:
     return total
 
 
-class _BootstrapComplete(Exception):
-    """Raised by the measure-only --bootstrap path once bootstrap.json is
-    written and the gated child has been terminated (no trials, no flips;
-    skips every post-run trial verification)."""
+class SegmentFatal(RuntimeError):
+    """A fail-closed segment failure: anything except the recoverable
+    process-fatal fault (illegal memory access mid-trial). The LEVEL
+    aborts with status FAIL_CLOSED -- no restart."""
 
 
 # --------------------------------------------------------------------------
@@ -543,14 +831,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def finalize(failures: list[str], run_dir: Path, summary_output: Path,
-             test_log: Path, event_output: Path, observer: G2Observer,
+def finalize(failures: list[str], run_dir: Path, test_log: Path,
+             event_output: Path, observer_info: dict[str, int],
              args: argparse.Namespace, run_id: str, device_uuid: str,
              started_ns: int, extra: dict[str, Any], uid: int, gid: int,
              status_override: str | None = None,
              ) -> int:
     status = status_override or ("FAIL_CLOSED" if failures
                                  else "G5_CAMPAIGN_VERIFIED")
+    summary_output = run_dir / "summary.json"
     summary = {
         "schema_version": G5_SCHEMA,
         "status": status,
@@ -565,7 +854,7 @@ def finalize(failures: list[str], run_dir: Path, summary_output: Path,
         "run_id": run_id,
         "device": args.device,
         "device_uuid": device_uuid,
-        "target_tgid": observer.target_tgid,
+        "target_tgid": observer_info.get("target_tgid", -1),
         "workload": args.workload,
         "level": args.level,
         "trials_requested": args.trials,
@@ -575,12 +864,14 @@ def finalize(failures: list[str], run_dir: Path, summary_output: Path,
         "engine_sha256": sha256(args.engine) if args.engine.is_file() else "",
         "runner_path": str(args.runner),
         "runner_sha256": sha256(args.runner) if args.runner.is_file() else "",
-        "event_count": len(observer.rows),
-        "lost_event_count": observer.lost_event_count,
+        "event_count": observer_info.get("event_count", 0),
+        "lost_event_count": observer_info.get("lost_event_count", 0),
         "event_output": str(event_output),
-        "event_output_sha256": sha256(event_output),
+        "event_output_sha256": (sha256(event_output)
+                                if Path(event_output).is_file() else ""),
         "test_log": str(test_log),
-        "test_log_sha256": sha256(test_log),
+        "test_log_sha256": (sha256(test_log)
+                            if Path(test_log).is_file() else ""),
         "started_wall_time_ns": started_ns,
         "ended_wall_time_ns": time.time_ns(),
         "driver_modified": False,
@@ -618,59 +909,57 @@ def finalize(failures: list[str], run_dir: Path, summary_output: Path,
     return 2 if failures else 0
 
 
-def run_once(args: argparse.Namespace) -> int:
-    uid, gid = drop_to_invoking_user()
-    contract, contract_hash = load_and_validate_contract(
-        args.contract.resolve(), DEFAULT_OPEN_SOURCE_REPO)
-    if not args.runner.is_file() or not os.access(args.runner, os.X_OK):
-        raise RuntimeError(f"runner missing or not executable: {args.runner}")
-    if args.trials < 1:
-        raise RuntimeError("--trials must be >= 1")
+def execute_segment(args: argparse.Namespace, contract: dict,
+                    contract_hash: str, level: dict | None,
+                    level_dir: Path, segment_index: int, trials: int,
+                    seed: int, first_trial: int, uid: int, gid: int,
+                    cotenancy: str, device_uuid: str) -> dict:
+    """One gated runner process of a level = segment k of the restart
+    protocol (a --bootstrap run is segment 0 and FLAT: its files live
+    directly in the level dir, preserving the run_bootstrap_* layout the
+    freeze tooling globs). The segment owns its observer, gates,
+    snapshot, sampled work, and (per-trial flushed) result CSVs inside
+    segment_dir, and returns a result dict:
+
+      {"fatal": [...]}                    -> level fails closed, no restart
+      {"bootstrap": True}                 -> measure-only run complete
+      {"crashed_trial": <global slot>}    -> process-fatal trial; restart
+      {"passed": True}                    -> segment finished cleanly
+
+    Everything inside raises nothing past RuntimeError; the except below
+    converts every failure into a fatal result so the level driver owns
+    the fail-closed decision."""
+    if args.bootstrap:
+        segment_dir = level_dir
+    else:
+        segment_dir = level_dir / f"segment_{segment_index:03d}"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        os.chown(segment_dir, uid, gid)
+    segment_name = (level_dir.name if args.bootstrap
+                    else f"{level_dir.name}/{segment_dir.name}")
+    event_output = segment_dir / "events.csv"
+    test_log = segment_dir / "harness.log"
+    registry_output = segment_dir / "g1_5_allocations.csv"
+    registry_gate_copy = segment_dir / "g1_5_allocations_gate.csv"
+    map_output = segment_dir / "gpu_va_pa_map.csv"
+    map_gate_output = segment_dir / "gpu_va_pa_map_gate.csv"
+    work_output = segment_dir / "work.csv"
+    work_detail_output = segment_dir / "work_detail.json"
+    site_result_output = segment_dir / "g1_5_g5_site_result.csv"
+    trial_result_output = segment_dir / "g1_5_g5_trial_result.csv"
+    image_detail_output = segment_dir / "g1_5_g5_image_detail.csv"
+    clean_pass_output = segment_dir / "g1_5_g5_clean_pass.csv"
+    gate = segment_dir / f".gate_{os.getpid()}_{time.time_ns()}"
+    release = segment_dir / f".release_{os.getpid()}_{time.time_ns()}"
+    run_id = segment_name
     workload_entry = fault_model.workload_by_name(args.workload)
     r_nominal = workload_entry["resident_bytes_nominal"]
-    if not args.bootstrap:
-        # a real campaign runs fail-closed against the frozen level table;
-        # the bootstrap run exists precisely to MEASURE R for a workload
-        # whose table is not frozen yet (empty levels, R placeholder 0)
-        fault_model.assert_frozen_levels(args.workload)
-        level = fault_model.level_by_name(args.level, args.workload)
+
     trt_runtime_dir = Path(os.environ.get(
         "GPU_M2D_REMU_ROOT", "/data1/luojx/REMU")) / \
         ".local/deps/tensorrt-8.6.1/tensorrt_libs"
     opencv_lib_dir = Path(os.environ.get(
         "GPU_M2D_REMU_ROOT", "/data1/luojx/REMU")) / ".local/deps/conda/lib"
-    for required in (args.engine, args.sample_csv,
-                     trt_runtime_dir / "libnvinfer.so.8",
-                     args.table / "gddr_seed_table.csv",
-                     args.table / "bank_classes.csv",
-                     args.table / "page_anchors.csv"):
-        if not required.is_file():
-            raise RuntimeError(f"missing required asset: {required}")
-
-    cotenancy = cotenancy_snapshot(args.device)
-    device_uuid = query_device_uuid(args.device)
-    level_tag = args.level if args.level else "bootstrap"
-    run_dir = args.output_root / \
-        f"run_{level_tag}_gpu{args.device}_{time.time_ns()}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    os.chown(run_dir, uid, gid)
-    event_output = run_dir / "events.csv"
-    summary_output = run_dir / "summary.json"
-    test_log = run_dir / "harness.log"
-    registry_output = run_dir / "g1_5_allocations.csv"
-    registry_gate_copy = run_dir / "g1_5_allocations_gate.csv"
-    map_output = run_dir / "gpu_va_pa_map.csv"
-    map_gate_output = run_dir / "gpu_va_pa_map_gate.csv"
-    work_output = run_dir / "work.csv"
-    work_detail_output = run_dir / "work_detail.json"
-    site_result_output = run_dir / "g1_5_g5_site_result.csv"
-    trial_result_output = run_dir / "g1_5_g5_trial_result.csv"
-    image_detail_output = run_dir / "g1_5_g5_image_detail.csv"
-    clean_pass_output = run_dir / "g1_5_g5_clean_pass.csv"
-    gate = run_dir / f".gate_{os.getpid()}_{time.time_ns()}"
-    release = run_dir / f".release_{os.getpid()}_{time.time_ns()}"
-    run_id = run_dir.name
-
     environment = os.environ.copy()
     environment["LD_LIBRARY_PATH"] = ":".join(
         part for part in (str(trt_runtime_dir), str(opencv_lib_dir),
@@ -692,13 +981,40 @@ def run_once(args: argparse.Namespace) -> int:
     if args.std is not None:
         runner_passthrough += ["--std", args.std]
 
-    observer = G2Observer(contract, contract_hash, 0, event_output)
+    observer: G2Observer | None = None
     process: subprocess.Popen[bytes] | None = None
     started_ns = time.time_ns()
     captured = bytearray()
     failures: list[str] = []
     extra: dict[str, Any] = {"cotenancy_at_start": cotenancy,
-                             "runner_passthrough": runner_passthrough}
+                             "runner_passthrough": runner_passthrough,
+                             "level": level,
+                             "segment": segment_index,
+                             "segment_dir": segment_name,
+                             "segment_seed": seed,
+                             "segment_trials": trials,
+                             "segment_first_trial": first_trial}
+
+    def observer_info() -> dict[str, int]:
+        if observer is None:
+            return {"target_tgid": -1, "event_count": 0,
+                    "lost_event_count": 0}
+        return {"target_tgid": observer.target_tgid,
+                "event_count": len(observer.rows),
+                "lost_event_count": observer.lost_event_count}
+
+    def segment_result(**over: Any) -> dict:
+        result = {"segment": segment_index, "dir": segment_dir,
+                  "name": segment_name, "seed": seed, "trials": trials,
+                  "first_trial": first_trial, "passed": False,
+                  "completed": 0, "crashed_trial": None, "campaign": [],
+                  "extra": extra, "test_log": test_log,
+                  "event_output": event_output,
+                  "observer_info": observer_info(), "bootstrap": False}
+        result.update(over)
+        return result
+
+    observer = G2Observer(contract, contract_hash, 0, event_output)
     try:
         process = subprocess.Popen(
             [
@@ -707,7 +1023,7 @@ def run_once(args: argparse.Namespace) -> int:
                 "--sample-csv", str(args.sample_csv.resolve()),
                 "--sample-index", str(args.sample_index),
                 "--device", str(args.device),
-                "--output-prefix", str((run_dir / "g1_5").resolve()),
+                "--output-prefix", str((segment_dir / "g1_5").resolve()),
                 "--observer-gate", str(gate),
                 "--hold-seconds", str(args.hold_seconds),
                 "--gate-timeout-seconds", str(max(5, int(args.timeout_seconds))),
@@ -783,7 +1099,7 @@ def run_once(args: argparse.Namespace) -> int:
         write_map_csv(map_gate_output, gate_map_rows)
         os.chmod(map_gate_output, 0o644)
 
-        snapshot_dir = run_dir / "snapshot"
+        snapshot_dir = segment_dir / "snapshot"
         result = run_build(registry_output, map_gate_output, args.device,
                            args.table, snapshot_dir,
                            lambda text="": print(text))
@@ -823,7 +1139,7 @@ def run_once(args: argparse.Namespace) -> int:
             # The runner sits blocked at the campaign gate having already
             # written the clean-pass CSV (the baseline-validation
             # artifact) -- terminate it now.
-            bootstrap_output = run_dir / "bootstrap.json"
+            bootstrap_output = segment_dir / "bootstrap.json"
             bootstrap_output.write_text(json.dumps({
                 "schema_version": "gpu-m2d.g5.bootstrap.v1",
                 "workload": args.workload,
@@ -866,7 +1182,8 @@ def run_once(args: argparse.Namespace) -> int:
                 "g1_5_run_id": g1_5_run_id,
                 "registry_allocation_count": len(registry),
             })
-            raise _BootstrapComplete()
+            return segment_result(bootstrap=True, completed=0,
+                                  campaign=[])
 
         if surface_bytes != r_nominal:
             raise RuntimeError(
@@ -876,27 +1193,28 @@ def run_once(args: argparse.Namespace) -> int:
 
         anchors = fault_model.load_anchors(args.table)
         anchor_pages = len(anchors)
-        print(f"anchors: {anchor_pages} pages with valid consensus masks")
+        print(f"[{run_id}] anchors: {anchor_pages} pages with valid "
+              "consensus masks")
         campaign = fault_model.sample_campaign(
-            args.level, args.trials, surface_rows, anchors, args.seed,
+            args.level, trials, surface_rows, anchors, seed,
             resident_bytes_expected=r_nominal, workload=args.workload)
         model_failures = verify_work_model(level, campaign)
         if model_failures:
             raise RuntimeError("sampled campaign violates the frozen model: "
                                + "; ".join(model_failures[:10]))
         total_sites = sum(len(sites) for sites in campaign)
-        print(f"sampler: level {args.level} BER {level['ber']:g} "
+        print(f"[{run_id}] sampler: level {args.level} BER {level['ber']:g} "
               f"B={level['bits']} (s,d,t)=({level['s']},{level['d']},"
-              f"{level['t']}), {args.trials} trials, {total_sites} sites")
+              f"{level['t']}), {trials} trials, {total_sites} sites")
         fault_model.write_work_csv(work_output, campaign)
         work_detail = {
             "schema": "gpu-m2d.g5.campaign.work.v1",
             "run_id": run_id,
             "device": args.device,
             "level": level,
-            "seed": args.seed,
+            "seed": seed,
             "trial_seed_rule": "random.Random(seed * 100003 + trial_index)",
-            "trials": args.trials,
+            "trials": trials,
             "resident_bytes": resident_bytes,
             "anchor_pages": anchor_pages,
             "frozen_composition_echo": [level["s"], level["d"],
@@ -912,6 +1230,19 @@ def run_once(args: argparse.Namespace) -> int:
         os.chmod(work_output, 0o644)
         os.chmod(work_detail_output, 0o644)
 
+        # core provenance both the crash and clean exits need (the merge
+        # and the level summary read them from segment extras)
+        extra.update({
+            "g1_5_run_id": g1_5_run_id,
+            "registry_allocation_count": len(registry),
+            "snapshot_dir": str(snapshot_dir),
+            "snapshot_sha256": result.manifest.get("snapshot_sha256", ""),
+            "snapshot_manifest": result.manifest,
+            "resident_bytes": resident_bytes,
+            "anchor_pages": anchor_pages,
+            "total_sites": total_sites,
+        })
+
         release.write_text(f"campaign_ready target_tgid={process.pid}\n",
                            encoding="utf-8")
         os.chmod(release, 0o644)
@@ -922,7 +1253,75 @@ def run_once(args: argparse.Namespace) -> int:
         if not finished:
             if process.poll() is None:
                 process.terminate()
-            raise RuntimeError("runner did not report " + PASS_MARKER)
+                raise RuntimeError("runner did not report " + PASS_MARKER +
+                                   " (timeout)")
+            # The runner PROCESS died mid-campaign. The single recoverable
+            # class is the process-fatal fault (restart protocol, user
+            # decision 2026-09-28): a flip in TRT create_execution_context
+            # control state surfaces as a CUDA illegal memory access; the
+            # runner flushed every COMPLETED trial's rows, so the prefix
+            # on disk is verified below and the dying trial becomes
+            # PROCESS_FATAL. Every other death shape fails the level.
+            for _ in range(20):
+                observer.poll(50)
+            drain_pipe(process, captured)
+            output = captured.decode("utf-8", errors="replace")
+            death, reasons = analyze_process_death(output, campaign)
+            if death is None:
+                raise RuntimeError(
+                    "runner died with an unrecoverable failure shape: "
+                    + "; ".join(reasons))
+            completed_now = death["completed"]
+            prefix = campaign[:completed_now]
+            print(f"[{run_id}] PROCESS_FATAL: dying trial "
+                  f"{first_trial + death['dying']} (illegal memory access); "
+                  f"verifying the {completed_now} completed trials on disk")
+            site_rows = read_csv_rows(site_result_output, SITE_RESULT_FIELDS)
+            failures.extend(verify_site_rows(prefix, site_rows, registry))
+            trial_rows = read_csv_rows(trial_result_output,
+                                       TRIAL_RESULT_FIELDS)
+            clean_rows = read_csv_rows(clean_pass_output, CLEAN_PASS_FIELDS)
+            images_total = len(clean_rows)
+            if images_total == 0:
+                failures.append("clean pass CSV is empty")
+            else:
+                failures.extend(verify_trial_rows(trial_rows, prefix,
+                                                  images_total))
+                image_rows = read_csv_rows(image_detail_output,
+                                           IMAGE_DETAIL_FIELDS)
+                failures.extend(verify_image_rows(image_rows, trial_rows,
+                                                  clean_rows))
+            failures.extend(verify_event_structure(
+                output, prefix, site_rows,
+                partial_trial=campaign[completed_now]))
+            # the dying trial's flips were mid-pass and its GPU state died
+            # with the process; the closing ledger/skeleton checks only
+            # apply to a clean exit. Observer-level checks still do.
+            if registry_output.read_text() != registry_gate_copy.read_text():
+                failures.append("allocation registry changed between the "
+                                "campaign gate and the death of the run")
+            kernel_uuids = sorted({str(row["gpu_uuid"]) for row in
+                                   observer.rows
+                                   if row["event_type"] == "PTE_HEADER"
+                                   and row["gpu_uuid"]})
+            if len(kernel_uuids) > 1:
+                failures.append(f"multiple kernel GPU UUIDs: {kernel_uuids}")
+            elif kernel_uuids and normalize_gpu_uuid(kernel_uuids[0]) != \
+                    normalize_gpu_uuid(device_uuid):
+                failures.append(f"kernel GPU UUID {kernel_uuids[0]} != "
+                                f"device UUID {device_uuid}")
+            if len({str(row["address_space_id"]) for row in observer.rows
+                    if row["event_type"] in ("MAP_RETURN", "PTE_HEADER")}) > 1:
+                failures.append("multiple UVM address-space IDs observed")
+            if observer.lost_event_count:
+                failures.append(f"lost BPF events: {observer.lost_event_count}")
+            if failures:
+                raise RuntimeError("crashed-segment prefix verification "
+                                   "failed: " + "; ".join(failures[:10]))
+            return segment_result(
+                completed=completed_now,
+                crashed_trial=first_trial + death["dying"],
+                campaign=campaign)
         exit_deadline = time.monotonic() + args.timeout_seconds
         while process.poll() is None and time.monotonic() < exit_deadline:
             observer.poll(50)
@@ -1003,9 +1402,9 @@ def run_once(args: argparse.Namespace) -> int:
                 image_totals[key] += int(row[key])
             for key in restore_totals:
                 restore_totals[key] += int(row[key])
-        if len(trial_rows) != args.trials:
+        if len(trial_rows) != trials:
             failures.append(f"trial count {len(trial_rows)} != requested "
-                            f"{args.trials}")
+                            f"{trials}")
 
         kernel_uuids = sorted({str(row["gpu_uuid"]) for row in observer.rows
                                if row["event_type"] == "PTE_HEADER"
@@ -1060,8 +1459,14 @@ def run_once(args: argparse.Namespace) -> int:
             "nvidia_module_sha256": contract["nvidia_module_sha256"],
             "nvidia_uvm_module_sha256": contract["nvidia_uvm_module_sha256"],
         })
-    except _BootstrapComplete:
-        pass
+        if failures:
+            return {**segment_result(passed=False, completed=trials,
+                                     campaign=campaign), "fatal": failures}
+        return segment_result(passed=True, completed=trials,
+                              campaign=campaign)
+    except RuntimeError as error:
+        return {**segment_result(), "fatal": [f"segment failed closed: "
+                                              f"{error}"]}
     finally:
         gate.unlink(missing_ok=True)
         release.unlink(missing_ok=True)
@@ -1076,12 +1481,199 @@ def run_once(args: argparse.Namespace) -> int:
         test_log.write_text(captured.decode("utf-8", errors="replace"),
                             encoding="utf-8")
 
-    return finalize(failures, run_dir, summary_output, test_log,
-                    event_output, observer, args, run_id, device_uuid,
-                    started_ns, extra, uid, gid,
-                    status_override=("G5_BOOTSTRAP_MEASURED"
-                                     if args.bootstrap and not failures
-                                     else None))
+
+def _segment_details(segments: list[dict]) -> list[dict]:
+    return [{
+        "segment": seg["segment"],
+        "dir": seg["name"],
+        "seed": seg["seed"],
+        "trials": seg["trials"],
+        "first_trial": seg["first_trial"],
+        "completed": seg["completed"],
+        "crashed_trial": seg["crashed_trial"],
+        "g1_5_run_id": seg["extra"].get("g1_5_run_id"),
+        "event_output": str(seg["event_output"]),
+        "event_output_sha256": (sha256(seg["event_output"])
+                                if Path(seg["event_output"]).is_file()
+                                else ""),
+        "harness_log": str(seg["test_log"]),
+        "harness_log_sha256": (sha256(seg["test_log"])
+                               if Path(seg["test_log"]).is_file() else ""),
+        "snapshot_dir": seg["extra"].get("snapshot_dir"),
+        "snapshot_sha256": seg["extra"].get("snapshot_sha256", ""),
+        "total_sites": seg["extra"].get("total_sites"),
+        "campaign_window_ns": seg["extra"].get("campaign_window_ns"),
+    } for seg in segments]
+
+
+def run_once(args: argparse.Namespace) -> int:
+    uid, gid = drop_to_invoking_user()
+    contract, contract_hash = load_and_validate_contract(
+        args.contract.resolve(), DEFAULT_OPEN_SOURCE_REPO)
+    if not args.runner.is_file() or not os.access(args.runner, os.X_OK):
+        raise RuntimeError(f"runner missing or not executable: {args.runner}")
+    if args.trials < 1:
+        raise RuntimeError("--trials must be >= 1")
+    level: dict | None = None
+    if not args.bootstrap:
+        # a real campaign runs fail-closed against the frozen level table;
+        # the bootstrap run exists precisely to MEASURE R for a workload
+        # whose table is not frozen yet (empty levels, R placeholder 0)
+        fault_model.assert_frozen_levels(args.workload)
+        level = fault_model.level_by_name(args.level, args.workload)
+    trt_runtime_dir = Path(os.environ.get(
+        "GPU_M2D_REMU_ROOT", "/data1/luojx/REMU")) / \
+        ".local/deps/tensorrt-8.6.1/tensorrt_libs"
+    for required in (args.engine, args.sample_csv,
+                     trt_runtime_dir / "libnvinfer.so.8",
+                     args.table / "gddr_seed_table.csv",
+                     args.table / "bank_classes.csv",
+                     args.table / "page_anchors.csv"):
+        if not required.is_file():
+            raise RuntimeError(f"missing required asset: {required}")
+
+    cotenancy = cotenancy_snapshot(args.device)
+    device_uuid = query_device_uuid(args.device)
+    level_tag = args.level if args.level else "bootstrap"
+    level_dir = args.output_root / \
+        f"run_{level_tag}_gpu{args.device}_{time.time_ns()}"
+    level_dir.mkdir(parents=True, exist_ok=True)
+    os.chown(level_dir, uid, gid)
+    started_ns = time.time_ns()
+
+    if args.bootstrap:
+        result = execute_segment(args, contract, contract_hash, level,
+                                 level_dir, 0, args.trials, args.seed, 0,
+                                 uid, gid, cotenancy, device_uuid)
+        return finalize(result.get("fatal", []), level_dir,
+                        result["test_log"], result["event_output"],
+                        result["observer_info"], args, level_dir.name,
+                        device_uuid, started_ns, result["extra"], uid, gid,
+                        status_override=("G5_BOOTSTRAP_MEASURED"
+                                         if not result.get("fatal")
+                                         else None))
+
+    # ---- campaign: the restart-protocol segment loop. Every iteration
+    # runs one full gated segment (fresh observer + snapshot + sampling)
+    # for the REMAINING trial slots; a process-fatal trial consumes its
+    # slot as PROCESS_FATAL and the loop relaunches. A crash can never
+    # loop forever: each dying trial consumes exactly one slot, and any
+    # death without a dying trial is fatal.
+    segments: list[dict] = []
+    completed = 0
+    crashes = 0
+    while completed + crashes < args.trials:
+        segment_index = len(segments)
+        if segment_index > args.trials + 8:
+            return finalize(
+                ["restart budget exhausted: more segments than trials + 8; "
+                 "the crash rate exceeds what the protocol can absorb"],
+                level_dir, level_dir / "harness.log",
+                segments[-1]["event_output"] if segments else
+                level_dir / "events.csv",
+                segments[-1]["observer_info"] if segments else {},
+                args, level_dir.name, device_uuid, started_ns,
+                {"segments": len(segments),
+                 "segment_details": _segment_details(segments)},
+                uid, gid)
+        seg = execute_segment(args, contract, contract_hash, level,
+                              level_dir, segment_index,
+                              args.trials - completed - crashes,
+                              args.seed + segment_index,
+                              completed + crashes, uid, gid, cotenancy,
+                              device_uuid)
+        if seg.get("fatal"):
+            return finalize(seg["fatal"], level_dir, seg["test_log"],
+                            seg["event_output"], seg["observer_info"],
+                            args, level_dir.name, device_uuid, started_ns,
+                            {"segments": len(segments) + 1,
+                             "segment_details": _segment_details(
+                                 segments + [seg]),
+                             "restart_protocol_used": bool(segments)},
+                            uid, gid)
+        segments.append(seg)
+        completed += seg["completed"]
+        if seg["crashed_trial"] is not None:
+            crashes += 1
+            print(f"restart: {args.trials - completed - crashes} trial "
+                  f"slot(s) remain ({completed} completed + {crashes} "
+                  "PROCESS_FATAL)")
+
+    images_total = len(read_csv_rows(segments[0]["dir"] /
+                                     "g1_5_g5_clean_pass.csv",
+                                     CLEAN_PASS_FIELDS))
+    merge = merge_campaign_outputs(level_dir, segments, args, images_total)
+    trial_rows = merge["trial_rows"]
+    outcome_histogram = dict.fromkeys(OUTCOMES, 0)
+    image_totals = {"images_benign": 0, "images_sdc_numeric": 0,
+                    "images_sdc_top1": 0, "images_invalid": 0}
+    restore_totals = {"restore_alloc_exact": 0,
+                      "restore_alloc_mismatch": 0,
+                      "restore_alloc_skipped": 0,
+                      "restore_mismatch_bytes": 0}
+    for row in trial_rows:
+        outcome_histogram[row["injected_outcome"]] = \
+            outcome_histogram.get(row["injected_outcome"], 0) + 1
+        for key in image_totals:
+            image_totals[key] += int(row[key])
+        for key in restore_totals:
+            restore_totals[key] += int(row[key])
+    fatal_trials = [seg["crashed_trial"] for seg in segments
+                    if seg["crashed_trial"] is not None]
+
+    first = segments[0]["extra"]
+    site_output = level_dir / "g1_5_g5_site_result.csv"
+    trial_output = level_dir / "g1_5_g5_trial_result.csv"
+    image_output = level_dir / "g1_5_g5_image_detail.csv"
+    work_output = level_dir / "work.csv"
+    clean_output = level_dir / "g1_5_g5_clean_pass.csv"
+    extra: dict[str, Any] = {
+        "segments": len(segments),
+        "restart_protocol_used": bool(fatal_trials),
+        "segment_details": _segment_details(segments),
+        "process_fatal_trials": fatal_trials,
+        "process_fatal_count": len(fatal_trials),
+        "trials_completed": completed,
+        "images_per_trial": images_total,
+        "trial_outcome_histogram": outcome_histogram,
+        "image_totals": image_totals,
+        "restore_totals": restore_totals,
+        "g1_5_run_id": first.get("g1_5_run_id"),
+        "registry_allocation_count": first.get("registry_allocation_count"),
+        "snapshot_dir": first.get("snapshot_dir"),
+        "snapshot_sha256": first.get("snapshot_sha256", ""),
+        "snapshot_manifest": first.get("snapshot_manifest"),
+        "resident_bytes": first.get("resident_bytes"),
+        "anchor_pages": first.get("anchor_pages"),
+        # sites of the level's trials exactly (trials x bits); a crashed
+        # segment's never-run tail was re-sampled later and is NOT added
+        "total_sites": args.trials * level["bits"],
+        "surface_excludes": first.get("surface_excludes", []),
+        "surface_resident_bytes": first.get("surface_resident_bytes"),
+        "work_output": str(work_output),
+        "work_sha256": sha256(work_output),
+        "site_result_output": str(site_output),
+        "site_result_sha256": sha256(site_output),
+        "trial_result_output": str(trial_output),
+        "trial_result_sha256": sha256(trial_output),
+        "image_detail_output": str(image_output),
+        "image_detail_sha256": sha256(image_output),
+        "clean_pass_output": str(clean_output),
+        "clean_pass_sha256": sha256(clean_output),
+        "map_output": str(level_dir / "gpu_va_pa_map.csv"),
+        "map_output_sha256": sha256(level_dir / "gpu_va_pa_map.csv"),
+        "map_gate_output": str(level_dir / "gpu_va_pa_map_gate.csv"),
+        "map_gate_output_sha256": sha256(level_dir / "gpu_va_pa_map_gate.csv"),
+        "contract_sha256": contract_hash,
+        "nvidia_module_sha256": contract["nvidia_module_sha256"],
+        "nvidia_uvm_module_sha256": contract["nvidia_uvm_module_sha256"],
+    }
+    extra.update({key: value for key, value in first.items()
+                  if key in ("cotenancy_at_start", "runner_passthrough")})
+    return finalize([], level_dir, level_dir / "harness.log",
+                    segments[0]["event_output"],
+                    segments[0]["observer_info"], args, level_dir.name,
+                    device_uuid, started_ns, extra, uid, gid)
 
 
 # --------------------------------------------------------------------------
@@ -1324,6 +1916,223 @@ def self_test() -> int:
                                            resident_bytes_expected=None)
         assert [len(sites) for sites in tiny] == [2, 2]
         assert verify_work_model(fault_model.level_by_name("L1"), tiny) == []
+
+    # --- restart protocol: process-death classification
+    def trial_event_lines(sites) -> str:
+        out = []
+        trial = str(sites[0]["trial_index"])
+        out.append(f"GPU_M2D_EVENT,event=TRIAL_BEGIN,trial_index={trial},"
+                   "pid=1,tgid=1")
+        for site in sites:
+            out.append(f"GPU_M2D_EVENT,event=SITE_FLIPPED,trial_index="
+                       f"{trial},target_id={site['target_id']},pid=1,"
+                       "tgid=1")
+        out.append(f"GPU_M2D_EVENT,event=TRIAL_INJECTED_END,trial_index="
+                   f"{trial},pid=1,tgid=1")
+        for site in reversed(sites):
+            out.append(f"GPU_M2D_EVENT,event=SITE_RESTORED,trial_index="
+                       f"{trial},target_id={site['target_id']},pid=1,"
+                       "tgid=1")
+        out.append(f"GPU_M2D_EVENT,event=TRIAL_SANITY_BEGIN,trial_index="
+                   f"{trial},pid=1,tgid=1")
+        out.append(f"GPU_M2D_EVENT,event=TRIAL_SANITY_END,trial_index="
+                   f"{trial},pid=1,tgid=1")
+        out.append(f"GPU_M2D_EVENT,event=TRIAL_END,trial_index={trial},"
+                   "pid=1,tgid=1")
+        return "\n".join(out) + "\n"
+
+    ima_tail = ("GPU_M2D_G1_5_FAIL: synchronize inference stream failed: "
+                "an illegal memory access was encountered\n")
+
+    def dying_trial_lines(trial: int, sites) -> str:
+        return ("GPU_M2D_EVENT,event=TRIAL_BEGIN,"
+                f"trial_index={trial},pid=1,tgid=1\n"
+                + "".join(f"GPU_M2D_EVENT,event=SITE_FLIPPED,"
+                          f"trial_index={trial},"
+                          f"target_id={site['target_id']},pid=1,tgid=1\n"
+                          for site in sites))
+
+    crashed_output = (trial_event_lines(campaign[0])
+                      + trial_event_lines(campaign[1])
+                      + dying_trial_lines(2, campaign[2])
+                      + ima_tail)
+    death, reasons = analyze_process_death(crashed_output, campaign)
+    assert death == {"completed": 2, "dying": 2}, (death, reasons)
+    # no IMA signature -> unrecoverable
+    death, reasons = analyze_process_death(
+        crashed_output.replace("illegal memory access", "boom"), campaign)
+    assert death is None and any("signature" in r for r in reasons)
+    # anything after the dying trial's flips (it survived the injected
+    # pass) -> unrecoverable
+    last_flip = (f"target_id={campaign[2][-1]['target_id']},pid=1,tgid=1\n")
+    survivor = crashed_output.replace(
+        last_flip + ima_tail,
+        last_flip + "GPU_M2D_EVENT,event=TRIAL_INJECTED_END,trial_index=2,"
+        "pid=1,tgid=1\n" + ima_tail)
+    death, reasons = analyze_process_death(survivor, campaign)
+    assert death is None and any("flip set" in r for r in reasons), reasons
+    # incomplete flip set before death -> unrecoverable
+    partial_flips = (trial_event_lines(campaign[0])
+                     + trial_event_lines(campaign[1])
+                     + dying_trial_lines(2, campaign[2][:4])
+                     + ima_tail)
+    death, reasons = analyze_process_death(partial_flips, campaign)
+    assert death is None, (death, reasons)
+    # the FIRST trial dying (zero completed) is recoverable
+    death, reasons = analyze_process_death(
+        dying_trial_lines(0, campaign[0]) + ima_tail, campaign)
+    assert death == {"completed": 0, "dying": 0}, (death, reasons)
+    # a stream with no open trial (clean end) has no dying trial
+    death, reasons = analyze_process_death(
+        "".join(trial_event_lines(sites) for sites in campaign) + ima_tail,
+        campaign)
+    assert death is None, death
+
+    # --- restart protocol: event structure with the dying trial's
+    # partial sequence appended. `lines` carries the full CSV-agreeing
+    # stream of the 3-trial campaign; its first two trials are the dead
+    # segment's completed prefix, and only their site rows exist on disk
+    # (the dying trial's were never flushed, so the agreement check must
+    # skip them).
+    per_trial_lines = 2 * len(campaign[0]) + 5  # flips + restores + 5 brackets
+    prefix_site_rows = good_sites[:2 * len(campaign[0])]
+    dying_stream = ("\n".join(lines[:2 * per_trial_lines]) + "\n"
+                    + dying_trial_lines(2, campaign[2]))
+    assert verify_event_structure(dying_stream, campaign[:2],
+                                   prefix_site_rows,
+                                   partial_trial=campaign[2]) == []
+    swapped = list(campaign[2])
+    swapped[0], swapped[1] = swapped[1], swapped[0]
+    assert verify_event_structure(dying_stream, campaign[:2],
+                                  prefix_site_rows, partial_trial=swapped)
+
+    # --- restart protocol: global-slot renumbering
+    row = ["r-x", "0", "4", "0", "1", "t004-e000-s01", "trt-internal-0",
+           "label", "12", "3", "8", "0x10", "0x10", "85", "93", "1", "1",
+           "1", "exact"]
+    shifted = shift_trial_fields(row, 78, 2, 5)
+    assert shifted[2] == "82" and shifted[5] == "t082-e000-s01"
+    assert row[2] == "4"  # the input row is not mutated
+
+    # --- restart protocol: two-segment merge (one crash) + single
+    # clean segment hardlink
+    campaign4 = fault_model.sample_campaign("L2", 4, rows_fixture,
+                                            anchors_fixture, seed=13)
+    campaign5 = fault_model.sample_campaign("L2", 5, rows_fixture,
+                                            anchors_fixture, seed=17)
+    assert verify_work_model(level, campaign4) == []
+    assert verify_work_model(level, campaign5) == []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        images_total = 2
+
+        def site_csv_row(trial, site):
+            return ["r-x", "0", str(trial), "0", "0", site["target_id"],
+                    "trt-internal-0", "TENSORRT_INTERNAL_UNKNOWN", "0",
+                    "0", "1", "0x10", "0x10", "85", "86", "1", "1", "1",
+                    "exact"]
+
+        def trial_csv_row(trial):
+            return ["r-x", "0", str(trial), str(level["bits"]),
+                    str(level["s"] + level["d"] + level["t"]),
+                    str(images_total), str(images_total),
+                    str(images_total), "0", "0", "0", "BENIGN", "7",
+                    "0.5", "1", "1", "0", "0", "0"]
+
+        def image_csv_row(trial, image):
+            return ["r-x", "0", str(trial), str(image), "1", "7", "7",
+                    "0.5", "0.5", "IMAGE_BENIGN"]
+
+        def work_csv_row(trial, site):
+            return [str(trial), "0", "0", site["target_id"],
+                    "trt-internal-0", "0", "0", "0x10"]
+
+        def fill_segment(seg_dir, sampled, completed, sites_per_trial):
+            # completed trials' rows only; work.csv carries every SAMPLED
+            # trial's sites, the dying one included
+            seg_dir.mkdir(parents=True)
+            site_rows, trial_rows, image_rows = [], [], []
+            for trial in range(completed):
+                site_rows += [site_csv_row(trial, site)
+                              for site in sites_per_trial[trial]]
+                trial_rows.append(trial_csv_row(trial))
+                image_rows += [image_csv_row(trial, image)
+                               for image in range(images_total)]
+            write_merged_csv(seg_dir / "g1_5_g5_site_result.csv",
+                             SITE_RESULT_FIELDS, site_rows)
+            write_merged_csv(seg_dir / "g1_5_g5_trial_result.csv",
+                             TRIAL_RESULT_FIELDS, trial_rows)
+            write_merged_csv(seg_dir / "g1_5_g5_image_detail.csv",
+                             IMAGE_DETAIL_FIELDS, image_rows)
+            write_merged_csv(seg_dir / "work.csv", fault_model.WORK_FIELDS,
+                             [work_csv_row(trial, site)
+                              for trial in range(sampled)
+                              for site in sites_per_trial[trial]],
+                             comment="work")
+
+        level_dir = root / "run_L2_gpu0_test"
+        level_dir.mkdir()
+        seg0_dir = level_dir / "segment_000"
+        seg1_dir = level_dir / "segment_001"
+        # segment 0 was ASSIGNED 5 slots (work.csv lists all 5) but died
+        # on local trial 2: consumed = 2 completed + 1 dying, locals 3-4
+        # were re-sampled by segment 1 and must be dropped at merge
+        fill_segment(seg0_dir, 5, 2, campaign5)
+        fill_segment(seg1_dir, 4, 4, campaign4)
+        for seg_dir in (seg0_dir, seg1_dir):
+            write_merged_csv(seg_dir / "g1_5_g5_clean_pass.csv",
+                             CLEAN_PASS_FIELDS,
+                             [["0", "a.jpg", "7", "7", "0.5"],
+                              ["1", "b.jpg", "7", "7", "0.5"]])
+        merge_args = argparse.Namespace(trials=7, device=0, seed=7)
+        segments = [
+            {"segment": 0, "dir": seg0_dir, "name": "s0", "seed": 7,
+             "trials": 5, "first_trial": 0, "completed": 2,
+             "crashed_trial": 2, "campaign": campaign5,
+             "extra": {"level": level}},
+            {"segment": 1, "dir": seg1_dir, "name": "s1", "seed": 8,
+             "trials": 4, "first_trial": 3, "completed": 4,
+             "crashed_trial": None, "campaign": campaign4,
+             "extra": {"level": level}},
+        ]
+        merge = merge_campaign_outputs(level_dir, segments, merge_args,
+                                       images_total)
+        assert merge["mode"] == "merged"
+        assert len(merge["trial_rows"]) == 6  # 2 + 4 completed
+        trial_ids = sorted(int(row["trial_index"])
+                           for row in merge["trial_rows"])
+        assert trial_ids == [0, 1, 3, 4, 5, 6]  # slot 2 = PROCESS_FATAL
+        work_rows = read_result_csv(level_dir / "work.csv",
+                                    fault_model.WORK_FIELDS)
+        assert len(work_rows) == 7 * level["bits"]
+        assert {int(row[0]) for row in work_rows} == set(range(7))
+        site_rows = read_result_csv(level_dir / "g1_5_g5_site_result.csv",
+                                    SITE_RESULT_FIELDS)
+        assert {row[5].split("-")[0] for row in site_rows} == \
+            {f"t{i:03d}" for i in [0, 1, 3, 4, 5, 6]}
+        detail = json.loads((level_dir / "work_detail.json").read_text())
+        assert detail["trials"] == 7 and len(detail["segments"]) == 2
+        assert len(detail["sites"]) == 7 * level["bits"]
+
+        # single clean segment -> hardlink mode, identical content
+        solo_dir = root / "run_L2_gpu0_solo"
+        solo_dir.mkdir()
+        solo_seg_dir = solo_dir / "segment_000"
+        fill_segment(solo_seg_dir, 3, 3, campaign)
+        write_merged_csv(solo_seg_dir / "g1_5_g5_clean_pass.csv",
+                         CLEAN_PASS_FIELDS,
+                         [["0", "a.jpg", "7", "7", "0.5"],
+                          ["1", "b.jpg", "7", "7", "0.5"]])
+        solo = [{"segment": 0, "dir": solo_seg_dir, "name": "s0",
+                 "seed": 7, "trials": 3, "first_trial": 0, "completed": 3,
+                 "crashed_trial": None, "campaign": campaign,
+                 "extra": {"level": level}}]
+        merge = merge_campaign_outputs(solo_dir, solo, merge_args,
+                                       images_total)
+        assert merge["mode"] == "hardlink"
+        assert len(merge["trial_rows"]) == 3
+        assert (solo_dir / "g1_5_g5_site_result.csv").read_text() == \
+            (solo_seg_dir / "g1_5_g5_site_result.csv").read_text()
 
     print("g5 campaign self-test: PASS")
     return 0

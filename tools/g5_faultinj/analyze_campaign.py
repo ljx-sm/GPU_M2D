@@ -16,6 +16,10 @@ tables:
   - right->wrong vs wrong->right decomposition of top-1 changes;
   - mean |dProbability| over valid outputs;
   - trial-level: P(trial has >=1 top-1 change), P(trial DUE);
+  - process-fatal crash rate P(trial PROCESS_FATAL) from the
+    restart-protocol summaries (restarts after a CUDA illegal-memory-
+    access trial death; 0 for campaigns that predate the protocol) --
+    the crash-rate-vs-BER reliability curve;
   - restore/sanity echoes from the verified summaries.
 
 Run: python3 tools/g5_faultinj/analyze_campaign.py [--root artifacts/g5/campaign]
@@ -132,6 +136,13 @@ def analyze_run(run_dir: Path) -> dict | None:
         "mean_dprob": prob_delta_sum / n_valid if n_valid else float("nan"),
         "max_dprob": prob_delta_max,
         "trials_top1": len(trials_top1), "trials_due": len(trials_due),
+        # restart protocol: trials the runner PROCESS died on (CUDA IMA
+        # mid-trial); absent from every CSV (no rows flushed), so they
+        # are excluded from the accuracy mean by construction, exactly
+        # like DUE trials, and counted here over the ATTEMPTED trials
+        "proc_fatal": summary.get("process_fatal_count", 0),
+        "trials_attempted": summary.get("trials_requested", n_trials),
+        "restart_segments": summary.get("segments", 1),
         "restore": summary.get("restore_totals", {}),
         "outcome_hist": summary.get("trial_outcome_histogram", {}),
     }
@@ -148,6 +159,9 @@ def pooled(runs: list[dict]) -> dict:
     ci = 1.96 * math.sqrt(p * (1 - p) / n_valid) if n_valid else 0.0
     return {
         "trials": sum(r["trials"] for r in runs),
+        "trials_attempted": sum(r.get("trials_attempted", r["trials"])
+                                for r in runs),
+        "proc_fatal": sum(r.get("proc_fatal", 0) for r in runs),
         "total_images": total_images,
         "top1_rate": p, "top1_ci": ci,
         "numeric_rate": ((n_top1 + sum(r["numeric"] for r in runs)) / n_valid
@@ -229,7 +243,8 @@ def main() -> int:
 
     hdr = (f"{'lvl':3} {'dev':3} {'trials':6} {'top1/valid':>11} "
            f"{'numeric%':>9} {'DUE%':>6} {'cleanAcc':>8} {'injAcc':>7} "
-           f"{'r2w/w2r':>9} {'mean|dP|':>8} {'trialTop1':>9} {'trialDUE':>8}")
+           f"{'r2w/w2r':>9} {'mean|dP|':>8} {'trialTop1':>9} {'trialDUE':>8} "
+           f"{'pf':>3}")
     print(hdr)
     for level in sorted(by_level):
         for run in sorted(by_level[level], key=lambda r: r["device"]):
@@ -245,7 +260,8 @@ def main() -> int:
                   f" {run['r2w']:3}/{run['w2r']:<3}"
                   f" {run['mean_dprob']:8.5f}"
                   f" {run['trials_top1']:5}/{run['trials']:3}"
-                  f" {run['trials_due']:4}/{run['trials']:3}")
+                  f" {run['trials_due']:4}/{run['trials']:3}"
+                  f" {run['proc_fatal']:3}")
 
     devices = sorted({r["device"] for r in runs})
     print()
@@ -253,13 +269,16 @@ def main() -> int:
           f"{'s' if len(devices) != 1 else ''}):")
     print(f"{'lvl':3} {'trials':6} {'top1 rate [95% CI]':>24} "
           f"{'numeric%':>9} {'DUE%':>6} {'cleanAcc':>8} {'injAcc':>7} "
-          f"{'mean|dP|':>8} {'P(trial top1)':>13} {'P(trial DUE)':>12}")
+          f"{'mean|dP|':>8} {'P(trial top1)':>13} {'P(trial DUE)':>12} "
+          f"{'P(trial crash)':>14}")
     for level in sorted(by_level):
         good = [r for r in by_level[level]
                 if r["status"] == "G5_CAMPAIGN_VERIFIED"]
         if not good:
             continue
         p = pooled(good)
+        crash = (p["proc_fatal"] / p["trials_attempted"]
+                 if p["trials_attempted"] else float("nan"))
         print(f"{level:3} {p['trials']:6} "
               f"{p['top1_rate']*100:10.4f}% +/-{p['top1_ci']*100:6.4f}"
               f" {p['numeric_rate']*100:8.3f}%"
@@ -268,7 +287,8 @@ def main() -> int:
               f" {p['acc_inj']*100:6.2f}%"
               f" {p['mean_dprob']:8.5f}"
               f" {p['trials_top1']/p['trials']*100:12.1f}%"
-              f" {p['trials_due']/p['trials']*100:11.1f}%")
+              f" {p['trials_due']/p['trials']*100:11.1f}%"
+              f" {crash*100:13.1f}%")
 
     spread_lines = []
     for level in sorted(by_level):

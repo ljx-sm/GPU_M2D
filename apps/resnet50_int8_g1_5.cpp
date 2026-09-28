@@ -1350,38 +1350,6 @@ struct G5SiteRecord {
     std::string restore_check{"pending"};
 };
 
-void write_g5_site_result(const std::string& path, const Options& options,
-                          const std::string& run_id,
-                          const std::vector<G5SiteRecord>& records) {
-    std::ofstream output(path);
-    if (!output) {
-        throw std::runtime_error("cannot write G5 site result: " + path);
-    }
-    output << "run_id,device,trial_index,event_index,site_index,target_id,"
-              "allocation_id,semantic_label,byte_offset,bit_in_byte,xor_mask,"
-              "gpu_va,expected_gpu_va,before,after,guard_bytes_unchanged,"
-              "reverse_map_ok,restored_byte_ok,restore_check\n";
-    for (const G5SiteRecord& record : records) {
-        output << run_id << ',' << options.device << ','
-               << record.site.trial_index << ',' << record.site.event_index
-               << ',' << record.site.site_index << ','
-               << record.site.target.target_id << ','
-               << record.site.target.allocation_id << ','
-               << record.semantic_label << ','
-               << record.site.target.byte_offset << ','
-               << record.site.target.bit_in_byte << ','
-               << static_cast<unsigned>(record.flip.xor_mask) << ','
-               << hex_address(record.flip.gpu_va) << ','
-               << hex_address(record.site.target.expected_gpu_va) << ','
-               << static_cast<unsigned>(record.flip.before) << ','
-               << static_cast<unsigned>(record.flip.after) << ','
-               << (record.alloc_guard_ok ? 1 : 0) << ','
-               << (record.reverse_map_ok ? 1 : 0) << ','
-               << (record.restored_byte_ok ? 1 : 0) << ','
-               << record.restore_check << '\n';
-    }
-}
-
 // One trial's summary row (site flips are joined per site in
 // g5_site_result.csv; per-image rows live in g5_image_detail.csv).
 struct G5TrialRecord {
@@ -1404,37 +1372,6 @@ struct G5TrialRecord {
     std::size_t restore_mismatch_bytes{0};
 };
 
-void write_g5_trial_result(const std::string& path, const Options& options,
-                           const std::string& run_id,
-                           const std::vector<G5TrialRecord>& records) {
-    std::ofstream output(path);
-    if (!output) {
-        throw std::runtime_error("cannot write G5 trial result: " + path);
-    }
-    output << "run_id,device,trial_index,site_count,event_count,images_total,"
-              "images_evaluated,images_benign,images_sdc_numeric,"
-              "images_sdc_top1,images_invalid,injected_outcome,sanity_class,"
-              "sanity_probability,sanity_matches_clean,restore_alloc_exact,"
-              "restore_alloc_mismatch,restore_alloc_skipped,"
-              "restore_mismatch_bytes\n";
-    for (const G5TrialRecord& record : records) {
-        output << run_id << ',' << options.device << ','
-               << record.trial_index << ',' << record.site_count << ','
-               << record.event_count << ',' << record.images_total << ','
-               << record.images_evaluated << ',' << record.images_benign
-               << ',' << record.images_sdc_numeric << ','
-               << record.images_sdc_top1 << ',' << record.images_invalid
-               << ',' << record.injected_outcome << ','
-               << record.sanity_class << ',' << std::setprecision(9)
-               << record.sanity_probability << ','
-               << (record.sanity_matches_clean ? 1 : 0) << ','
-               << record.restore_alloc_exact << ','
-               << record.restore_alloc_mismatch << ','
-               << record.restore_alloc_skipped << ','
-               << record.restore_mismatch_bytes << '\n';
-    }
-}
-
 // One evaluation image of one trial (the DUE abort marks the remaining
 // images of the trial evaluated=0/IMAGE_DUE).
 struct G5ImageRow {
@@ -1449,32 +1386,133 @@ struct G5ImageRow {
     const char* outcome{""};
 };
 
-void write_g5_image_detail(const std::string& path, const Options& options,
-                           const std::string& run_id,
-                           const std::vector<G5ImageRow>& rows) {
-    std::ofstream output(path);
-    if (!output) {
-        throw std::runtime_error("cannot write G5 image detail: " + path);
-    }
-    output << "run_id,device,trial_index,image_index,evaluated,clean_class,"
-              "injected_class,clean_probability,injected_probability,outcome\n"
-           << std::setprecision(9);
-    for (const G5ImageRow& row : rows) {
-        output << run_id << ',' << options.device << ',' << row.trial_index
-               << ',' << row.image_index << ',' << (row.evaluated ? 1 : 0)
-               << ',' << row.clean_class << ','
-               << (row.have_injected
-                       ? std::to_string(row.injected_class)
-                       : std::string("NA"))
-               << ',' << row.clean_probability << ',';
-        if (row.have_injected) {
-            output << row.injected_probability;
-        } else {
-            output << "NA";
+// The three campaign result CSVs are written INCREMENTALLY: the streams
+// open before the first trial and every COMPLETED trial's rows are
+// appended and flushed, so a process-fatal fault (a flip in TRT runtime
+// control state surfaces as a CUDA illegal memory access) that kills the
+// runner mid-trial cannot lose the completed trials' data. The
+// orchestrator's restart protocol resumes the level in a fresh process,
+// counts the dying trial as PROCESS_FATAL, and merges the segments -- so
+// a trial is on disk iff it reached TRIAL_END.
+struct G5ResultStreams {
+    std::ofstream site;
+    std::ofstream trial;
+    std::ofstream image;
+    std::size_t flushed_sites{0};
+    std::size_t flushed_trials{0};
+    std::size_t flushed_images{0};
+    std::string run_id;
+    int device{0};
+
+    G5ResultStreams(const std::string& prefix, const Options& options,
+                    const std::string& run_id_)
+        : run_id(run_id_), device(options.device) {
+        const std::string site_path = prefix + "_g5_site_result.csv";
+        const std::string trial_path = prefix + "_g5_trial_result.csv";
+        const std::string image_path = prefix + "_g5_image_detail.csv";
+        site.open(site_path, std::ios::out | std::ios::trunc);
+        trial.open(trial_path, std::ios::out | std::ios::trunc);
+        image.open(image_path, std::ios::out | std::ios::trunc);
+        if (!site || !trial || !image) {
+            throw std::runtime_error("cannot open G5 result CSVs at " +
+                                     prefix);
         }
-        output << ',' << row.outcome << '\n';
+        site << "run_id,device,trial_index,event_index,site_index,target_id,"
+                "allocation_id,semantic_label,byte_offset,bit_in_byte,xor_mask,"
+                "gpu_va,expected_gpu_va,before,after,guard_bytes_unchanged,"
+                "reverse_map_ok,restored_byte_ok,restore_check\n";
+        trial << "run_id,device,trial_index,site_count,event_count,images_total,"
+                 "images_evaluated,images_benign,images_sdc_numeric,"
+                 "images_sdc_top1,images_invalid,injected_outcome,sanity_class,"
+                 "sanity_probability,sanity_matches_clean,restore_alloc_exact,"
+                 "restore_alloc_mismatch,restore_alloc_skipped,"
+                 "restore_mismatch_bytes\n"
+              << std::setprecision(9);
+        image << "run_id,device,trial_index,image_index,evaluated,clean_class,"
+                 "injected_class,clean_probability,injected_probability,outcome\n"
+              << std::setprecision(9);
     }
-}
+
+    void append_site(const G5SiteRecord& record) {
+        site << run_id << ',' << device << ','
+             << record.site.trial_index << ',' << record.site.event_index
+             << ',' << record.site.site_index << ','
+             << record.site.target.target_id << ','
+             << record.site.target.allocation_id << ','
+             << record.semantic_label << ','
+             << record.site.target.byte_offset << ','
+             << record.site.target.bit_in_byte << ','
+             << static_cast<unsigned>(record.flip.xor_mask) << ','
+             << hex_address(record.flip.gpu_va) << ','
+             << hex_address(record.site.target.expected_gpu_va) << ','
+             << static_cast<unsigned>(record.flip.before) << ','
+             << static_cast<unsigned>(record.flip.after) << ','
+             << (record.alloc_guard_ok ? 1 : 0) << ','
+             << (record.reverse_map_ok ? 1 : 0) << ','
+             << (record.restored_byte_ok ? 1 : 0) << ','
+             << record.restore_check << '\n';
+    }
+
+    void append_trial(const G5TrialRecord& record) {
+        trial << run_id << ',' << device << ','
+              << record.trial_index << ',' << record.site_count << ','
+              << record.event_count << ',' << record.images_total << ','
+              << record.images_evaluated << ',' << record.images_benign
+              << ',' << record.images_sdc_numeric << ','
+              << record.images_sdc_top1 << ',' << record.images_invalid
+              << ',' << record.injected_outcome << ','
+              << record.sanity_class << ',' << record.sanity_probability
+              << ',' << (record.sanity_matches_clean ? 1 : 0) << ','
+              << record.restore_alloc_exact << ','
+              << record.restore_alloc_mismatch << ','
+              << record.restore_alloc_skipped << ','
+              << record.restore_mismatch_bytes << '\n';
+    }
+
+    void append_image(const G5ImageRow& row) {
+        image << run_id << ',' << device << ',' << row.trial_index
+              << ',' << row.image_index << ',' << (row.evaluated ? 1 : 0)
+              << ',' << row.clean_class << ','
+              << (row.have_injected ? std::to_string(row.injected_class)
+                                    : std::string("NA"))
+              << ',' << row.clean_probability << ',';
+        if (row.have_injected) {
+            image << row.injected_probability;
+        } else {
+            image << "NA";
+        }
+        image << ',' << row.outcome << '\n';
+    }
+
+    // Append every not-yet-flushed record (exactly one completed trial's
+    // worth) and flush all three streams to the OS: after this call the
+    // data survives the death of this process.
+    void flush_trial(const std::vector<G5SiteRecord>& sites,
+                     const std::vector<G5TrialRecord>& trials,
+                     const std::vector<G5ImageRow>& images) {
+        for (std::size_t index = flushed_sites; index < sites.size();
+             ++index) {
+            append_site(sites[index]);
+        }
+        for (std::size_t index = flushed_trials; index < trials.size();
+             ++index) {
+            append_trial(trials[index]);
+        }
+        for (std::size_t index = flushed_images; index < images.size();
+             ++index) {
+            append_image(images[index]);
+        }
+        flushed_sites = sites.size();
+        flushed_trials = trials.size();
+        flushed_images = images.size();
+        site.flush();
+        trial.flush();
+        image.flush();
+        if (!site || !trial || !image) {
+            throw std::runtime_error("flushing G5 result CSVs failed");
+        }
+    }
+};
 
 void write_g5_clean_pass(const std::string& path,
                          const std::vector<Sample>& samples,
@@ -1823,6 +1861,7 @@ int main(int argc, char** argv) {
         std::vector<G5SiteRecord> g5_site_records;
         std::vector<G5TrialRecord> g5_trial_records;
         std::vector<G5ImageRow> g5_image_rows;
+        G5ResultStreams g5_results(options.output_prefix, options, run_id);
 
         for (std::size_t trial_index = 0; trial_index < campaign_trials.size();
              ++trial_index) {
@@ -2227,14 +2266,17 @@ int main(int argc, char** argv) {
             observer.event_with("TRIAL_END",
                                 "trial_index=" + std::to_string(trial_index) +
                                     ",outcome=" + trial_outcome);
+            // Durable per-trial flush: this trial's rows reach the OS now
+            // (G5ResultStreams); a later process-fatal trial cannot
+            // destroy them.
+            g5_results.flush_trial(g5_site_records, g5_trial_records,
+                                   g5_image_rows);
         }
 
-        write_g5_site_result(options.output_prefix + "_g5_site_result.csv",
-                             options, run_id, g5_site_records);
-        write_g5_trial_result(options.output_prefix + "_g5_trial_result.csv",
-                              options, run_id, g5_trial_records);
-        write_g5_image_detail(options.output_prefix + "_g5_image_detail.csv",
-                              options, run_id, g5_image_rows);
+        // Final no-op append + stream-state check: every trial was already
+        // flushed at its TRIAL_END (G5ResultStreams).
+        g5_results.flush_trial(g5_site_records, g5_trial_records,
+                               g5_image_rows);
         // Final registry at the same path as the gate-time one: the
         // orchestrator snapshotted the gate file when the gate opened and
         // diffs it against this final content (stability check).
