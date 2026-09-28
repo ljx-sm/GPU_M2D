@@ -93,23 +93,41 @@ SCHEMA = "gpu-m2d.g5.bootstrap.v1"
 LADDER = [("L1", 1e-7), ("L2", 5e-7), ("L3", 1e-6), ("L4", 3e-6),
           ("L5", 5e-6), ("L6", 7e-6), ("L7", 1e-5)]
 
-# G7-v2 fault-surface scoping (user decision 2026-09-27, MobileNetV3
-# ONLY): the TensorRT create_execution_context-phase PRIVATE buffers are
-# runtime CONTROL state, not model data. The 2026-09-27 three-seed
-# diagnostic L1 runs (artifacts/g7/campaign/run_L1_gpu0_*) proved that a
-# flip at an address-bearing offset of trt-internal-5 (246,272 B) kills
-# the runner PROCESS with a CUDA illegal memory access on the FIRST
+# G7-v2 fault-surface scoping (user decisions 2026-09-27 / 2026-09-28,
+# PER MODEL -- never a blanket policy): the TensorRT
+# create_execution_context-phase PRIVATE buffers are runtime CONTROL
+# state (per-kernel argument blocks: device pointers, dims, scalars),
+# not model data. A flip at an address-bearing offset there kills the
+# runner PROCESS with a CUDA illegal memory access on the FIRST
 # injected inference -- a process-fatal reliability event, not an
-# output-observable fault -- while every flip in the weights, scratch,
-# deserialize constants, and input binding survived and restored (even
-# benign-offset internal-5 hits completed their trials). trt-internal-6
-# (2,048 B, same allocation class) is excluded with it. ResNet-50 and
-# the other extension models keep FULL-surface injection until they
-# individually show the same failure; the full-surface protocol stays
-# available as the control experiment (paper appendix).
+# output-observable fault -- while flips in the weights, scratch,
+# deserialize constants, and input bindings survive and restore (the
+# fatal and benign offsets interleave: pointer-bearing arguments vs
+# scalars). A model joins this table only after its own campaign showed
+# that failure; every other workload keeps FULL-surface injection, and
+# the full-surface data stays as the control experiment (paper
+# appendix).
+#
+# MobileNetV3 (2026-09-27): three-seed diagnostic L1 runs proved
+# trt-internal-5 (246,272 B) fatal/benign interleaved; excluded with
+# trt-internal-6 (2,048 B, same class) = 248,320 B = 2.66% of R.
+#
+# EfficientNet-B0 (2026-09-28): full-surface L1 completed (100 trials,
+# VERIFIED); L2 died at trial 83 on its first injected inference. The
+# dying trial's 69 flips were 43x internal-4 + 22x internal-0 + 3x
+# binding + 1x internal-2; the only structurally IMA-capable hits are
+# the ctx-phase ones (weights/constants/bindings are data, with
+# 2,747 / 4 / 217 prior benign hits respectively). This engine's
+# ctx-phase pool is internal-2 + internal-3 + internal-4 =
+# 9,944,064 B = 58.0% of R (mobilenet's 246 KB counterpart is 9.9 MB
+# here); observed fatal density ~1/4,200 pool bits puts L2 death at
+# p ~ 1%/trial (observed: trial 83) and L4+ at p -> 1, so no
+# full-surface campaign is possible above L1.
 EXCLUDES: dict[str, tuple[str, ...]] = {
     "g7v2_imagenet1k_mobilenetv3_large_100":
         ("trt-internal-5", "trt-internal-6"),
+    "g7v2_imagenet1k_efficientnet_b0":
+        ("trt-internal-2", "trt-internal-3", "trt-internal-4"),
 }
 
 
