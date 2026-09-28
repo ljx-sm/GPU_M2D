@@ -91,9 +91,10 @@ WORKLOAD_SUBTITLES = {
         "TensorRT) on the ImageNet-1K 10,000-image eval split\n"
         "NVIDIA GeForce RTX 4090 — GDDR6X device-memory bit flips "
         "(SBU 60% / MCU 40% event mix)\n"
-        "100 trials × 10,000 images per level; DUE-aborted trials excluded "
-        "from the mean (DUE rate reported separately);\n"
-        "error bars: 95% CI over the averaged trials"),
+        "100 trials × 10,000 images per level; DUE and PROCESS_FATAL "
+        "(crash) trials excluded from the mean, both reported as\n"
+        "reliability rates below; error bars: 95% CI over the "
+        "averaged trials"),
     "g7v2_imagenet1k_vit_base_patch16_224": (
         "ViT-Base/16 (INT8 PTQ, explicit Q/DQ, head quantized, TensorRT) "
         "on the ImageNet-1K 10,000-image eval split\n"
@@ -180,6 +181,8 @@ def collect(root: Path, min_trials: int,
     by_level: dict[str, list[float]] = defaultdict(list)
     clean_accs: dict[str, list[float]] = defaultdict(list)
     due_by_level: dict[str, int] = defaultdict(int)
+    pf_by_level: dict[str, int] = defaultdict(int)
+    attempted_by_level: dict[str, int] = defaultdict(int)
     for run_dir in sorted(root.glob("run_*")):
         if not (run_dir / "summary.json").is_file():
             continue
@@ -188,12 +191,18 @@ def collect(root: Path, min_trials: int,
             continue
         if run.get("workload") != workload:
             continue
-        if run.get("trials", 0) < min_trials:
+        # formality filter on the REQUESTED trial count: under the
+        # restart protocol a formal level completes trials - crashes,
+        # so completed < 100 is normal (a smoke run requested 1)
+        attempted = run.get("trials_attempted", run.get("trials", 0))
+        if attempted < min_trials:
             continue
         accs, clean, n_due = per_trial_accuracies(run_dir)
         by_level[run["level"]].extend(accs)
         clean_accs[run["level"]].append(clean)
         due_by_level[run["level"]] += n_due
+        pf_by_level[run["level"]] += run.get("proc_fatal", 0)
+        attempted_by_level[run["level"]] += attempted
 
     out: dict[str, dict] = {}
     for name in order:
@@ -215,6 +224,8 @@ def collect(root: Path, min_trials: int,
             "ci": 1.96 * sd / math.sqrt(len(accs)),
             "clean": sum(clean_accs[name]) / len(clean_accs[name]),
             "due_trials": n_due,
+            "pf_trials": pf_by_level.get(name, 0),
+            "attempted": attempted_by_level.get(name, len(accs)),
         }
     return out
 
@@ -250,7 +261,18 @@ def main() -> int:
     cis = [data[n]["ci"] * 100 for n in names]
     clean = sum(data[n]["clean"] for n in names) / len(names) * 100
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.7))
+    # reliability panel only for workloads that actually recorded
+    # PROCESS_FATAL trials (restart protocol); a crash-free workload
+    # keeps the original single-panel figure unchanged
+    show_reliability = any(data[n]["pf_trials"] for n in names)
+    if show_reliability:
+        fig, (ax, axr) = plt.subplots(
+            2, 1, figsize=(7.2, 6.7), sharex=True,
+            gridspec_kw={"height_ratios": [2.35, 1.0]})
+        axr.set_facecolor("white")
+    else:
+        fig, ax = plt.subplots(figsize=(7.2, 4.7))
+        axr = None
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
 
@@ -262,6 +284,15 @@ def main() -> int:
         ax.spines[side].set_color(AXIS)
         ax.spines[side].set_linewidth(0.9)
     ax.tick_params(colors=INK_MUTED, labelsize=9.5, length=3.5)
+    if axr is not None:
+        axr.grid(axis="y", color=GRID, linewidth=0.8, zorder=0)
+        for side in ("top", "right"):
+            axr.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            axr.spines[side].set_color(AXIS)
+            axr.spines[side].set_linewidth(0.9)
+        axr.tick_params(colors=INK_MUTED, labelsize=9.5, length=3.5)
+        ax.tick_params(labelbottom=False)
 
     # clean baseline: neutral reference, not a series
     ax.axhline(clean, color=INK_MUTED, linewidth=1.1, linestyle=(0, (4, 3)),
@@ -319,10 +350,12 @@ def main() -> int:
     # L7-L9 markers is crowded (tall bars, connecting segments, gridlines
     # at this data height) and every fixed-offset placement there either
     # crossed ink or needed an opaque patch that erased neighboring text;
-    # the margin below the axis names is empty at every rendering
+    # the margin below the axis names is empty at every rendering.
+    # (Two-panel mode plots the DUE rate as a series instead -- the
+    # footnote would duplicate it.)
     due_levels = [(name, data[name]["due_trials"]) for name in names
                   if data[name]["due_trials"]]
-    if due_levels:
+    if due_levels and not show_reliability:
         note = ", ".join(f"{name} {n}/{data[name]['trials'] + n}"
                          for name, n in due_levels)
         mid = math.sqrt(data[due_levels[0][0]]["ber"]
@@ -331,6 +364,26 @@ def main() -> int:
                     xy=(mid, 0), xycoords=("data", "axes fraction"),
                     xytext=(0, -36), textcoords="offset points",
                     ha="center", fontsize=8, color=INK_MUTED)
+
+    if show_reliability:
+        # per-trial reliability outcomes vs BER, both excluded from the
+        # accuracy mean above: the PROCESS_FATAL crash rate (a flip in
+        # TRT ctx-phase control state kills the runner process mid-trial;
+        # the campaign restarts and pools) and the DUE trial rate (first
+        # invalid output aborts the trial's pass). Rates of ATTEMPTED
+        # trials; exact counts go to the points CSV and stdout.
+        crash = [data[n]["pf_trials"] / data[n]["attempted"] * 100
+                 for n in names]
+        due_rate = [data[n]["due_trials"] / data[n]["attempted"] * 100
+                    for n in names]
+        axr.plot(bers, crash, "o-", color=SERIES, markersize=5,
+                 linewidth=1.6, label="P(trial crash) — PROCESS_FATAL")
+        axr.plot(bers, due_rate, "s--", color=INK_MUTED, markersize=4.5,
+                 linewidth=1.4, label="P(trial DUE)")
+        axr.set_ylabel("Trials (%)", fontsize=10, color=INK_PRIMARY)
+        axr.set_ylim(-0.5, max(crash + due_rate) * 1.45 + 1.0)
+        axr.legend(frameon=False, fontsize=8.5, loc="upper left",
+                   labelcolor=INK_SECONDARY)
 
     ax.set_xscale("log")
     # data-driven window (the G5 hardcode assumed the nine-level ladder's
@@ -343,8 +396,11 @@ def main() -> int:
     step = 10 if span > 45 else 5 if span > 18 else 2 if span > 7 else 1
     ticks = list(range(int(math.ceil(y_floor / step)) * step, 101, step))
     ax.yaxis.set_major_locator(FixedLocator(ticks))
-    ax.set_xlabel("Bit error rate (BER, fraction of resident bits flipped "
-                  "per trial)", fontsize=11, color=INK_PRIMARY, labelpad=8)
+    # the x-axis chrome lives on the BOTTOM axis of the two-panel figure
+    target = axr if axr is not None else ax
+    target.set_xlabel("Bit error rate (BER, fraction of resident bits "
+                      "flipped per trial)", fontsize=11, color=INK_PRIMARY,
+                      labelpad=8)
     ax.set_ylabel("Top-1 accuracy (%)", fontsize=11, color=INK_PRIMARY)
 
     def tick_label(ber: float) -> str:
@@ -353,14 +409,15 @@ def main() -> int:
         coeff = ber / 10 ** math.floor(math.log10(ber))
         return rf"${coeff:.0f}\times 10^{{{math.floor(math.log10(ber)):.0f}}}$"
 
-    ax.xaxis.set_major_locator(FixedLocator(bers))
-    ax.set_xticklabels([tick_label(b) for b in bers])
-    ax.minorticks_off()
+    target.xaxis.set_major_locator(FixedLocator(bers))
+    target.set_xticklabels([tick_label(b) for b in bers])
+    target.minorticks_off()
     # level names as a second, muted row under the tick labels
     for name, ber in zip(names, bers):
-        ax.annotate(name, xy=(ber, 0), xycoords=("data", "axes fraction"),
-                    xytext=(0, -22), textcoords="offset points",
-                    ha="center", fontsize=8, color=INK_MUTED)
+        target.annotate(name, xy=(ber, 0),
+                        xycoords=("data", "axes fraction"),
+                        xytext=(0, -22), textcoords="offset points",
+                        ha="center", fontsize=8, color=INK_MUTED)
 
     fig.suptitle("Top-1 accuracy vs. injected GDDR6X bit-error rate",
                  fontsize=13, fontweight="bold", color=INK_PRIMARY, y=0.975)
@@ -377,19 +434,23 @@ def main() -> int:
             "w", encoding="utf-8", newline="") as sink:
         writer = csv.writer(sink)
         writer.writerow(["level", "ber", "trials", "acc_pct", "ci95_pct",
-                         "clean_acc_pct"])
+                         "clean_acc_pct", "due_trials", "pf_trials",
+                         "attempted"])
         for name in names:
             d = data[name]
             writer.writerow([name, f"{d['ber']:g}", d["trials"],
                              f"{d['acc']*100:.4f}", f"{d['ci']*100:.4f}",
-                             f"{d['clean']*100:.4f}"])
+                             f"{d['clean']*100:.4f}", d["due_trials"],
+                             d["pf_trials"], d["attempted"]])
     print(f"wrote fig_accuracy_vs_ber.{{png,pdf}} + points csv to {outdir}")
     for name in names:
         d = data[name]
         due = d["due_trials"]
+        extra = (f" averaged, {due} DUE-excluded" if due else "") + \
+            (f", {d['pf_trials']} PROCESS_FATAL of {d['attempted']}"
+             if d["pf_trials"] else "")
         print(f"  {name}: BER {d['ber']:g}  acc {d['acc']*100:.2f}%"
-              f"  +/- {d['ci']*100:.2f} pp  ({d['trials']} trials"
-              + (f" averaged, {due} DUE-excluded)" if due else ")"))
+              f"  +/- {d['ci']*100:.2f} pp  ({d['trials']} trials{extra})")
     return 0
 
 
