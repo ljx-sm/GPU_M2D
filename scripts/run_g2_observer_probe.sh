@@ -81,6 +81,10 @@
 #   [--class-count N] [--preprocess legacy|canonical] [--resize-scale N]
 #   [--interp bicubic|bilinear] [--mean R,G,B] [--std R,G,B]
 #   [--prelude-seconds N]   host-preprocessing budget (G7 10K needs more)
+#   [--image-cache-dir DIR] host preprocessed-image cache (default
+#                           <output-root>/../image_cache; the first run
+#                           populates it, restart segments reload it in
+#                           seconds -- key-checked, safe fallback)
 #   (also honors --table / --sample-index / --timeout-seconds above)
 #
 # The tensorrt mode also regenerates artifacts/g2/gpu_va_pa_map.csv from the
@@ -116,7 +120,7 @@ while [[ $# -gt 0 ]]; do
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --engine|--sample-csv|--workload|--class-count|\
         --preprocess|--resize-scale|--interp|--mean|--std|\
-        --prelude-seconds) \
+        --prelude-seconds|--image-cache-dir) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --output-root) CUSTOM_OUTPUT_ROOT="$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --bootstrap) EXTRA_ARGS+=("$1"); shift 1 ;;

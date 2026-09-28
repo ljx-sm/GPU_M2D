@@ -313,3 +313,19 @@ carries `process_fatal_trials`/`process_fatal_count`/`segments`;
 `analyze_campaign.py` prints the per-run `pf` column and the pooled
 P(trial crash) reliability column. Every other death shape fails the
 level closed (exit 2).
+
+**Host-image cache (same day).** Each restart segment's prelude
+re-preprocessed the 10K ImageNet pass on the host (~3 min CPU), which
+dominated the per-restart cost (~4.5 min). The runner now caches the
+preprocessed CHW float32 buffer (5.6 GiB) at
+`<output-root>/../image_cache/g5img_<key>.bin`, keyed by
+SHA-256(sample CSV content + preprocessing spec + image count + tensor
+size + the runner binary itself); the key, header fields, and blob
+checksum are all verified on load, and ANY miss/mismatch/I-O error
+falls back to fresh preprocessing and rewrites the file (pure
+optimization, zero effect on the gated window or trial semantics — the
+cache is shared by every workload with the same CSV + spec, so all
+five models reuse one file). SHA-256 is a self-contained FIPS
+implementation verified against the standard known-answer vectors
+("", "abc", 1M×'a'). A relaunch now costs ~1.5 min (observer + snapshot
++ clean pass) instead of ~4.5.

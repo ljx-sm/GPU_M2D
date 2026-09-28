@@ -825,6 +825,14 @@ def parse_args() -> argparse.Namespace:
                         help="R,G,B canonical-mode mean (model_meta.json)")
     parser.add_argument("--std", default=None,
                         help="R,G,B canonical-mode std (model_meta.json)")
+    parser.add_argument("--image-cache-dir", type=Path, default=None,
+                        help="host preprocessed-image cache directory shared "
+                             "by every segment/restart of every workload "
+                             "with the same sample CSV + preprocessing spec "
+                             "(default: <output-root>/../image_cache). The "
+                             "runner key-checks the cache fail-closed and "
+                             "falls back to fresh preprocessing on any "
+                             "mismatch; the first run populates it")
     parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
     parser.add_argument("--output-root", type=Path,
                         default=PROJECT / "artifacts/g5/campaign")
@@ -980,6 +988,8 @@ def execute_segment(args: argparse.Namespace, contract: dict,
         runner_passthrough += ["--mean", args.mean]
     if args.std is not None:
         runner_passthrough += ["--std", args.std]
+    if args.image_cache_dir is not None:
+        runner_passthrough += ["--image-cache-dir", str(args.image_cache_dir)]
 
     observer: G2Observer | None = None
     process: subprocess.Popen[bytes] | None = None
@@ -1534,6 +1544,13 @@ def run_once(args: argparse.Namespace) -> int:
 
     cotenancy = cotenancy_snapshot(args.device)
     device_uuid = query_device_uuid(args.device)
+    # shared across levels, workloads (same CSV + preprocessing spec), and
+    # every restart segment: one 5.6 GiB file populates once, then each
+    # relaunched segment loads it in seconds instead of re-preprocessing
+    # 10K images on the host (~3 min CPU) before the pre-allocation gate
+    if args.image_cache_dir is None:
+        args.image_cache_dir = args.output_root.parent / "image_cache"
+    print(f"image cache dir: {args.image_cache_dir}")
     level_tag = args.level if args.level else "bootstrap"
     level_dir = args.output_root / \
         f"run_{level_tag}_gpu{args.device}_{time.time_ns()}"

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -490,6 +491,12 @@ struct Options {
     // so the canonical preprocessing can be diffed bit-exactly against the
     // python contract.
     std::string dump_preprocessed;
+    // Restart-protocol host-image cache directory (empty = disabled): the
+    // campaign prelude's preprocessed CHW float buffer is written here
+    // keyed by every input that determines its bytes, so a relaunched
+    // segment skips the ~3 min CPU re-preprocessing of the 10K pass.
+    // Pure optimization -- any mismatch falls back to fresh work.
+    std::string image_cache_dir;
 };
 
 struct Sample {
@@ -644,6 +651,11 @@ Options parse_options(int argc, char** argv) {
             options.canonical_std = parse_rgb_triple(value, "--std");
         } else if (key == "--dump-preprocessed") {
             options.dump_preprocessed = value;
+        } else if (key == "--image-cache-dir") {
+            options.image_cache_dir = value;
+            if (value.empty()) {
+                throw std::invalid_argument("--image-cache-dir needs a path");
+            }
         } else {
             throw std::invalid_argument("unknown argument: " + key);
         }
@@ -661,7 +673,8 @@ Options parse_options(int argc, char** argv) {
             "--campaign-gate-timeout-seconds N] "
             "[--class-count N --preprocess legacy|canonical --resize-scale N "
             "--interp bicubic|bilinear --mean R,G,B --std R,G,B "
-            "--dump-preprocessed PATH]");
+            "--dump-preprocessed PATH] "
+            "[--image-cache-dir DIR]");
     }
     if (options.injection_work.empty() != options.injection_release.empty()) {
         throw std::invalid_argument(
@@ -826,6 +839,355 @@ std::vector<float> preprocess(const std::string& path,
         }
     }
     return chw;
+}
+
+// ---- G5 campaign host-image cache (restart protocol) ------------------
+// The campaign prelude preprocesses every evaluation image on the host
+// (~3 min CPU for the G7 10K ImageNet pass) before the pre-allocation
+// gate, and a process-fatal trial restart relaunches that whole prelude.
+// This cache stores the preprocessed CHW float32 buffer on disk, keyed
+// by every input that determines its bytes: the sample CSV content, the
+// full preprocessing spec, the image count and per-image tensor size,
+// and the runner BINARY itself (a rebuild against a different OpenCV
+// could preprocess differently). Pure optimization: any miss, mismatch,
+// or I/O error falls back to fresh preprocessing and rewrites the file;
+// the gated window, the clean pass, and the trial loop are untouched.
+constexpr unsigned char kImageCacheMagic[8] = {'G', 'M', '2', 'D',
+                                               'I', 'M', 'G', 'C'};
+constexpr uint32_t kImageCacheVersion = 1;
+
+class Sha256 {
+public:
+    Sha256() { reset(); }
+    void reset() {
+        state_[0] = 0x6a09e667u; state_[1] = 0xbb67ae85u;
+        state_[2] = 0x3c6ef372u; state_[3] = 0xa54ff53au;
+        state_[4] = 0x510e527fu; state_[5] = 0x9b05688cu;
+        state_[6] = 0x1f83d9abu; state_[7] = 0x5be0cd19u;
+        bits_ = 0;
+        fill_ = 0;
+    }
+    void update(const void* data, std::size_t size) {
+        const unsigned char* p = static_cast<const unsigned char*>(data);
+        bits_ += static_cast<uint64_t>(size) * 8u;
+        while (size > 0) {
+            const std::size_t take = std::min(size, sizeof(buffer_) - fill_);
+            std::memcpy(buffer_ + fill_, p, take);
+            fill_ += take;
+            p += take;
+            size -= take;
+            if (fill_ == sizeof(buffer_)) {
+                compress(buffer_);
+                fill_ = 0;
+            }
+        }
+    }
+    void update_u32(uint32_t value) {
+        unsigned char b[4] = {static_cast<unsigned char>(value >> 24),
+                              static_cast<unsigned char>(value >> 16),
+                              static_cast<unsigned char>(value >> 8),
+                              static_cast<unsigned char>(value)};
+        update(b, sizeof(b));
+    }
+    void update_u64(uint64_t value) {
+        unsigned char b[8];
+        for (int i = 0; i < 8; ++i) {
+            b[i] = static_cast<unsigned char>(value >> (56 - 8 * i));
+        }
+        update(b, sizeof(b));
+    }
+    void update_float(float value) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        update_u32(bits);
+    }
+    // finalizes this hash object in place
+    std::array<unsigned char, 32> digest() {
+        const uint64_t bits = bits_;  // padding must not extend the length
+        const unsigned char one = 0x80;
+        update(&one, 1);
+        const unsigned char zero = 0x00;
+        while (fill_ != 56) {
+            update(&zero, 1);
+        }
+        unsigned char length[8];
+        for (int i = 0; i < 8; ++i) {
+            length[i] = static_cast<unsigned char>(bits >> (56 - 8 * i));
+        }
+        update(length, sizeof(length));
+        std::array<unsigned char, 32> out{};
+        for (int i = 0; i < 8; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                out[static_cast<std::size_t>(4 * i + j)] =
+                    static_cast<unsigned char>(state_[i] >> (24 - 8 * j));
+            }
+        }
+        return out;
+    }
+
+private:
+    static uint32_t rotr(uint32_t x, int n) {
+        return (x >> n) | (x << (32 - n));
+    }
+    void compress(const unsigned char* p) {
+        static constexpr uint32_t K[64] = {
+            0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+            0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+            0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+            0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+            0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+            0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+            0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+            0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+            0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+            0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+            0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+            0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+            0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+            0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+            0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+            0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u};
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (static_cast<uint32_t>(p[4 * i]) << 24) |
+                   (static_cast<uint32_t>(p[4 * i + 1]) << 16) |
+                   (static_cast<uint32_t>(p[4 * i + 2]) << 8) |
+                   static_cast<uint32_t>(p[4 * i + 3]);
+        }
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^
+                                (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^
+                                (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = state_[0], b = state_[1], c = state_[2], d = state_[3];
+        uint32_t e = state_[4], f = state_[5], g = state_[6], h = state_[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch = (e & f) ^ (~e & g);
+            const uint32_t t1 = h + S1 + ch + K[i] + w[i];
+            const uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t t2 = S0 + maj;
+            h = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        state_[0] += a; state_[1] += b; state_[2] += c; state_[3] += d;
+        state_[4] += e; state_[5] += f; state_[6] += g; state_[7] += h;
+    }
+    uint32_t state_[8];
+    uint64_t bits_;
+    unsigned char buffer_[64];
+    std::size_t fill_;
+};
+
+std::string to_hex(const std::array<unsigned char, 32>& digest) {
+    static const char kDigits[] = "0123456789abcdef";
+    std::string out(64, '0');
+    for (std::size_t i = 0; i < digest.size(); ++i) {
+        out[2 * i] = kDigits[digest[i] >> 4];
+        out[2 * i + 1] = kDigits[digest[i] & 0x0F];
+    }
+    return out;
+}
+
+std::array<unsigned char, 32> sha256_file(const std::string& path,
+                                           const char* what) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error(std::string("cannot open ") + what + ": " +
+                                 path);
+    }
+    Sha256 hash;
+    std::vector<char> chunk(1u << 20);
+    while (file) {
+        file.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+        const std::streamsize got = file.gcount();
+        if (got > 0) {
+            hash.update(chunk.data(), static_cast<std::size_t>(got));
+        }
+    }
+    if (file.bad()) {
+        throw std::runtime_error(std::string("read error on ") + what + ": " +
+                                 path);
+    }
+    return hash.digest();
+}
+
+// Field encoding (the offline python cross-check mirrors it exactly):
+// tag | u32 schema | u32 have-self | self[32]? | csv[32] | u64 count |
+// u64 floats/image | u32 canonical | u32 scale | u32 interpolation |
+// 3x f32 mean bits | 3x f32 std bits
+std::array<unsigned char, 32> image_cache_key(
+    const Options& options, const PreprocessSpec& spec,
+    std::size_t image_count, std::size_t floats_per_image) {
+    const std::array<unsigned char, 32> csv =
+        sha256_file(options.sample_csv, "sample CSV");
+    char self_path[4096] = {};
+    const ssize_t self_length =
+        readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    bool have_self = self_length > 0;
+    const std::array<unsigned char, 32> self =
+        have_self ? sha256_file(std::string(self_path, static_cast<std::size_t>(
+                                                          self_length)),
+                                 "runner binary")
+                  : std::array<unsigned char, 32>{};
+    Sha256 hash;
+    static const char kTag[] = "gpu-m2d g5 host image cache key v1";
+    hash.update(kTag, sizeof(kTag) - 1);
+    hash.update_u32(1);
+    hash.update_u32(have_self ? 1u : 0u);
+    if (have_self) {
+        hash.update(self.data(), self.size());
+    }
+    hash.update(csv.data(), csv.size());
+    hash.update_u64(image_count);
+    hash.update_u64(floats_per_image);
+    hash.update_u32(spec.canonical ? 1u : 0u);
+    hash.update_u32(static_cast<uint32_t>(spec.resize_scale));
+    hash.update_u32(static_cast<uint32_t>(spec.resize_interpolation));
+    for (int i = 0; i < 3; ++i) {
+        hash.update_float(spec.mean[static_cast<std::size_t>(i)]);
+    }
+    for (int i = 0; i < 3; ++i) {
+        hash.update_float(spec.std[static_cast<std::size_t>(i)]);
+    }
+    return hash.digest();
+}
+
+// Returns true and fills `out` with the cached preprocessed buffer on a
+// verified hit; false (out cleared) on any miss -- the caller then
+// preprocesses fresh. Every failure path is a fallback, never an abort.
+bool load_image_cache(const std::string& cache_dir,
+                      const std::array<unsigned char, 32>& key,
+                      std::size_t image_count, std::size_t floats_per_image,
+                      std::vector<float>& out) {
+    const std::string path = cache_dir + "/g5img_" + to_hex(key).substr(0, 16) +
+                             ".bin";
+    std::cout << "image-cache: key=" << to_hex(key) << '\n';
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        std::cout << "image-cache: no cache file yet (" << path << ")\n";
+        return false;
+    }
+    try {
+        unsigned char magic[8];
+        unsigned char file_key[32];
+        unsigned char blob_sha[32];
+        auto read_exact = [&file](void* dst, std::size_t size,
+                                  const char* what) {
+            file.read(static_cast<char*>(dst),
+                      static_cast<std::streamsize>(size));
+            if (file.gcount() != static_cast<std::streamsize>(size)) {
+                throw std::runtime_error(std::string("truncated ") + what);
+            }
+        };
+        read_exact(magic, sizeof(magic), "magic");
+        if (std::memcmp(magic, kImageCacheMagic, sizeof(magic)) != 0) {
+            throw std::runtime_error("bad magic");
+        }
+        uint32_t version = 0;
+        read_exact(&version, sizeof(version), "version");
+        if (version != kImageCacheVersion) {
+            throw std::runtime_error("cache version mismatch");
+        }
+        read_exact(file_key, sizeof(file_key), "key");
+        if (std::memcmp(file_key, key.data(), key.size()) != 0) {
+            throw std::runtime_error("key mismatch");
+        }
+        uint64_t count = 0;
+        uint64_t per_image = 0;
+        read_exact(&count, sizeof(count), "image count");
+        read_exact(&per_image, sizeof(per_image), "tensor size");
+        if (count != image_count || per_image != floats_per_image) {
+            throw std::runtime_error("count/tensor-size mismatch");
+        }
+        read_exact(blob_sha, sizeof(blob_sha), "blob checksum");
+        const std::size_t total_bytes =
+            image_count * floats_per_image * sizeof(float);
+        out.assign(image_count * floats_per_image, 0.0F);
+        Sha256 hasher;
+        std::vector<char> chunk(1u << 20);
+        std::size_t done = 0;
+        while (done < total_bytes) {
+            const std::size_t take = std::min(chunk.size(), total_bytes - done);
+            read_exact(chunk.data(), take, "blob");
+            hasher.update(chunk.data(), take);
+            std::memcpy(reinterpret_cast<char*>(out.data()) + done, chunk.data(),
+                        take);
+            done += take;
+        }
+        file.get();
+        if (!file.eof()) {
+            throw std::runtime_error("trailing bytes after the blob");
+        }
+        const std::array<unsigned char, 32> have = hasher.digest();
+        if (std::memcmp(have.data(), blob_sha, sizeof(blob_sha)) != 0) {
+            throw std::runtime_error("blob checksum mismatch");
+        }
+        std::cout << "image-cache: HIT " << path << " (" << image_count
+                  << " images, " << (total_bytes >> 20) << " MiB)\n";
+        return true;
+    } catch (const std::exception& error) {
+        std::cout << "image-cache: miss (" << error.what()
+                  << "), preprocessing fresh\n";
+        out.clear();
+        return false;
+    }
+}
+
+// Best effort: a failure to write is reported and ignored (the next
+// segment simply preprocesses fresh again).
+void store_image_cache(const std::string& cache_dir,
+                       const std::array<unsigned char, 32>& key,
+                       std::size_t image_count, std::size_t floats_per_image,
+                       const std::vector<float>& blob) {
+    const std::string path = cache_dir + "/g5img_" + to_hex(key).substr(0, 16) +
+                             ".bin";
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    try {
+        std::filesystem::create_directories(cache_dir);
+        Sha256 hasher;
+        hasher.update(blob.data(), blob.size() * sizeof(float));
+        const std::array<unsigned char, 32> blob_sha = hasher.digest();
+        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            throw std::runtime_error("cannot create " + tmp);
+        }
+        file.write(reinterpret_cast<const char*>(kImageCacheMagic),
+                   sizeof(kImageCacheMagic));
+        const uint32_t version = kImageCacheVersion;
+        file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        file.write(reinterpret_cast<const char*>(key.data()), key.size());
+        const uint64_t count = image_count;
+        const uint64_t per_image = floats_per_image;
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        file.write(reinterpret_cast<const char*>(&per_image), sizeof(per_image));
+        file.write(reinterpret_cast<const char*>(blob_sha.data()),
+                   blob_sha.size());
+        const std::size_t total = blob.size() * sizeof(float);
+        const char* raw = reinterpret_cast<const char*>(blob.data());
+        std::size_t done = 0;
+        while (done < total) {
+            const std::size_t take = std::min<std::size_t>(1u << 20, total - done);
+            file.write(raw + done, static_cast<std::streamsize>(take));
+            done += take;
+        }
+        file.flush();
+        if (!file) {
+            throw std::runtime_error("write failed on " + tmp);
+        }
+        file.close();
+        std::filesystem::rename(tmp, path);
+        std::cout << "image-cache: stored " << path << " (" << image_count
+                  << " images, " << (total >> 20) << " MiB)\n";
+    } catch (const std::exception& error) {
+        std::error_code ignored;
+        std::filesystem::remove(tmp, ignored);
+        std::cout << "image-cache: store failed (" << error.what()
+                  << "), continuing without a cache\n";
+    }
 }
 
 gpu_m2d::DType to_gpu_m2d_dtype(nvinfer1::DataType dtype) {
@@ -1576,7 +1938,9 @@ int main(int argc, char** argv) {
         // G5/G7 campaign: stage every evaluation image's preprocessed input
         // on the host BEFORE the gate (CPU-only work; the gated window
         // stays CUDA-only). ~600 MB host for the G5 1000-image pass,
-        // ~5.6 GiB for the G7 10000-image pass.
+        // ~5.6 GiB for the G7 10000-image pass. With --image-cache-dir the
+        // buffer comes from the on-disk cache when its key matches (the
+        // restart protocol's relaunches then skip the ~3 min re-preprocess).
         std::vector<Sample> campaign_samples;
         std::vector<float> campaign_input;
         if (!options.campaign_work.empty()) {
@@ -1585,12 +1949,30 @@ int main(int argc, char** argv) {
                 throw std::out_of_range(
                     "sanity sample index is outside the campaign CSV");
             }
-            campaign_input.reserve(campaign_samples.size() * input.size());
-            for (const Sample& eval_sample : campaign_samples) {
-                const std::vector<float> staged =
-                    preprocess(eval_sample.path, preprocess_spec);
-                campaign_input.insert(campaign_input.end(), staged.begin(),
-                                      staged.end());
+            const std::size_t floats_per_image = input.size();
+            bool from_cache = false;
+            std::array<unsigned char, 32> cache_key{};
+            if (!options.image_cache_dir.empty()) {
+                cache_key = image_cache_key(options, preprocess_spec,
+                                            campaign_samples.size(),
+                                            floats_per_image);
+                from_cache = load_image_cache(options.image_cache_dir, cache_key,
+                                              campaign_samples.size(),
+                                              floats_per_image, campaign_input);
+            }
+            if (!from_cache) {
+                campaign_input.reserve(campaign_samples.size() * floats_per_image);
+                for (const Sample& eval_sample : campaign_samples) {
+                    const std::vector<float> staged =
+                        preprocess(eval_sample.path, preprocess_spec);
+                    campaign_input.insert(campaign_input.end(), staged.begin(),
+                                          staged.end());
+                }
+                if (!options.image_cache_dir.empty()) {
+                    store_image_cache(options.image_cache_dir, cache_key,
+                                      campaign_samples.size(), floats_per_image,
+                                      campaign_input);
+                }
             }
         }
         const std::string run_id =
