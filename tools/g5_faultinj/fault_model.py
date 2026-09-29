@@ -267,19 +267,39 @@ WORKLOADS = {
              "t": 260},
         ],
     },
-    # PLACEHOLDER (R unfrozen) -- fill via
-    # tools/g7_prep/freeze_g7v2_workload.py after this engine's
-    # --bootstrap run.
+    # G7-v2 five-model extension (user decision 2026-09-27):
+    # Swin-Tiny/ImageNet-1K on the SAME head-quantized v2 INT8
+    # engine family as g7v2_imagenet1k_resnet50 (every weighted
+    # op INT8 per-channel, classifier head included); seven-level
+    # ladder L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5
+    # (the ResNet-50 curve's L3-L9 BERs).
+    # R was MEASURED by the
+    # bootstrap run
+    # artifacts/g7/campaign/run_bootstrap_gpu0_1790645259232989747
+    # (engine /data1/luojx/g7_models/swin_tiny_patch4_window7_224/clean.engine,
+    # sha256 ace6aad4c63c...,
+    # snapshot allocations=8, pa_pages=22, rows=27)
+    # and the seven levels derived from it; every literal is an
+    # EXHAUSTIVE-solver literal (bits past the 3000-bit windowed
+    # threshold were forced exhaustive at freeze time and
+    # cross-checked against the windowed path). Frozen in place
+    # by tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_swin_tiny_patch4_window7_224": {
-        "resident_bytes_nominal": 0,
+        "resident_bytes_nominal": 43_799_616,
         "levels": [
-            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L1", "ber": 1e-07, "bits": 35, "s": 13, "d": 5, "t": 4},
+            {"level": "L2", "ber": 5e-07, "bits": 175, "s": 65, "d": 22,
+             "t": 22},
+            {"level": "L3", "ber": 1e-06, "bits": 350, "s": 130, "d": 44,
+             "t": 44},
+            {"level": "L4", "ber": 3e-06, "bits": 1051, "s": 394, "d": 132,
+             "t": 131},
+            {"level": "L5", "ber": 5e-06, "bits": 1752, "s": 657, "d": 219,
+             "t": 219},
+            {"level": "L6", "ber": 7e-06, "bits": 2453, "s": 920, "d": 306,
+             "t": 307},
+            {"level": "L7", "ber": 1e-05, "bits": 3504, "s": 1314, "d": 438,
+             "t": 438},
         ],
     },
 }
