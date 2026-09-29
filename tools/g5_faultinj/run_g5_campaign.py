@@ -59,10 +59,10 @@ gated segment (new observer, snapshot, and sampling of the remaining
 trial slots -- trials are independent draws of the same frozen model, so
 segments pool statistically; segment k seeds from --seed + k and its
 trial numbering is shifted to its global execution-order slots at merge
-time). Only the illegal-memory-access signature mid-trial is recoverable;
-every other death, and any prefix-verification failure, fails the whole
-level closed (exit 2). A --bootstrap run is exempt: single flat run,
-measure-only.
+time). Only a mid-trial death carrying a known fatal CUDA signature (see
+RECOVERABLE_CUDA_SIGNATURES) is recoverable; every other death, and any
+prefix-verification failure, fails the whole level closed (exit 2). A
+--bootstrap run is exempt: single flat run, measure-only.
 
 Fail-closed: any ledger failure, snapshot problem, residency mismatch
 with the frozen R, composition/distinctness violation, result
@@ -160,13 +160,24 @@ TRIAL_EVENT_NAMES = {"TRIAL_BEGIN", "SITE_FLIPPED", "TRIAL_INJECTED_END",
                      "TRIAL_SANITY_END", "TRIAL_END"}
 
 OUTCOMES = ("BENIGN", "SDC_TOP1", "SDC_NUMERIC", "DUE_INVALID_OUTPUT")
-# Restart protocol: the trial the runner process DIED on (CUDA illegal
-# memory access from a flip in TRT runtime control state). Like a DUE it
+# Restart protocol: the trial the runner process DIED on (a flip in TRT
+# runtime control state surfacing as a fatal CUDA error). Like a DUE it
 # is excluded from the accuracy mean; it is reported separately as the
 # crash-rate reliability curve (summary.process_fatal_* fields).
 PROCESS_FATAL = "PROCESS_FATAL"
-# the dead-process output must contain every needle to be restartable
-RECOVERABLE_DEATH_NEEDLES = ("GPU_M2D_G1_5_FAIL", "illegal memory access")
+# the dead-process output must contain the harness fail marker plus at
+# least ONE known fatal CUDA signature. Two verified so far -- the same
+# phenomenon (a flip in TRT runtime control state killing the process at
+# the dying trial's first injected inference) surfaced by the driver as
+# different strings; both corpses had the identical recoverable shape:
+#   - "illegal memory access" (mobilenet 2026-09-27, effnet/swin L1-L4)
+#   - "operation not supported on global/shared address space"
+#     (swin L5 2026-09-28; TRT teardown adds Myelin Error 717 destroying
+#     streams + ScopedCudaEvent destructor errors around it)
+MANDATORY_DEATH_NEEDLES = ("GPU_M2D_G1_5_FAIL",)
+RECOVERABLE_CUDA_SIGNATURES = ("illegal memory access",
+                               "operation not supported on "
+                               "global/shared address space")
 IMAGE_OUTCOMES = ("IMAGE_BENIGN", "IMAGE_SDC_NUMERIC", "IMAGE_SDC_TOP1",
                   "IMAGE_DUE")
 PROBABILITY_TOLERANCE = 1.0e-6
@@ -432,17 +443,21 @@ def analyze_process_death(output: str, campaign: list[list[dict]]
                           ) -> tuple[dict | None, list[str]]:
     """Classify a runner process that died mid-campaign (restart
     protocol). RECOVERABLE -- and the only restartable class -- is the
-    process-fatal fault: the output carries the CUDA illegal-memory-
-    access failure signature, every trial before the dying one reached
-    TRIAL_END, and the dying trial (the LAST TRIAL_BEGIN, exactly one
-    open) has its complete SITE_FLIPPED set with nothing after it (the
-    death hits the trial's first injected inference). Returns
-    ({completed, dying}, []) or (None, reasons); the caller fail-closes
-    on any other death shape."""
+    process-fatal fault: the output carries the harness fail marker plus
+    one of the known fatal CUDA signatures (RECOVERABLE_CUDA_SIGNATURES),
+    every trial before the dying one reached TRIAL_END, and the dying
+    trial (the LAST TRIAL_BEGIN, exactly one open) has its complete
+    SITE_FLIPPED set with nothing after it (the death hits the trial's
+    first injected inference). Returns ({completed, dying}, []) or
+    (None, reasons); the caller fail-closes on any other death shape."""
     reasons: list[str] = []
-    for needle in RECOVERABLE_DEATH_NEEDLES:
+    for needle in MANDATORY_DEATH_NEEDLES:
         if needle not in output:
             reasons.append(f"failure signature {needle!r} absent")
+    if not any(sig in output for sig in RECOVERABLE_CUDA_SIGNATURES):
+        reasons.append("no recoverable CUDA death signature ("
+                       + " / ".join(RECOVERABLE_CUDA_SIGNATURES)
+                       + ") in output")
     trial_events = [(name, fields) for name, fields in
                     parse_all_events(output) if name in TRIAL_EVENT_NAMES]
     begins = [fields["trial_index"] for name, fields in trial_events
@@ -721,7 +736,7 @@ def verify_event_structure(output: str, campaign: list[list[dict]],
     partial_trial (restart protocol): the trial the runner process DIED
     on. The expected stream then additionally ends with that trial's
     TRIAL_BEGIN plus its COMPLETE SITE_FLIPPED set and nothing after --
-    the illegal-memory-access death hits the trial's first injected
+    the process-fatal death hits the trial's first injected
     inference, before TRIAL_INJECTED_END or any restore. The dying
     trial's site rows do not exist (never flushed) so the CSV-agreement
     check skips them."""
@@ -777,8 +792,8 @@ def resident_bytes_of(snapshot_rows: list[dict]) -> int:
 
 class SegmentFatal(RuntimeError):
     """A fail-closed segment failure: anything except the recoverable
-    process-fatal fault (illegal memory access mid-trial). The LEVEL
-    aborts with status FAIL_CLOSED -- no restart."""
+    process-fatal fault (a known fatal CUDA signature mid-trial). The
+    LEVEL aborts with status FAIL_CLOSED -- no restart."""
 
 
 # --------------------------------------------------------------------------
@@ -1284,10 +1299,11 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             # The runner PROCESS died mid-campaign. The single recoverable
             # class is the process-fatal fault (restart protocol, user
             # decision 2026-09-28): a flip in TRT create_execution_context
-            # control state surfaces as a CUDA illegal memory access; the
-            # runner flushed every COMPLETED trial's rows, so the prefix
-            # on disk is verified below and the dying trial becomes
-            # PROCESS_FATAL. Every other death shape fails the level.
+            # control state surfaces as one of the known fatal CUDA
+            # signatures (RECOVERABLE_CUDA_SIGNATURES); the runner flushed
+            # every COMPLETED trial's rows, so the prefix on disk is
+            # verified below and the dying trial becomes PROCESS_FATAL.
+            # Every other death shape fails the level.
             for _ in range(20):
                 observer.poll(50)
             drain_pipe(process, captured)
@@ -1297,10 +1313,12 @@ def execute_segment(args: argparse.Namespace, contract: dict,
                 raise RuntimeError(
                     "runner died with an unrecoverable failure shape: "
                     + "; ".join(reasons))
+            signature = next(sig for sig in RECOVERABLE_CUDA_SIGNATURES
+                             if sig in output)
             completed_now = death["completed"]
             prefix = campaign[:completed_now]
             print(f"[{run_id}] PROCESS_FATAL: dying trial "
-                  f"{first_trial + death['dying']} (illegal memory access); "
+                  f"{first_trial + death['dying']} ({signature}); "
                   f"verifying the {completed_now} completed trials on disk")
             site_rows = read_csv_rows(site_result_output, SITE_RESULT_FIELDS)
             failures.extend(verify_site_rows(prefix, site_rows, registry))
@@ -1992,7 +2010,16 @@ def self_test() -> int:
                       + ima_tail)
     death, reasons = analyze_process_death(crashed_output, campaign)
     assert death == {"completed": 2, "dying": 2}, (death, reasons)
-    # no IMA signature -> unrecoverable
+    # the swin-L5 death class (2026-09-28): a DIFFERENT fatal CUDA
+    # string with the same recoverable shape is restartable too
+    addr_tail = ("GPU_M2D_G1_5_FAIL: synchronize inference stream "
+                 "failed: operation not supported on global/shared "
+                 "address space\n")
+    death, reasons = analyze_process_death(
+        trial_event_lines(campaign[0]) + trial_event_lines(campaign[1])
+        + dying_trial_lines(2, campaign[2]) + addr_tail, campaign)
+    assert death == {"completed": 2, "dying": 2}, (death, reasons)
+    # no known CUDA death signature -> unrecoverable
     death, reasons = analyze_process_death(
         crashed_output.replace("illegal memory access", "boom"), campaign)
     assert death is None and any("signature" in r for r in reasons)

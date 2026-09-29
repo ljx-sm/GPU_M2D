@@ -32,10 +32,13 @@
 #                       # engine's resident-byte total R into bootstrap.json,
 #                       # then stop -- no trials, no flips).
 #                       # Restart protocol: if the runner PROCESS dies on a
-#                       # CUDA illegal-memory-access trial (flip in TRT ctx-
-#                       # phase control state), that trial is counted
-#                       # PROCESS_FATAL and the campaign relaunches fresh
-#                       # gated segments for the remaining trial slots;
+#                       # trial with a KNOWN fatal CUDA signature (flip in
+#                       # TRT ctx-phase control state; 'illegal memory
+#                       # access' or 'operation not supported on
+#                       # global/shared address space' so far), that trial
+#                       # is counted PROCESS_FATAL and the campaign
+#                       # relaunches fresh gated segments for the remaining
+#                       # trial slots;
 #                       # every other death fails the level closed.
 #
 # Common options:
