@@ -115,6 +115,16 @@ high-precision dtype):
 | deit_small_patch16_224 | none (base recipe) | 80.26 | 78.75 | 1.51 |
 | swin_tiny_patch4_window7_224 | `--op_types_to_quantize Conv Gemm MatMul --disable_mha_qdq` | 81.63 | 81.17 | 0.46 |
 
+INT8 columns measured on the v1 FP32-head engines (the GEMV exclusion
+documented below was found later the same day, during the fault-surface
+census; the archived v1 numbers live in `<model>/v1_fp32head/clean_
+summary.json`). The v2 head-quantized rebuild — the engines the G7-v2
+campaigns actually run — re-measured: resnet50 78.42 (−2.19) /
+mobilenetv3 75.04 (−0.60) / effnet 77.36 (−0.60) / vit 78.21 (−1.20) /
+deit 78.73 (−1.53) / swin 81.30 (−0.33) (`eval/clean_summary.json`,
+2026-09-24; the campaign-time clean baselines match these, e.g. effnet
+77.36, deit 78.73).
+
 Evidence chain behind the two non-default choices:
 
 - **Swish-output activations** (EffNet SiLU ×16, MobileNetV3
@@ -134,7 +144,7 @@ Evidence chain behind the two non-default choices:
   recipe-level fix (keeps MLP/patch/downsample MatMuls + all weights
   quantized).
 
-### ModelOpt auto-excludes the batch-1 classifier head (GEMV heuristic, all six models)
+### ModelOpt auto-excludes the batch-1 classifier head (GEMV heuristic; v1 finding — resolved by the v2 rebuild)
 
 Found 2026-09-24 during the G7 fault-surface census: the ONE weighted
 op left FP32 in every `model_qdq.onnx` is the classifier-head Gemm —
@@ -149,32 +159,43 @@ any weighted MatMul/Gemm whose output is rank<3 with a dim==1 into
 adding Q/DQ layers is not good in TRT" (a perf heuristic, not a
 precision policy) — **even when Gemm is explicitly requested** via
 `--op_types_to_quantize Conv Gemm MatMul` (mobilenet/effnet/swin do;
-their heads are still FP32). Our exports are fixed batch-1 (the G5
-host contract, step 3), so every head Gemm outputs `(1,1000)` and
-trips the rule.
+their heads stayed FP32 in the v1 CLI runs). Our exports are fixed
+batch-1 (the G5 host contract, step 3), so every head Gemm outputs
+`(1,1000)` and trips the rule.
 
 Verified by counterfactual on the real artifacts (modelopt venv,
-2026-09-24): production-equivalent defaults reproduce the shipped
+2026-09-24): CLI-equivalent defaults reproduce the then-current v1
 `model_qdq.onnx` exactly (QL/DQL 108/108, head weight a raw FP32
 initializer); the single-flag delta `enable_gemv_detection_for_trt=
 False` yields 110/110 with `classifier.fc.weight` behind a
 per-channel DequantizeLinear. That single-flag difference eliminates
 every other candidate cause (op lists, post-processing, adjacency).
 
-Accepted as-is (engines frozen; the losses in the table above were
-measured WITH the FP32 head, so the head is not a damage source, and
-anyone running ModelOpt ONNX PTQ on a batch-1 export gets the same
-graph). Consequences to remember:
+Resolved the same day (v2 rebuild, user decision 2026-09-24): rather
+than accept the heuristic, every graph was rebuilt through
+`quantize_g7_qdq_head.py` — the SAME quantizer via the python API with
+`enable_gemv_detection_for_trt=False`, i.e. the single-flag
+counterfactual above, now the production path inside
+`quantize_g7_qdq.sh` (pipeline step 4). That wrapper fails closed
+unless every Gemm weight sits behind a DequantizeLinear. The v1
+FP32-head engines are archived under `<model>/v1_fp32head/`; only the
+g7 v1 campaign (fault-model key `g7_imagenet1k_resnet50`,
+R = 34,959,884) ever ran on them.
 
-- unquantized head-weight bytes: resnet50 8,192,000 (97.1% of its
-  FP32 constant surface; 23.4% of the campaign residency R=34,959,884)
-  / mobilenet, effnet 5,120,000 each (LARGER than their entire INT8
-  backbone) / vit, swin 3,072,000 / deit 1,536,000;
-- the FP32 head is part of the G7 fault surface and one of the
-  explicit-Q/DQ engine's overflow→NaN (DUE) pathways; fatal-surface
-  decompositions are per-model and must be redone for each engine;
-- a fully-quantized-head variant would need the python-API flag above
-  or a batch>1 / dynamic-batch export — out of scope for G7.
+Shipped-graph audit (2026-09-28, v2 campaign cross-check): all six v2
+`model_qdq.onnx` carry ZERO weighted ops with raw-FP32 weights — every
+weight, classifier head included, resolves through a per-channel
+DequantizeLinear (head pattern: FP32 initializer → QuantizeLinear →
+DequantizeLinear, scale dim 1000 → Gemm; resnet50 Q/DQ census 110/110
+vs v1's 108/108; Gemm biases stay FP32 — a 4 KB head bias — standard
+explicit-Q/DQ practice, not a GEMV residue). Residency agrees
+independently: g7v2 resnet50 R = 28,832,268 B, Δ vs v1 = 6,127,616 B ≈
+the head FP32 (8.19 MB) → INT8 (2.05 MB) delta. So NO v2 fault surface
+contains an FP32 head island; the v1-era head-byte bookkeeping
+(unquantized head weights: resnet50 8,192,000 B — 23.4% of the v1
+residency R = 34,959,884 — / mobilenet, effnet 5,120,000 B each /
+vit, swin 3,072,000 B / deit 1,536,000 B) applies to the archived v1
+engines and the g7 v1 campaign only.
 
 ### TRT 8.6.1 graph-compatibility notes (`fix_qdq_for_trt86.py`)
 
