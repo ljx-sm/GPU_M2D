@@ -217,19 +217,40 @@ WORKLOADS = {
              "t": 171},
         ],
     },
-    # PLACEHOLDER (R unfrozen) -- fill via
-    # tools/g7_prep/freeze_g7v2_workload.py after this engine's
-    # --bootstrap run.
+    # G7-v2 five-model extension (user decision 2026-09-27):
+    # ViT-Base/16/ImageNet-1K on the SAME head-quantized v2 INT8
+    # engine family as g7v2_imagenet1k_resnet50 (every weighted
+    # op INT8 per-channel, classifier head included); seven-level
+    # ladder L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5
+    # (the ResNet-50 curve's L3-L9 BERs).
+    # R was MEASURED by the
+    # bootstrap run
+    # artifacts/g7/campaign/run_bootstrap_gpu0_1790669078233737614
+    # (engine /data1/luojx/g7_models/vit_base_patch16_224/clean.engine,
+    # sha256 a360a1935e38...,
+    # snapshot allocations=8, pa_pages=46, rows=51)
+    # and the seven levels derived from it; every literal is an
+    # EXHAUSTIVE-solver literal (bits past the 3000-bit windowed
+    # threshold were forced exhaustive at freeze time and
+    # cross-checked against the windowed path). Frozen in place
+    # by tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_vit_base_patch16_224": {
-        "resident_bytes_nominal": 0,
+        "resident_bytes_nominal": 93_867_728,
         "levels": [
-            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L1", "ber": 1e-07, "bits": 75, "s": 28, "d": 10,
+             "t": 9},
+            {"level": "L2", "ber": 5e-07, "bits": 375, "s": 140, "d": 47,
+             "t": 47},
+            {"level": "L3", "ber": 1e-06, "bits": 751, "s": 281, "d": 94,
+             "t": 94},
+            {"level": "L4", "ber": 3e-06, "bits": 2253, "s": 845, "d": 281,
+             "t": 282},
+            {"level": "L5", "ber": 5e-06, "bits": 3755, "s": 1408, "d": 470,
+             "t": 469},
+            {"level": "L6", "ber": 7e-06, "bits": 5257, "s": 1972, "d": 657,
+             "t": 657},
+            {"level": "L7", "ber": 1e-05, "bits": 7509, "s": 2816, "d": 938,
+             "t": 939},
         ],
     },
     # G7-v2 five-model extension (user decision 2026-09-27):
