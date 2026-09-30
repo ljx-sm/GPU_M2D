@@ -33,3 +33,21 @@ To capture a fresh machine-readable console snapshot, run:
 ```bash
 scripts/collect_environment.sh
 ```
+
+## Later toolchain additions (G2–G7, recorded 2026-09-29)
+
+The hardware, driver 580.95.05 and kernel above are unchanged. The G2
+observer contract pins that driver/kernel pair, so any upgrade
+invalidates it. Components added after G1:
+
+| Component | Location / version | Used by |
+| --- | --- | --- |
+| System Python for the eBPF orchestrators | `/usr/bin/python3` (3.10.13, BCC) | G2–G5/G7 observer, campaign orchestrator (run via sudo wrapper) |
+| TensorRT | 8.6.1, `/data1/luojx/REMU/.local/deps/TensorRT-8.6.1/include` + `.../tensorrt-8.6.1/tensorrt_libs` | G1.5 runner (`build-g1.5/`), G7 engine build/eval |
+| OpenCV | `/data1/luojx/REMU/.local/deps/conda` (opencv4) | G1.5 runner preprocessing |
+| cuDNN | 8.9.7 under `/data1/luojx/REMU/.local/deps/` | G7 engine build/eval |
+| Python ML env | `/data1/luojx/miniforge3/envs/vit_fault` (torch 2.5.1+cu124, timm 1.0.26, onnx 1.17.0, cv2 4.10.0, `tensorrt_bindings` 8.6.1, matplotlib) | G7 prep, campaign figures |
+| ModelOpt (isolated) | `/data1/luojx/REMU/.local/deps/modelopt-venv` (ModelOpt 0.47.0) | G7 explicit Q/DQ quantization only |
+
+The base `python3` (3.13.13) still runs the pure-stdlib offline tools and
+self-tests. Wiring details are in `tools/g7_prep/README.md` (Environment).

@@ -1,5 +1,8 @@
 # G7 preparation tooling (six models, ImageNet-1K)
 
+Status: base work complete 2026-09-24; all six G7-v2 campaigns complete
+2026-09-29 (see the last section and docs/G7V2_RESULTS.md).
+
 Bulk base work for the G7 multi-model extension (plan doc §G7, user
 decisions 2026-09-23): download all six models now, quantize all to
 INT8 now, run FP32+INT8 clean on the 10K eval split — then the fault
@@ -68,6 +71,20 @@ ViT-B/16 / DeiT-S / Swin-T, all timm ImageNet-1k pretrained, all
    two full passes with byte-identical (prediction, probability).
    → `eval/{fp32,int8}_predictions*.csv`, `eval/clean_summary.json`
    (fp32_top1, int8_top1, quantization loss pp).
+8. Campaign hand-off (tools in this directory, campaign stack in
+   `tools/g5_faultinj/`): a `--bootstrap` run measures the engine's live
+   resident bytes R. The level table is then frozen into
+   `tools/g5_faultinj/fault_model.py`:
+   - `freeze_g7v2_levels.py` + `extend_g7v2_levels.py` for the ResNet-50
+     v2 nine-level ladder (1e-8 … 1e-5);
+   - `freeze_g7v2_workload.py` for the five other models' seven-level
+     ladder (1e-7 … 1e-5).
+
+   Both tools pin the engine sha256, force the exhaustive composition
+   solver, regression-check the derivation against the frozen ResNet-50
+   table, and rewrite `fault_model.py` atomically. See
+   [tools/g5_faultinj/README.md](../g5_faultinj/README.md) for how to run
+   the campaigns.
 
 ## Preprocessing contract v2 (canonical, 2026-09-24 — identical everywhere)
 
@@ -362,3 +379,47 @@ GiB total. SHA-256 is a self-contained FIPS implementation verified
 against the standard known-answer vectors ("", "abc", 1M×'a'). A
 relaunch now costs ~1.5 min (observer + snapshot + clean pass) instead
 of ~4.5.
+
+## DeiT-S, Swin-T, ViT-B (2026-09-28/29): full surface under the restart protocol
+
+All three ran on their FULL injection surface with the restart protocol
+enabled from the start. There were no exclusions; each model was handled
+individually, one at a time. Frozen R values (bootstrap, GPU 0):
+
+- DeiT-S 26,010,832 B;
+- Swin-T 43,799,616 B (70.4 % weights; its ctx-phase pool
+  `trt-internal-2/3/4` is 12.36 MB = 28.2 % of R);
+- ViT-B 93,867,728 B (the largest surface, 75 → 7,509 bits over L1–L7).
+
+**Second fatal signature (Swin L5, 2026-09-28).** A trial died with
+`operation not supported on global/shared address space` instead of
+`illegal memory access`. The TRT teardown also logged Myelin Error 717 and
+ScopedCudaEvent destructor errors. An offline re-check of the dead process
+showed the same structural shape as a recoverable death: a contiguous
+completed prefix, exactly one open trial, and its complete flip-set tail,
+with death at the trial's first injected inference. Only the signature
+check had blocked the restart. It is the same phenomenon with a different
+driver string. The orchestrator therefore now accepts either string
+(`RECOVERABLE_CUDA_SIGNATURES`), and the structural checks are unchanged.
+
+## G7-v2 campaign status (complete 2026-09-29)
+
+All six v2 workloads finished on GPU 0, with 100 trials per level and
+every level VERIFIED. The campaigns hit 61 PROCESS_FATAL crashes in total
+(EfficientNet-B0 24, Swin-T 33, ViT-B 3, DeiT-S 1, ResNet-50 0, and
+MobileNetV3 0 on its scoped surface). The restart protocol absorbed all of
+them with zero lost trials. Top-1 accuracy moved from clean to 1e-5 as
+follows:
+
+| model | clean | 1e-5 | Δ pp |
+| --- | --- | --- | --- |
+| ResNet-50 | 78.42 | 61.23 | −17.19 |
+| MobileNetV3-L | 75.04 | 47.27 | −27.77 |
+| EfficientNet-B0 | 77.36 | 61.34 | −16.02 |
+| DeiT-S | 78.73 | 61.11 | −17.62 |
+| Swin-T | 81.30 | 58.84 | −22.46 |
+| ViT-B | 78.21 | 71.73 | −6.48 |
+
+Per-level tables (top-1, SDC-top1, DUE/PROCESS_FATAL) and artifact
+locations are in [docs/G7V2_RESULTS.md](../../docs/G7V2_RESULTS.md).
+The unified figure is under `artifacts/g7/campaign/fig_six_models/`.

@@ -8,6 +8,11 @@ parameter of the G5 fault-injection campaign; the code re-derives the
 level table with the rule in §5 and asserts equality against this
 document at every campaign start.
 
+Campaign state: the full nine-level campaign completed 2026-09-22
+(19 campaigns, all VERIFIED; analysis in docs/G6_ANALYSIS.md). The same
+model, with per-workload R and ladders, drives the G7-v2 six-model
+ImageNet-1K campaign, which completed 2026-09-29; see §11.
+
 Provenance of the ratios and spatial patterns: the user's G5-T0 literature
 survey, done 2026-09-21. The reference list will be inserted by the user in
 §9 (left as a placeholder on purpose).
@@ -174,9 +179,15 @@ collapses onto L2) or a single 2-bit MCU (0% SBU).
 
 - **One campaign per BER level** = one runner process = one bootstrap
   (observer attaches pre-context; gate-time registry; online snapshot; the
-  100 trials reuse that snapshot; never across processes). 5 campaigns
-  total, 100 trials each, 500 trials overall. A campaign failure voids only
-  its level (fail-closed isolation), co-tenancy recorded never refused.
+  100 trials reuse that snapshot; never across processes). As planned:
+  5 campaigns, 100 trials each, 500 trials. As executed:
+  - L1–L5 on each of the three cards (15 campaigns);
+  - L6–L9 single-card;
+  - total 19 campaigns and 1,900 trials, all VERIFIED (2026-09-21/22).
+
+  A campaign failure voids only its level (fail-closed isolation);
+  co-tenancy is recorded, never refused. (G7 later relaxed "one process"
+  to a segment loop for process-fatal trials; see §11.)
 - Per trial: sample events → XOR **all** sites on device simultaneously →
   1000-image inference with faults held → classify → restore every site
   byte-exactly (byte + whole-allocation compare + guard bytes) → sanity
@@ -187,7 +198,7 @@ collapses onto L2) or a single 2-bit MCU (0% SBU).
   trial would add no information. Campaign-close checks inherit the G4-T2
   skeleton (registry consistency, gate-vs-final map diff = mid-run remap
   detector, 0 lost BPF events).
-- Classification (vocabulary from G4-T2; final lock in T3): each image is
+- Classification (vocabulary from G4-T2, locked in G5-T3): each image is
   compared against the campaign's clean pass — SDC_NUMERIC if any output
   deviates numerically, SDC_TOP1 if any top-1 changes, DUE_INVALID_OUTPUT
   if any invalid output/abort, BENIGN if all outputs bit-identical. Trial
@@ -235,3 +246,46 @@ the user.**
 - Every relation G5 injects is measured; the assumed tier is unused;
   unknowns (row distance, column identity) are labeled per site, never
   guessed.
+
+## 11. Reuse for the G7 workloads (2026-09-24 … 2026-09-29)
+
+The G7-v2 campaign (six ImageNet-1K INT8 TensorRT models;
+docs/G7V2_RESULTS.md) reuses this model unchanged in the following:
+
+- event mix;
+- sampling classes;
+- spatial relations and provenance labels;
+- the composition rule (§5);
+- seed 7;
+- 100 trials per level;
+- the trial protocol (§6).
+
+What is per-workload:
+
+- **R and the ladder.** R is measured by a `--bootstrap` run of each
+  engine and frozen in `fault_model.WORKLOADS`. B = round(BER × R × 8).
+  - ResNet-50 v2 runs nine levels: 1e-8, 5e-8, 1e-7, 5e-7, 1e-6, 3e-6,
+    5e-6, 7e-6 and 1e-5.
+  - The other five models run seven levels: 1e-7, 5e-7, 1e-6, 3e-6, 5e-6,
+    7e-6 and 1e-5.
+
+  The BER values are shared across models so the curves can be compared.
+  BER semantics are unchanged, except that one trial is one pass over the
+  10,000-image eval split.
+- **Injection surface.** The surface is the full resident set by default.
+  A workload may declare `surface_excludes`. Only MobileNetV3 does: it
+  excludes `trt-internal-5/6`, its TensorRT execution-context control
+  state (2.66 % of R), where any hit is process-fatal (user decision
+  2026-09-27). Its frozen R is then the scoped total, 9,087,912 B.
+- **New outcome, PROCESS_FATAL.** In full-surface G7 engines, a flip in the
+  TRT execution-context control state can kill the runner process at the
+  trial's first injected inference. The campaign records that trial as
+  PROCESS_FATAL, verifies the completed prefix, and finishes the remaining
+  trial slots in fresh gated segments (restart protocol, user decision
+  2026-09-28; details in tools/g5_faultinj/README.md). This outcome is
+  outside the §6 classification vocabulary because it produces no output
+  at all. It is reported as its own crash-rate-vs-BER column.
+- **Accuracy convention (user decision 2026-09-25).** The injected
+  accuracy averages only normally completed trials. DUE trials and
+  PROCESS_FATAL trials are excluded from the mean and reported as rates.
+  The G5 campaign had zero DUE, so its numbers are unchanged.

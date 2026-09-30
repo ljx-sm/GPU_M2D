@@ -108,6 +108,23 @@ of the decision-margin distribution.**
   hardware-level DUE (e.g. ECC uncorrectable) is outside this fault
   model, as is the cache hierarchy (plan §8).
 
+**Later note (G7-v2, 2026-09-27 … 29): the last two bullets hold for this
+workload only.**
+
+- **Crash path.** On the ImageNet-1K engines, a flip in TensorRT's
+  execution-context control state can kill the runner process at the first
+  injected inference. The G7 campaign records that as a new outcome,
+  PROCESS_FATAL, and relaunches the remaining trials. This engine's
+  counterpart buffer is 22,528 B (0.08 % of R) and was never fatal over
+  the G5 campaign. In the G7 engines the buffer is 2.6–58 % of R, and 61
+  such crashes occurred across the six-model campaign.
+- **DUE firewall.** The INT8 "DUE firewall" is also not universal.
+  MobileNetV3-L produced NaN/Inf DUE trials in up to 6 of 100 trials per
+  level, while the other G7 models stayed at ≤ 2/100.
+
+See docs/G7V2_RESULTS.md §3 and tools/g5_faultinj/README.md (restart
+protocol).
+
 ## 5. Overall conclusion — two-regime robustness
 
 On RESISC45, the INT8 ResNet-50 shows a **high tolerance floor with
