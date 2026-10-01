@@ -92,7 +92,7 @@ Workload surfaces (frozen R from G7-v2) against the 72 MiB L2:
 
 ### 3.2 Number of cache flips per trial
 
-```
+```text
 n_cache = round(BER_cache × R_bits)
 ```
 
@@ -153,7 +153,7 @@ Further rules:
 
 ### 3.5 Mapping and injection chain
 
-```
+```text
 selected cache line ℓ (allocation a, 128-B-aligned line offset)   ← residency-time-weighted (§3.4)
   + byte in line + bit
   → VA = base(a) + line offset + byte                              ← offset arithmetic in the G1.5 registry
