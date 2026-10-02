@@ -1,6 +1,8 @@
 # G8 Plan — L2 Cache Fault Injection on Top of the GDDR Campaign
 
-Status: **DESIGN CONFIRMED by the user, 2026-10-01. No code yet.** This
+Status: **DESIGN CONFIRMED by the user, 2026-10-01. G8-T0 complete
+2026-10-01 (GPU 0): probe calibration V6 PASS, hook neutrality V7 PASS;
+results and the decisions they raise in §11.** This
 file has been revised in place through the 2026-09-29 … 10-01 discussion
 (earlier versions are in git history; §10 records what changed and why).
 One parameter is still open: the cache upset rate BER_cache (§3.3).
@@ -22,6 +24,8 @@ Scope:
 | Persisting-L2 set-aside max | 49.5 MiB (not used by this design) | same |
 | DRAM ECC | mode exists, **Disabled** (current and pending) | `nvidia-smi -q -d ECC` |
 | SRAM error counters | N/A (no L2 parity/ECC reporting exposed) | same |
+| L2 fill granularity | **32-B sector**: touching sector 0 of a line leaves sectors 1–3 absent (T0) | `tools/g8_cache/g8_l2_calib` |
+| Effective L2 capacity | hit fraction after touching W twice: 1.000 up to 64 MiB, 0.903 at 68, 0.617 at 72, 0.06 at 80, 0 from 96 MiB (T0) | same |
 
 Notes on these facts:
 
@@ -254,7 +258,14 @@ pass with no faults.
 1. Every **k images**, at an image boundary, a probe kernel times one load
    for **every line** of the injection surface (~71 K lines for
    MobileNetV3 up to ~733 K for ViT-B). The latency separates an L2 hit
-   from a GDDR fetch (the G3 technique; thresholds calibrated in T0).
+   from a GDDR fetch.
+   - **Probe as calibrated in T0** (§11): one active lane per warp (a
+     multi-lane warp times its slowest lane), 16 concurrent probes per SM,
+     threshold **440 cycles** (hits 208–400, misses ≥ 480).
+   - For surfaces larger than L2, each boundary probes a **staggered 1/s
+     subset** of the units (stride s, rotating phase). A full sweep would
+     evict what it probes last, so each unit's timeline then has a
+     resolution of s images.
 2. A hit at boundary *i* marks ℓ as resident for the images
    `[i, i + k − 1]`. Consecutive resident blocks form a residency period;
    a miss ends the period.
@@ -265,10 +276,14 @@ pass with no faults.
    - T_ℓ is the sum of t_i over the images in ℓ's residency periods.
    - T_total is the sum of t_i over all 10,000 images.
    - Then R_eff_bits = Σ bits_ℓ × T_ℓ / T_total (§3.2).
-4. **Choice of k**: it is set from the probe throughput measured in T0,
-   so the pass costs an acceptable time. The faultless inference itself
-   takes ~35–53 s per 10K INT8 pass (G7-T0), and probes add per-boundary
-   time. Smaller k means finer timelines.
+4. **Choice of k (and stride)**: set from T0's measured costs.
+   - The pure GPU inference time is **0.25 ms/image (ResNet-50)** and
+     **0.65 ms/image (ViT-B)**. The 35–53 s per 10K pass quoted earlier
+     includes host overhead.
+   - A full probe sweep costs 0.034 ms for ResNet-50 (13 % of one
+     inference). A stride-16 sweep costs 0.013 ms for ViT-B (2 %).
+   - k = 1, probing at every image boundary, is therefore affordable.
+   - Smaller k and stride mean finer timelines.
 5. **Perturbation**: a probe that misses loads the line into L2. The
    engine reads every weight and constant line in every inference anyway,
    so this barely changes their behaviour. Lines the engine does not touch
@@ -341,7 +356,7 @@ Reported metrics:
 
 | Phase | Work | Output / gate |
 | --- | --- | --- |
-| **G8-T0** Feasibility (GPU 0) | Calibrate the L2-hit vs GDDR-fetch latency of the probe kernel (thresholds, separation, stability); measure probe throughput for full-surface sweeps and choose k per model; runner hook for probe/apply/remove kernels at image boundaries. | Gate: clean hit/miss separation; a hooked pass with no flips is bit-identical to the clean pass. |
+| **G8-T0** Feasibility (GPU 0) — **DONE 2026-10-01** | Calibrate the L2-hit vs GDDR-fetch latency of the probe kernel (thresholds, separation, stability); measure probe throughput for full-surface sweeps and choose k per model; runner hook for probe/apply/remove kernels at image boundaries. Done: probe calibration + runner probe pass (`--l2-probe-*`); apply/remove hooks are T2 work. | Gate: clean hit/miss separation; a hooked pass with no flips is bit-identical to the clean pass. **Both PASS** (§11). |
 | **G8-T1** Residency pass | Implement the in-process measurement pass (§4) and the residency-map format. Validation runs per model: two passes in one process (same-process stability) and runs in separate processes (how much the per-line pattern changes, reported as allocation-level statistics). Start with ResNet-50 v2 (default; the user may pick another first model). | Residency maps; stability report. |
 | **G8-T2** Implementation | Cache sampler (§3.2, §3.4) in `fault_model.py`; runner per-image apply/remove; orchestrator flow (clean pass → residency pass → plan → trials, re-measure per restart segment) and independent re-verification; self-tests (apply/remove exactness, overlap with DRAM flips, engine-written skip, input re-staging, start-inside-residency check). | Self-tests PASS; a smoke campaign VERIFIED. |
 | **G8-T3** Cache rate | The user derives BER_cache from the DRAM BER via prior work; the cache level table is frozen alongside the DRAM levels. | The frozen table, documented as for G5-T1. |
@@ -395,9 +410,15 @@ Reported metrics:
 
 1. BER_cache derivation (§3.3), done by the user from prior work.
 2. First model for T1/T4: ResNet-50 v2 by default.
-3. The value of k per model, set in T0 from the probe throughput.
-4. Whether to report a "dedicated GPU" condition in addition to the
-   shared one, if an idle window on GPU 0 becomes available.
+3. **Probe unit (raised by T0)**: 128-B line or 32-B sector. L2 fills
+   per sector (§1), so a line probe observes one sector. For ResNet-50
+   every sector was resident, so the choice made no difference there.
+4. **k and stride per model (raised by T0)**: k = 1 is affordable for
+   all models. A stride is needed only for surfaces larger than L2
+   (ViT-B; 16 recommended).
+5. Whether to report a "dedicated GPU" condition in addition to the
+   shared one, if an idle window on GPU 0 becomes available. All T0
+   measurements ran on an idle GPU 0.
 
 ## 10. Design history (why the earlier options were dropped)
 
@@ -410,3 +431,62 @@ Reported metrics:
 | Residency measured in separate runs (1K, then 10K paired probes) | Per-line residency depends on the process's physical addresses and on co-tenant load, so it does not transfer between processes. Replaced by an in-process 10K-image timeline before each campaign segment's trials (§4). |
 | `n = BER × L2_bits × occupancy`, then `n = BER × min(R_bits, L2_bits)`, then `n = BER_cache × R_bits` | R_bits assumes the whole model is present all the time, which is true for DRAM but not for the cache. Replaced by `n = BER_cache × R_eff_bits` with `R_eff_bits = Σ bits_ℓ × T_ℓ / T_total`, the time-averaged resident bits (user decision 2026-10-01, §3.2). A denominator of Σ T_ℓ was rejected because it always reduces to ~1,024 bits (one line); the denominator is the total inference time of the 10K images. |
 | Mid-inference injection via CUDA-graph capture; L1/shared via NVBit; three cards | More complex than needed. Scope set to L2 only, image-boundary resolution, GPU 0 only (user decision 2026-09-30). |
+
+## 11. G8-T0 results (2026-10-01, GPU 0 idle)
+
+Full tables are in `tools/g8_cache/README.md`. Artifacts (untracked) are
+under `artifacts/g8/t0/`.
+
+**V6 probe calibration: PASS.** One active lane per warp, 16 probes per
+SM, 3 runs × 10 rounds:
+
+- hits 208–400 cycles, misses ≥ 480 cycles, an empty gap of 80–112
+  cycles;
+- 100 % correct classification of cold, warm, reprobe, and the per-line
+  mixed test (only the even lines resident);
+- threshold 440 / 440 / 448 cycles, with **440** in production;
+- the capacity cliff sits at the 72 MiB L2;
+- L2 fills per 32-B sector.
+
+**V7 probe-pass neutrality: PASS.** Every verified probe pass (27 passes
+× 10,000 images, ResNet-50 v2 and ViT-B, every probe mode) reproduced the
+clean pass bit-for-bit. In situ, ≤ 0.2 % of latencies fall inside the
+calibration gap, so the threshold transfers to real TensorRT memory.
+
+**Three probe-design findings**, all fixed in the shipped probe:
+
+1. **The warp-max effect.** With all 32 lanes probing, every lane times
+   the warp's slowest load. The mixed test then reads 0 % of the resident
+   lines as hits, so this design measures per 32-line group, not per line.
+   The probe therefore uses one active lane per warp.
+2. **Self-eviction for surfaces larger than L2.** A full ViT-B sweep
+   (94 MB) evicts whatever it probes last: forward vs reverse order gives
+   weights 78 % vs 0 % resident. Staggered sub-sampled sweeps fix this. At
+   stride 16 and 64, forward and reverse agree on weights within 0.4 pp
+   and on R_eff within 0.8 pp.
+3. **Concurrency limit.** Above about 16 probes per SM, queueing pushes
+   hits into the miss range.
+
+**Measured residency (idle GPU 0)**:
+
+- **ResNet-50 v2 (28.8 MB)**: every unit of every allocation is
+  L2-resident at all 10,000 image boundaries, which gives R_eff = R. This
+  also holds with probes only every 100 images and per 32-B sector, so it
+  is not created by the probe. Under §3.2/§3.4 that means
+  `n_cache = round(BER_cache × R_bits)`, and every read-only cache flip
+  lasts until the trial ends.
+- **ViT-B (93.9 MB)**:
+  - weights ~79 % resident;
+  - scratch ~68–77 %;
+  - the input binding 0 % at the boundaries (evicted by the inference's
+    own streaming);
+  - R_eff ≈ 73.5–74.2 MB, about the L2's effective capacity, as expected
+    for a model larger than L2.
+
+  Open: a residual ~8 pp forward/reverse difference on ViT-B scratch
+  (~0.4 MB, ≈0.6 % of R_eff). It does not shrink with the stride, and it
+  is recorded as a measurement uncertainty without a claimed cause.
+
+**What T1 inherits**: the calibrated probe (440 cycles, 16/SM, 1 lane),
+k = 1, stride 1 for surfaces below L2 and 16 above, and the open choices
+in §9 (probe unit; first model).

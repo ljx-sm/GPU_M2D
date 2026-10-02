@@ -19,8 +19,11 @@ sector 0 bring sectors 1..3 into L2?).
 
 Gate V6 (per input file, at --probe-tps): an EMPTY gap between every hit
 and every miss sample, cold classified miss >= 99.9 %, warm and reprobe
-classified hit >= 99.9 %. Across files the threshold must be stable
-(every file's threshold lies inside every other file's gap).
+classified hit >= 99.9 %, and PER-LINE resolution: with only the even
+lines resident ("mixed"), even lines must read hit and odd lines miss,
+each >= 99.9 % (a probe whose lanes share one warp load times the
+warp's slowest line and fails this). Across files the threshold must be
+stable (every file's threshold lies inside every other file's gap).
 
 Pure stdlib. Exit codes: 0 gate pass, 2 gate fail, 1 usage/input error.
 """
@@ -67,7 +70,8 @@ def load(path: Path) -> dict:
                 continue
             if row[0] == "meta":
                 meta = {"gpu": row[1], "sms": int(row[2]),
-                        "l2_bytes": int(row[3]), "sm_mhz": float(row[6])}
+                        "l2_bytes": int(row[3]), "sm_mhz": float(row[6]),
+                        "lanes": int(row[8]) if len(row) > 8 else 32}
             elif row[0] == "probe":
                 key = (row[1], int(row[2]), row[3], int(row[5]))
                 ms[key].append(float(row[7]))
@@ -124,6 +128,8 @@ def analyze_file(data: dict, probe_tps: int, bin_cycles: int) -> dict:
         threshold, gap, gap_bounds = choose_threshold(hits, misses, bin_cycles)
         warm = pooled(data, "calib", tps, ("warm",))
         reprobe = pooled(data, "calib", tps, ("reprobe",))
+        mixed_even = pooled(data, "calib", tps, ("mixed_even",))
+        mixed_odd = pooled(data, "calib", tps, ("mixed_odd",))
         lines_per_ms = []
         for key, values in data["ms"].items():
             if key[0] == "calib" and key[1] == tps:
@@ -142,6 +148,10 @@ def analyze_file(data: dict, probe_tps: int, bin_cycles: int) -> dict:
             "warm_hit_rate": fraction_below(warm, threshold),
             "reprobe_hit_rate": fraction_below(reprobe, threshold),
             "cold_miss_rate": 1 - fraction_below(misses, threshold),
+            "mixed_even_hit_rate": (fraction_below(mixed_even, threshold)
+                                    if mixed_even else None),
+            "mixed_odd_miss_rate": (1 - fraction_below(mixed_odd, threshold)
+                                    if mixed_odd else None),
             "lines_per_ms": rate,
             "projected_probe_ms": projected,
         }
@@ -175,8 +185,12 @@ def gate(reports: list[dict], probe_tps: int) -> list[str]:
                             f"({level['gap_cycles']} cycles)")
         else:
             gaps.append(level["gap_bounds"])
-        for name in ("warm_hit_rate", "reprobe_hit_rate", "cold_miss_rate"):
-            if level[name] < MIN_CLASS_RATE:
+        for name in ("warm_hit_rate", "reprobe_hit_rate", "cold_miss_rate",
+                     "mixed_even_hit_rate", "mixed_odd_miss_rate"):
+            if level[name] is None:
+                failures.append(f"{tag}: no {name} data (per-line "
+                                "resolution untested)")
+            elif level[name] < MIN_CLASS_RATE:
                 failures.append(f"{tag}: {name} {level[name]:.5f} < "
                                 f"{MIN_CLASS_RATE}")
     if gaps and not failures:
@@ -190,13 +204,18 @@ def gate(reports: list[dict], probe_tps: int) -> list[str]:
     return failures
 
 
+def pct(value) -> str:
+    return "   n/a  " if value is None else f"{100 * value:8.3f}"
+
+
 def print_report(paths, reports, probe_tps, failures) -> None:
     for path, report in zip(paths, reports):
         meta = report["meta"]
         print(f"== {path}  ({meta['gpu']}, {meta['sms']} SMs, "
-              f"L2 {meta['l2_bytes'] >> 20} MiB, SM {meta['sm_mhz']:.0f} MHz)")
-        print("  tps  hit[min,max)   miss[min,max)   gap  thr  warm%   "
-              "reprobe%  cold-miss%  lines/ms")
+              f"L2 {meta['l2_bytes'] >> 20} MiB, SM {meta['sm_mhz']:.0f} MHz, "
+              f"active lanes/warp {meta['lanes']})")
+        print("  p/SM  hit[min,max)  miss[min,max)   gap  thr  warm%   "
+              "reprobe%  cold-miss%  even-hit%  odd-miss%   lines/ms")
         for tps, lv in report["levels"].items():
             print(f"  {tps:4d} {lv['hit_range'][0]:5d},{lv['hit_range'][1]:5d}"
                   f"   {lv['miss_range'][0]:5d},{lv['miss_range'][1]:5d}"
@@ -204,6 +223,8 @@ def print_report(paths, reports, probe_tps, failures) -> None:
                   f"  {100 * lv['warm_hit_rate']:7.3f}"
                   f"  {100 * lv['reprobe_hit_rate']:7.3f}"
                   f"   {100 * lv['cold_miss_rate']:8.3f}"
+                  f"   {pct(lv['mixed_even_hit_rate'])}"
+                  f"   {pct(lv['mixed_odd_miss_rate'])}"
                   f"  {lv['lines_per_ms']:10.0f}")
         lv = report["levels"][probe_tps]
         print(f"  projected full-surface probe at {probe_tps} threads/SM "
@@ -232,7 +253,9 @@ def self_test() -> int:
         rows = [["meta", "TestGPU", "128", str(72 << 20), "32", "1",
                  "2500.0", "512"]]
         for state, lo, hi in (("warm", 288, hit_max), ("reprobe", 288, hit_max),
-                              ("cold", miss_min, miss_min + 800)):
+                              ("cold", miss_min, miss_min + 800),
+                              ("mixed_even", 288, hit_max),
+                              ("mixed_odd", miss_min, miss_min + 800)):
             rows.append(["probe", "calib", "32", state, "0", "32", "262144",
                          "0.02"])
             for b in range(lo - lo % 16, hi, 16):
@@ -271,6 +294,17 @@ def self_test() -> int:
         write(bad, 900, 608)
         failures = gate([analyze_file(load(bad), 32, 16)], 32)
         assert any("overlap" in f for f in failures), failures
+        # warp-max probe: mixed even lines read as misses -> must fail
+        warpmax = Path(tmp) / "warpmax.csv"
+        write(warpmax, 416, 608)
+        text = warpmax.read_text().replace(",mixed_even,0,32,288,",
+                                           ",mixed_even,0,32,900,")
+        text = "\n".join(line for line in text.splitlines()
+                         if not (",mixed_even," in line and line.startswith("hist")
+                                 and not line.endswith(",900,100")))
+        warpmax.write_text(text + "\n")
+        failures = gate([analyze_file(load(warpmax), 32, 16)], 32)
+        assert any("mixed_even_hit_rate" in f for f in failures), failures
         # a missing probe level is an input error
         try:
             analyze_file(load(good), 64, 16)

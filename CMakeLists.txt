@@ -41,6 +41,7 @@ target_compile_options(gpu_m2d_semantic PRIVATE
 
 add_library(gpu_m2d_injector STATIC
     src/injector/device_bit_injector.cu
+    src/injector/l2_probe.cu
 )
 target_include_directories(gpu_m2d_injector PUBLIC include)
 target_link_libraries(gpu_m2d_injector PUBLIC CUDA::cudart)

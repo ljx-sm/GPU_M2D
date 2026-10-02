@@ -63,8 +63,12 @@ struct Options
   std::uint64_t thrash_mib = 512;
   int rounds = 5;
   std::string out = "g8_l2_calib.csv";
-  std::vector<int> threads_per_sm = { 32, 64, 128, 512 };
-  int probe_tps = 32; // parallelism for the capacity and sector tests
+  // Concurrent probes per SM. With lanes == 1 (production) each probe is
+  // one warp with one active lane; with lanes == 32 every lane probes and
+  // times the warp-max (kept to reproduce that effect).
+  std::vector<int> threads_per_sm = { 4, 8, 16, 32, 48 };
+  int probe_tps = 32; // concurrency for the capacity and sector tests
+  int lanes = 1;
   std::vector<std::uint64_t> capacity_mib
       = { 8, 16, 32, 48, 56, 64, 68, 72, 76, 80, 96, 128 };
 };
@@ -113,18 +117,49 @@ touch_sector0_kernel (const std::uint8_t *__restrict__ p, std::uint64_t lines,
     sink[0] = acc;
 }
 
-// Times sector `s` (byte offset 32*s) of every line.
+// Touches all four sectors of every EVEN line only.
 __global__ void
-probe_sector_kernel (const std::uint8_t *__restrict__ p, std::uint64_t lines,
-                     int s, std::uint16_t *__restrict__ out)
+touch_even_lines_kernel (const std::uint8_t *__restrict__ p,
+                         std::uint64_t lines, std::uint32_t *__restrict__ sink)
 {
-  extern __shared__ std::uint32_t sector_sink[];
-  volatile std::uint32_t *sink = sector_sink + threadIdx.x;
+  std::uint32_t acc = 0;
   const std::uint64_t stride
       = static_cast<std::uint64_t> (gridDim.x) * blockDim.x;
   for (std::uint64_t l
-       = static_cast<std::uint64_t> (blockIdx.x) * blockDim.x + threadIdx.x;
-       l < lines; l += stride)
+       = (static_cast<std::uint64_t> (blockIdx.x) * blockDim.x + threadIdx.x)
+         * 2;
+       l < lines; l += 2 * stride)
+    for (int sct = 0; sct < 4; ++sct)
+      {
+        std::uint32_t v;
+        asm volatile ("ld.global.cg.u32 %0, [%1];"
+                      : "=r"(v)
+                      : "l"(p + l * kLineBytes + 32 * sct));
+        acc ^= v;
+      }
+  if (acc == 0x9e3779b9u)
+    sink[0] = acc;
+}
+
+// Times sector `s` (byte offset 32*s) of every line.  Same lane policy as
+// the production kernel: lanes == 1 -> one active lane per warp.
+__global__ void
+probe_sector_kernel (const std::uint8_t *__restrict__ p, std::uint64_t lines,
+                     int s, int lanes, std::uint16_t *__restrict__ out)
+{
+  extern __shared__ std::uint32_t sector_sink[];
+  volatile std::uint32_t *sink = sector_sink + threadIdx.x;
+  std::uint64_t worker
+      = static_cast<std::uint64_t> (blockIdx.x) * blockDim.x + threadIdx.x;
+  std::uint64_t workers = static_cast<std::uint64_t> (gridDim.x) * blockDim.x;
+  if (lanes == 1)
+    {
+      if ((threadIdx.x & 31u) != 0)
+        return;
+      worker /= 32;
+      workers /= 32;
+    }
+  for (std::uint64_t l = worker; l < lines; l += workers)
     {
       const std::uint32_t dt = gpu_m2d::l2probe::timed_load_cg (
           p + l * kLineBytes + 32 * s, sink);
@@ -176,6 +211,16 @@ thrash (Context &c)
   touch (c, c.thrash, c.opt.thrash_mib << 20);
 }
 
+// Launch geometry for `probes_per_sm` concurrent probes per SM.
+void
+geometry (const Context &c, int probes_per_sm, int &blocks, int &block)
+{
+  const int threads_per_sm
+      = c.opt.lanes == 1 ? probes_per_sm * 32 : probes_per_sm;
+  block = std::min (threads_per_sm, 512);
+  blocks = std::max (1, c.sms * threads_per_sm / block);
+}
+
 // Full-range probe with the PRODUCTION kernel; returns kernel ms.
 float
 probe (Context &c, const std::uint8_t *p, std::uint64_t bytes,
@@ -183,13 +228,18 @@ probe (Context &c, const std::uint8_t *p, std::uint64_t bytes,
 {
   ProbeRanges ranges{};
   ranges.count = 1;
+  ranges.unit = kLineBytes;
+  ranges.stride = 1;
+  ranges.phase = 0;
+  ranges.reverse = 0;
+  ranges.lanes = c.opt.lanes;
   ranges.r[0].base = p;
   ranges.r[0].bytes = bytes;
   ranges.r[0].first_line = 0;
   ranges.r[0].lines = (bytes + kLineBytes - 1) / kLineBytes;
   ranges.total_lines = ranges.r[0].lines;
-  const int block = std::min (threads_per_sm, 512);
-  const int blocks = std::max (1, c.sms * threads_per_sm / block);
+  int blocks = 0, block = 0;
+  geometry (c, threads_per_sm, blocks, block);
   CHECK_CUDA (cudaEventRecord (c.e0));
   gpu_m2d::l2probe::probe_latency_kernel<<<blocks, block,
                                             block * sizeof (std::uint32_t)>>> (
@@ -222,6 +272,35 @@ emit (Context &c, const char *mode, int threads_per_sm, const char *state,
                     threads_per_sm, state, round,
                     static_cast<unsigned long long> (param), b * kBinCycles,
                     static_cast<unsigned long long> (hist[b]));
+}
+
+// Like emit(), but histograms even and odd lines as separate states.
+void
+emit_parity (Context &c, const char *mode, int threads_per_sm, int round,
+             std::uint64_t param, std::uint64_t lines, float ms)
+{
+  std::vector<std::uint16_t> host (lines);
+  CHECK_CUDA (cudaMemcpy (host.data (), c.lat, lines * sizeof (std::uint16_t),
+                          cudaMemcpyDeviceToHost));
+  for (int parity = 0; parity < 2; ++parity)
+    {
+      const char *state = parity == 0 ? "mixed_even" : "mixed_odd";
+      std::vector<std::uint64_t> hist (kBins, 0);
+      std::uint64_t n = 0;
+      for (std::uint64_t l = parity; l < lines; l += 2, ++n)
+        hist[std::min<int> (host[l] / kBinCycles, kBins - 1)]++;
+      std::fprintf (c.csv, "probe,%s,%d,%s,%d,%llu,%llu,%.6f\n", mode,
+                    threads_per_sm, state, round,
+                    static_cast<unsigned long long> (param),
+                    static_cast<unsigned long long> (n), ms);
+      for (int b = 0; b < kBins; ++b)
+        if (hist[b])
+          std::fprintf (c.csv, "hist,%s,%d,%s,%d,%llu,%d,%llu\n", mode,
+                        threads_per_sm, state, round,
+                        static_cast<unsigned long long> (param),
+                        b * kBinCycles,
+                        static_cast<unsigned long long> (hist[b]));
+    }
 }
 
 std::vector<int>
@@ -272,11 +351,21 @@ main (int argc, char **argv)
         c.opt.threads_per_sm = parse_int_list (need ());
       else if (k == "--probe-tps")
         c.opt.probe_tps = std::atoi (need ());
+      else if (k == "--lanes")
+        {
+          c.opt.lanes = std::atoi (need ());
+          if (c.opt.lanes != 1 && c.opt.lanes != 32)
+            {
+              std::fprintf (stderr, "--lanes must be 1 or 32\n");
+              return 2;
+            }
+        }
       else
         {
           std::fprintf (stderr,
                         "usage: %s [--device N] [--buf-mib N] [--thrash-mib N] "
                         "[--rounds N] [--threads-per-sm a,b,..] [--probe-tps N] "
+                        "[--lanes 1|32] "
                         "[--out CSV]\n",
                         argv[0]);
           return 2;
@@ -316,11 +405,12 @@ main (int argc, char **argv)
   std::uint64_t hclk[2];
   CHECK_CUDA (cudaMemcpy (hclk, dclk, sizeof (hclk), cudaMemcpyDeviceToHost));
   const double mhz = static_cast<double> (hclk[0]) * 1e3 / hclk[1];
-  std::fprintf (c.csv, "meta,%s,%d,%llu,%llu,%d,%.1f,%llu\n", prop.name,
+  std::fprintf (c.csv, "meta,%s,%d,%llu,%llu,%d,%.1f,%llu,%d\n", prop.name,
                 c.sms, static_cast<unsigned long long> (prop.l2CacheSize),
                 static_cast<unsigned long long> (c.opt.buf_mib),
                 c.opt.rounds, mhz,
-                static_cast<unsigned long long> (c.opt.thrash_mib));
+                static_cast<unsigned long long> (c.opt.thrash_mib),
+                c.opt.lanes);
   std::printf ("G8_L2_CALIB device=%d name=\"%s\" sms=%d l2=%d MiB "
                "sm_clock=%.0f MHz\n",
                c.opt.device, prop.name, c.sms, prop.l2CacheSize >> 20, mhz);
@@ -341,6 +431,14 @@ main (int argc, char **argv)
         touch (c, c.buf, buf);
         ms = probe (c, c.buf, buf, tps);
         emit (c, "calib", tps, "warm", r, buf >> 20, buf_lines, ms);
+        // mixed: only even lines resident -> a per-line probe must read
+        // even = hit, odd = miss (a warp-max probe reads both as miss)
+        thrash (c);
+        touch_even_lines_kernel<<<c.sms * 4, 256>>> (c.buf, buf_lines, c.sink);
+        CHECK_CUDA (cudaGetLastError ());
+        CHECK_CUDA (cudaDeviceSynchronize ());
+        ms = probe (c, c.buf, buf, tps);
+        emit_parity (c, "calib", tps, r, buf >> 20, buf_lines, ms);
       }
   std::printf ("calib done (%zu parallelism levels x %d rounds)\n",
                c.opt.threads_per_sm.size (), c.opt.rounds);
@@ -369,11 +467,11 @@ main (int argc, char **argv)
         CHECK_CUDA (cudaGetLastError ());
         CHECK_CUDA (cudaDeviceSynchronize ());
         CHECK_CUDA (cudaEventRecord (c.e0));
-        const int sblock = std::min (c.opt.probe_tps, 512);
-        const int sblocks = std::max (1, c.sms * c.opt.probe_tps / sblock);
+        int sblocks = 0, sblock = 0;
+        geometry (c, c.opt.probe_tps, sblocks, sblock);
         probe_sector_kernel<<<sblocks, sblock,
                               sblock * sizeof (std::uint32_t)>>> (
-            c.buf, buf_lines, s, c.lat);
+            c.buf, buf_lines, s, c.opt.lanes, c.lat);
         CHECK_CUDA (cudaEventRecord (c.e1));
         CHECK_CUDA (cudaGetLastError ());
         CHECK_CUDA (cudaEventSynchronize (c.e1));

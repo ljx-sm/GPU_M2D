@@ -15,8 +15,12 @@
 //   - Completion is forced before the second clock read by a dependent
 //     shared-memory store of the loaded value (in-order issue + scoreboard
 //     wait), the standard pointer-chase-free microbenchmark pattern.
-//   - One probe per thread at a time, so per-thread latency is a single
-//     load's latency; parallelism comes from many threads.
+//   - ONE ACTIVE LANE PER WARP (lanes == 1, the production mode): a warp's
+//     load instruction completes only when ALL its lanes' data has
+//     returned, so with 32 active lanes every lane would time the SLOWEST
+//     of 32 lines (G8-T0 finding). Parallelism comes from many warps.
+//     lanes == 32 (all lanes probe) is kept only to reproduce that effect
+//     in calibration.
 //   - Range descriptors travel as a by-value kernel parameter (no device
 //     table to read), so the probe's own L2 footprint is the output array.
 //   - A probe that MISSES loads the line into L2 (unavoidable for any
@@ -35,16 +39,21 @@ namespace l2probe
 inline constexpr std::uint64_t kLineBytes = 128;
 inline constexpr int kMaxRanges = 32;
 
-// One contiguous device byte range [base, base + bytes). Lines are the
-// 128-B-aligned blocks overlapping the range; each line is probed at the
-// first byte of the line that lies inside the range (so a partial edge
-// line is probed inside its own allocation).
+// Probe unit: a 128-B L2 line or a 32-B L2 sector. T0 measured that L2
+// fills per 32-B sector, so a 128-B "line" probe observes only the sector
+// it touches.
+inline constexpr std::uint64_t kSectorBytes = 32;
+
+// One contiguous device byte range [base, base + bytes). Units are the
+// unit-aligned blocks overlapping the range; each unit is probed at the
+// first byte of the unit that lies inside the range (so a partial edge
+// unit is probed inside its own allocation).
 struct ProbeRange
 {
   const std::uint8_t *base;
   std::uint64_t bytes;
-  std::uint64_t first_line; // global output index of this range's line 0
-  std::uint64_t lines;      // number of 128-B lines overlapping the range
+  std::uint64_t first_line; // global output index of this range's unit 0
+  std::uint64_t lines;      // number of units overlapping the range
 };
 
 struct ProbeRanges
@@ -52,6 +61,19 @@ struct ProbeRanges
   ProbeRange r[kMaxRanges];
   int count;
   std::uint64_t total_lines;
+  std::uint64_t unit; // kLineBytes or kSectorBytes (power of two)
+  // Sub-sampled sweep: probe only units u with u % stride == phase (a
+  // sweep's own fill traffic is then ~1/stride of the surface, which
+  // bounds probe self-eviction when the surface exceeds L2). stride 1 =
+  // probe every unit.
+  std::uint64_t stride;
+  std::uint64_t phase;
+  // Probe the selected units in descending index order (contamination
+  // detector: forward and reverse sweeps must agree).
+  int reverse;
+  // Active probing lanes per warp: 1 (production) or 32 (calibration of
+  // the warp-max effect only).
+  int lanes;
 };
 
 __forceinline__ __device__ std::uint64_t
@@ -62,7 +84,7 @@ read_clock64 ()
   return c;
 }
 
-// Address of global line `g` (caller guarantees g < total_lines).
+// Address of global unit `g` (caller guarantees g < total_lines).
 __forceinline__ __device__ const std::uint8_t *
 line_address (const ProbeRanges &ranges, std::uint64_t g)
 {
@@ -72,8 +94,9 @@ line_address (const ProbeRanges &ranges, std::uint64_t g)
   const ProbeRange &pr = ranges.r[k];
   const std::uint64_t local = g - pr.first_line;
   const std::uintptr_t base = reinterpret_cast<std::uintptr_t> (pr.base);
-  const std::uintptr_t aligned = base & ~static_cast<std::uintptr_t> (kLineBytes - 1);
-  std::uintptr_t addr = aligned + local * kLineBytes;
+  const std::uintptr_t aligned
+      = base & ~static_cast<std::uintptr_t> (ranges.unit - 1);
+  std::uintptr_t addr = aligned + local * ranges.unit;
   if (addr < base)
     addr = base; // partial first line: probe inside the range
   return reinterpret_cast<const std::uint8_t *> (addr);
@@ -94,22 +117,40 @@ timed_load_cg (const std::uint8_t *p, volatile std::uint32_t *sink)
   return dt > 0xffffffffull ? 0xffffffffu : static_cast<std::uint32_t> (dt);
 }
 
-// Grid-stride probe of every line; latency (cycles, saturated to 16 bits)
-// per global line index. Launch with blockDim.x <= 1024 and dynamic shared
-// memory = blockDim.x * sizeof(uint32_t).
+// Grid-stride probe of the selected units (u % stride == phase); latency
+// (cycles, saturated to 16 bits) written at each probed unit's global
+// index, other entries untouched. Launch with blockDim.x <= 1024 and
+// dynamic shared memory = blockDim.x * sizeof(uint32_t).
 __global__ void
 probe_latency_kernel (ProbeRanges ranges, std::uint16_t *__restrict__ out)
 {
   extern __shared__ std::uint32_t probe_sink[];
   volatile std::uint32_t *sink = probe_sink + threadIdx.x;
-  const std::uint64_t stride
+  const std::uint64_t sweep_stride = ranges.stride ? ranges.stride : 1;
+  const std::uint64_t n
+      = ranges.total_lines > ranges.phase
+            ? (ranges.total_lines - ranges.phase + sweep_stride - 1)
+                  / sweep_stride
+            : 0;
+  const std::uint64_t thread
+      = static_cast<std::uint64_t> (blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::uint64_t threads
       = static_cast<std::uint64_t> (gridDim.x) * blockDim.x;
-  for (std::uint64_t g
-       = static_cast<std::uint64_t> (blockIdx.x) * blockDim.x + threadIdx.x;
-       g < ranges.total_lines; g += stride)
+  std::uint64_t worker = thread;
+  std::uint64_t workers = threads;
+  if (ranges.lanes == 1)
     {
-      const std::uint32_t dt = timed_load_cg (line_address (ranges, g), sink);
-      out[g] = dt > 0xffffu ? 0xffffu : static_cast<std::uint16_t> (dt);
+      if ((threadIdx.x & 31u) != 0)
+        return;
+      worker = thread / 32;
+      workers = threads / 32;
+    }
+  for (std::uint64_t g = worker; g < n; g += workers)
+    {
+      const std::uint64_t k = ranges.reverse ? n - 1 - g : g;
+      const std::uint64_t u = ranges.phase + k * sweep_stride;
+      const std::uint32_t dt = timed_load_cg (line_address (ranges, u), sink);
+      out[u] = dt > 0xffffu ? 0xffffu : static_cast<std::uint16_t> (dt);
     }
 }
 

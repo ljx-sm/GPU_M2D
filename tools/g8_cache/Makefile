@@ -19,8 +19,9 @@ g8_l2_calib: g8_l2_calib.cu ../../include/gpu_m2d/l2_probe_kernels.cuh
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 check: all
-	python3 -m py_compile analyze_l2_calib.py
+	python3 -m py_compile analyze_l2_calib.py analyze_l2_probe_pass.py
 	python3 analyze_l2_calib.py --self-test
+	python3 analyze_l2_probe_pass.py --self-test
 
 clean:
 	rm -f g8_l2_calib __pycache__/*.pyc
