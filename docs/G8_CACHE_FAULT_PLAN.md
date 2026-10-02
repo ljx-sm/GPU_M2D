@@ -4,7 +4,10 @@ Status: **DESIGN CONFIRMED by the user, 2026-10-01. G8-T0 complete
 2026-10-01 (GPU 0): probe calibration V6 PASS, hook neutrality V7 PASS
 (§11). G8-T1 complete 2026-10-02 (GPU 0): residency maps for all six
 G7-v2 models built, independently verified, and reproducible, V9 PASS
-(§12). Next: G8-T2 (injection), on all six models.** This
+(§12). G8-T2 complete 2026-10-02 (GPU 0): the cache-fault chain runs
+end to end, with smoke campaigns VERIFIED on all six models and a
+controlled shared-GPU test (§13). Open: BER_cache (T3), and the user's
+confirmation of the provisional self-check limits (§9).** This
 file has been revised in place through the 2026-09-29 … 10-01 discussion
 (earlier versions are in git history; §10 records what changed and why).
 One parameter is still open: the cache upset rate BER_cache (§3.3).
@@ -310,6 +313,19 @@ during the measurement pass, which is the same workload in the same
 process immediately before. A large change in co-tenant load during a long
 campaign is a stated limitation.
 
+**In-campaign settings (G8-T2).**
+
+- **Stride:** `--l2-probe-stride auto`. A stride-64 pre-sweep measures
+  the surface's miss fraction: ≤ 1 % → 1, ≤ 50 % → 64, > 50 % → 256.
+- **Self-checks** before any cache site is sampled (fail-closed):
+  - in-gap share ≤ 0.5 %;
+  - **order effect**: the probe hit rate of units in the first half of
+    their sweep minus the second half, |Δ| ≤ 3 pp;
+  - the map matches this process (VAs, image count, frozen R).
+- **Diagnostic only:** the direction-locked share. Under a bursty
+  co-tenant, units that genuinely flicker fake it, so it does not gate
+  (§13).
+
 **Output**, per process (segment):
 
 - `residency_map` file containing:
@@ -365,7 +381,7 @@ Reported metrics:
 | --- | --- | --- |
 | **G8-T0** Feasibility (GPU 0) — **DONE 2026-10-01** | Calibrate the L2-hit vs GDDR-fetch latency of the probe kernel (thresholds, separation, stability); measure probe throughput for full-surface sweeps and choose k per model; runner hook for probe/apply/remove kernels at image boundaries. Done: probe calibration + runner probe pass (`--l2-probe-*`); apply/remove hooks are T2 work. | Gate: clean hit/miss separation; a hooked pass with no flips is bit-identical to the clean pass. **Both PASS** (§11). |
 | **G8-T1** Residency pass — **DONE 2026-10-02** | Implement the in-process measurement pass (§4) and the residency-map format. Validation runs per model: two passes in one process (same-process stability) and runs in separate processes (how much the per-line pattern changes, reported as allocation-level statistics). Start with ResNet-50 v2 (default; the user may pick another first model). | Residency maps; stability report. |
-| **G8-T2** Implementation | Cache sampler (§3.2, §3.4) in `fault_model.py`; runner per-image apply/remove; orchestrator flow (clean pass → residency pass → plan → trials, re-measure per restart segment) and independent re-verification; self-tests (apply/remove exactness, overlap with DRAM flips, engine-written skip, input re-staging, start-inside-residency check). | Self-tests PASS; a smoke campaign VERIFIED. |
+| **G8-T2** Implementation — **DONE 2026-10-02** | Cache sampler (§3.2, §3.4) in `tools/g8_cache/cache_model.py` (classes in `fault_model.py`); runner per-image apply/remove; orchestrator flow (clean pass → residency pass → plan → trials, re-measure per restart segment) and independent re-verification; self-tests (apply/remove exactness, overlap with DRAM flips, engine-written skip, input re-staging, start-inside-residency check). | Self-tests PASS; a smoke campaign VERIFIED. |
 | **G8-T3** Cache rate | The user derives BER_cache from the DRAM BER via prior work; the cache level table is frozen alongside the DRAM levels. | The frozen table, documented as for G5-T1. |
 | **G8-T4** Campaigns (GPU 0) | DRAM + L2 per model at the frozen levels, 100 trials × 10K images, compared against the existing DRAM-only runs. | Accuracy curves (DRAM-only vs DRAM + L2) + the conditional cache-hit error rate. |
 
@@ -425,6 +441,13 @@ Reported metrics:
 5. Whether to report a "dedicated GPU" condition in addition to the
    shared one, if an idle window on GPU 0 becomes available. All T0
    measurements ran on an idle GPU 0.
+6. **Provisional T2 self-check limits (user to confirm):**
+   - in-gap share ≤ 0.5 %;
+   - order effect |Δ| ≤ 3 pp;
+   - auto-stride tiers: pre-sweep miss ≤ 1 % → stride 1, ≤ 50 % → 64,
+     > 50 % → 256.
+
+   Their calibration is in §13.
 
 ## 10. Design history (why the earlier options were dropped)
 
@@ -601,3 +624,72 @@ that T0's allocation-level counts had hidden:
 - **The probe's output buffer is an unregistered `cudaMalloc`.** Under
   the observer it must either be registered in the allocation registry as
   a non-surface allocation, or be tolerated by the ledger.
+
+## 13. G8-T2 results (2026-10-02, GPU 0)
+
+Full tables are in `tools/g8_cache/README.md` (T2 section). Run
+directories are under `artifacts/g8/t2/`.
+
+**What T2 built.**
+
+- **T2-a: in-campaign residency pass.**
+  - The pass runs before the gate.
+  - Its probe output buffer is a registered allocation
+    (`G8_L2_PROBE_OUTPUT`), so it is ledger-covered and outside the
+    surface.
+  - It uses the auto stride.
+- **T2-b: per-process self-checks** (§4).
+- **T2-c: cache lifetime classes.** `derive_alloc_classes.py`, frozen in
+  `fault_model.WORKLOADS`. A TRT-internal allocation is read-only iff
+  every G7-v2 restore was `exact`; bindings are engine-written.
+- **T2-d: sampler** (`cache_model.py`).
+- **T2-e: runner per-image apply/remove** (§3.5–§3.7).
+- **T2-f: orchestrator `--cache-ber`.** Sampling at the gate,
+  independent re-verification of the cache rows and events, a
+  cache-aware skeleton and restart merge, and the provenance in
+  `summary.json`.
+
+**Smoke campaigns: `G5_CAMPAIGN_VERIFIED` on all six models.** Each ran
+DRAM BER 1e-7 + `--cache-ber 1e-7`, 2 trials, on an idle GPU 0.
+
+| Model | Auto stride | R_eff | n_cache | Order effect | Cache removals: re-XOR / restored / overwritten |
+| --- | --- | --- | --- | --- | --- |
+| ResNet-50 v2 | 1 | 28.83 MB | 23 | 0.00 pp | 36 / 3 / 7 |
+| MobileNetV3-L | 1 | 9.09 MB | 7 | 0.00 pp | 7 / 2 / 5 |
+| EfficientNet-B0 | 1 | 17.14 MB | 14 | 0.00 pp | 15 / 2 / 11 |
+| DeiT-S | 1 | 26.01 MB | 21 | 0.00 pp | 32 / 0 / 10 |
+| Swin-T | 1 | 43.80 MB | 35 | 0.00 pp | 41 / 2 / 27 |
+| ViT-B | 64 | 74.21 MB | 59 | −0.35 pp | 111 / 0 / 7 |
+
+In every trial:
+
+- read-only flips returned exactly to their pre-cache value;
+- engine-written flips were restored or overwritten by the engine;
+- the sanity inference reproduced clean.
+
+**Controlled shared-GPU test.** The co-tenant was
+`tools/g8_cache/g8_l2_thrash`, either heavy (64 MiB continuous) or
+moderate (32 MiB, 50 % duty). The test used ResNet-50 v2 and ViT-B.
+
+- **Neutrality and threshold hold.** 0 mismatches; in-gap share
+  ≤ 0.18 % under load.
+- **Residency follows the co-tenant.** Heavy load: ResNet-50 R_eff 28.8
+  → 4.1–4.5 MB, ViT-B → 3–4 MB. Moderate load: ResNet-50 99.7 %, ViT-B
+  42–55 MB, varying between processes.
+- **The order effect is the gate statistic.** The known idle stride-16
+  artifact reads −3.87 pp. Every production configuration, idle or
+  shared, stays within ±2.3 pp. In the shared cases the residual is the
+  co-tenant evicting during the sweep, bounding a map's bias at about
+  1 pp.
+- **The direction-locked share was demoted to informational.** It
+  reached 5 % for moderate ViT-B even at stride 256, from genuine
+  flicker.
+- **Heavy contention needs stride 256.** Heavy ResNet-50 reads +2.18 pp
+  at stride 64 and −0.12 pp at stride 256.
+
+**Not yet exercised live:** a PROCESS_FATAL restart in cache mode. These
+low-intensity smoke trials did not crash; the death analysis and merge
+paths are covered by the orchestrator self-test.
+
+**Next (T3):** BER_cache from prior work, and freezing the cache level
+table.

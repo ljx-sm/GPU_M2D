@@ -350,3 +350,130 @@ and the exclusions come from `fault_model.WORKLOADS`.
 
 Artifacts (untracked) are under `artifacts/g8/t1/`, including the
 superseded stride-16/64/256 comparison maps `vit_compact*`.
+
+## T2 — L2 cache faults in the campaign chain (`--cache-ber`)
+
+**Status (2026-10-02, GPU 0): chain implemented; smoke campaigns
+`G5_CAMPAIGN_VERIFIED` on all six G7-v2 models; controlled shared-GPU
+test done. BER_cache is still an explicit, unfrozen parameter (G8-T3).**
+
+### How a campaign process runs with `--cache-ber X`
+
+1. The process allocates, then runs the clean pass.
+2. **Residency pass**, in the same process, before the campaign gate. It
+   writes `segment_NNN/g1_5_l2_residency.{bin,json}`.
+   - **Probe buffer:** the latency output is a *registered* allocation
+     (label `G8_L2_PROBE_OUTPUT`, alive until teardown), so the G2/G5
+     ledger covers it. `fault_model.surface_rows_for` keeps it out of the
+     injection surface.
+   - **Auto stride:** a stride-64 pre-sweep measures the miss fraction.
+     ≤ 1 % → stride 1; ≤ 50 % → 64; > 50 % → 256.
+3. **At the gate**, the orchestrator verifies the map
+   (`residency_map.load_map`) and runs the per-process **self-checks**
+   (`cache_model.map_self_checks`, fail-closed):
+
+   | Check | Limit |
+   | --- | --- |
+   | In-gap share of in-situ latencies | ≤ 0.5 % |
+   | Order effect: probe hit rate early − late in the sweep | \|Δ\| ≤ 3 pp |
+   | Map matches this process | same VAs, image count, frozen R |
+
+   The direction-locked share is recorded but does not gate (see the
+   shared-GPU test below).
+4. **Sampling.** `cache_model.sample_cache_campaign` draws the cache sites
+   and writes `cache_work.csv`:
+   - n_cache = round(X × R_eff_bits);
+   - sector chosen ∝ bits × resident time;
+   - start uniform in time within the sector's residency periods;
+   - byte and bit uniform;
+   - lifetime to the period end (read-only) or the start image
+     (engine-written);
+   - lifetime classes come from `fault_model.WORKLOADS[...]["cache_alloc_classes"]`,
+     derived by `derive_alloc_classes.py`.
+5. **Per image, in the runner:**
+   - cache flips that start at the image are applied after input staging
+     and the DRAM input re-apply, checked `after == before ^ mask` at the
+     expected VA;
+   - after the inference, flips that end at the image are removed:
+     read-only ones are re-XORed and must return exactly to the pre-cache
+     value (fail-closed); engine-written ones are restored only if the
+     byte still holds the flipped value, otherwise recorded as
+     `overwritten`;
+   - a DUE abort removes all active flips at that image;
+   - rows go to `g1_5_g8_cache_site_result.csv`, flushed per trial, with
+     `CACHE_FLIPPED` / `CACHE_REMOVED` events.
+6. **After the run** the orchestrator independently re-verifies:
+   - every completed trial's cache rows against the sampled work
+     (identity, apply image and VA, XOR, removal image including the DUE
+     case, removal semantics);
+   - the cache events against the rows.
+
+   The lifecycle skeleton gains `L2_PROBE_PASS_BEGIN/END`. Restart merges
+   renumber the `c%03d-k` cache ids. `summary.json` carries
+   `g8_cache_ber`, n_cache per segment, and each segment's map sha256,
+   self-check values and removal counts.
+
+### Smoke campaigns — all six models (GPU 0 idle, 2 trials, DRAM BER 1e-7 + `--cache-ber 1e-7`)
+
+| Model | Status | DRAM bits / trial | Auto stride (pre-sweep miss) | R_eff | n_cache | In-gap | Order effect | Cache removals: re-XOR / restored / overwritten |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ResNet-50 v2 | VERIFIED | 23 | 1 (0.000) | 28.83 MB | 23 | 0.013 % | 0.00 pp | 36 / 3 / 7 |
+| MobileNetV3-L | VERIFIED | 7 | 1 (0.000) | 9.09 MB | 7 | 0.023 % | 0.00 pp | 7 / 2 / 5 |
+| EfficientNet-B0 | VERIFIED | 14 | 1 (0.000) | 17.14 MB | 14 | 0.023 % | 0.00 pp | 15 / 2 / 11 |
+| DeiT-S | VERIFIED | 21 | 1 (0.000) | 26.01 MB | 21 | 0.005 % | 0.00 pp | 32 / 0 / 10 |
+| Swin-T | VERIFIED | 35 | 1 (0.000) | 43.80 MB | 35 | 0.004 % | 0.00 pp | 41 / 2 / 27 |
+| ViT-B | VERIFIED | 75 | 64 (0.208) | 74.21 MB | 59 | 0.085 % | −0.35 pp | 111 / 0 / 7 |
+
+Across all six:
+
+- every read-only flip returned exactly to its pre-cache value;
+- every engine-written flip was either restored or overwritten by the
+  engine;
+- every trial's sanity inference reproduced the clean output.
+
+Run directories are under `artifacts/g8/t2/campaign/`.
+
+Not exercised live: a PROCESS_FATAL restart in cache mode. These
+low-intensity trials did not crash; the merge and death analysis paths
+are covered by the orchestrator self-test.
+
+### Controlled shared-GPU test (`g8_l2_thrash` as the co-tenant)
+
+The runs used ResNet-50 v2 and ViT-B, with the co-tenant either heavy
+(64 MiB, continuous, ~410–450 GB/s) or moderate (32 MiB, 50 % duty,
+~140–165 GB/s).
+
+| Condition | Model | Stride | R_eff | In-gap | Order effect Δ |
+| --- | --- | --- | --- | --- | --- |
+| idle | ResNet-50 | 1 | 28.83 MB (100 %) | 0.013 % | 0.00 pp |
+| idle | ViT-B | 16 | 72.18 MB | 0.003 % | **−3.87 pp** (known sweep artifact) |
+| idle | ViT-B | 64 | 74.21 MB (79 %) | 0.085 % | −0.35 pp |
+| moderate | ResNet-50 | 64 | 28.75 MB (99.7 %) | 0.18 % | 0.00 pp |
+| moderate | ViT-B | 64 / 256 | 55.3 / 42.5 MB | 0.07 / 0.16 % | +1.60 / +2.28 pp |
+| heavy | ResNet-50 | 64 / 256 | 4.11 / 4.48 MB | 0.03 / 0.14 % | +2.18 / −0.12 pp |
+| heavy | ViT-B | 256 | 4.17 MB (4.4 %) | 0.03 % | +0.91 pp |
+
+1. **The method holds under sharing.** Every probe pass stayed neutral (0
+   mismatches). The idle threshold still separates hits from misses: the
+   in-gap share stays ≤ 0.18 % even under heavy load.
+2. **Residency follows the co-tenant.** Heavy contention evicts almost
+   everything, so R_eff collapses, which is the measurement working as
+   intended. Under a bursty co-tenant, R_eff varies between processes
+   (ViT-B 42–55 MB). That is why the map is measured per process and why
+   co-tenancy is recorded.
+3. **The direction-locked share is unfit as a gate.** It reached 5 % for
+   moderate ViT-B even at stride 256. Units that genuinely flicker, with
+   few observations, fake the signature, so it was demoted to
+   informational. The **order effect** replaced it. With alternating
+   direction every unit is sometimes probed early and sometimes late, so
+   genuine changes cancel and only the order artifact remains. It flags
+   the known idle stride-16 artifact (−3.87 pp). Every production
+   configuration stays within ±2.3 pp. In the shared cases that residual
+   comes from the co-tenant evicting lines *during* the ~10–60 µs sweep,
+   and it biases a map by about 1 pp at most.
+4. **Heavy contention needs stride 256.** Heavy ResNet-50 shows +2.18 pp
+   at stride 64 and −0.12 pp at stride 256. This is why the auto stride
+   has a third tier.
+
+The **gate (|Δ| ≤ 3 pp) and the 3-tier stride thresholds are provisional
+until the user confirms them**.

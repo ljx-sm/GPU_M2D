@@ -139,6 +139,42 @@ The same stack serves two campaign families, selected by `--workload`:
      counter/outcome precedence, DUE block shape, and event↔CSV agreement;
    - UUID, address-space and lost-event checks.
 
+## G8 L2 cache mode (`--cache-ber X`, 2026-10-02)
+
+Adds L2 cache single-bit upsets on top of the level's DRAM faults
+([docs/G8_CACHE_FAULT_PLAN.md](../../docs/G8_CACHE_FAULT_PLAN.md); tooling
+and results in [tools/g8_cache/README.md](../g8_cache/README.md)).
+
+- **Before the gate:** each campaign process measures its own L2
+  residency map, with an auto stride and a registered probe buffer.
+- **At the gate:** the orchestrator verifies the map, runs the
+  self-checks (in-gap share, order effect, map matches this process),
+  and samples `n_cache = round(X × R_eff_bits)` cache flips per trial
+  into `cache_work.csv`.
+- **During the trial:** the runner applies each cache flip before its
+  start image's inference and removes it after its last image.
+- **After the run:** every cache row is re-verified independently.
+
+All of this is fail-closed. DRAM-only campaigns are unchanged.
+
+```bash
+sudo scripts/run_g2_observer_probe.sh --api g5campaign --device 0 \
+     --workload <g7v2 workload> --level L1 [...G7 passthrough flags...] \
+     --cache-ber 1e-7
+```
+
+Extra outputs:
+
+- `cache_work.csv` and `g1_5_g8_cache_site_result.csv` (merged across
+  restart segments);
+- `segment_NNN/g1_5_l2_*` (the residency map, latency histogram and
+  probe-pass CSVs);
+- in `summary.json`, `g8_cache_ber`, `g8_n_cache_per_segment`, and a
+  `g8_cache` block per segment.
+
+Until G8-T3 freezes a cache level table, X is an explicit, recorded,
+unfrozen parameter.
+
 ## Restart protocol and PROCESS_FATAL (2026-09-28)
 
 **Why.** A flip in TensorRT's `create_execution_context`-phase private
