@@ -13,9 +13,12 @@ NVCCFLAGS := -std=c++17 -arch=sm_$(CUDA_ARCH) -O3 --generate-line-info \
 
 .PHONY: all clean check
 
-all: g8_l2_calib
+all: g8_l2_calib g8_l2_thrash
 
 g8_l2_calib: g8_l2_calib.cu ../../include/gpu_m2d/l2_probe_kernels.cuh
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+g8_l2_thrash: g8_l2_thrash.cu
 	$(NVCC) $(NVCCFLAGS) -o $@ $<
 
 check: all
@@ -28,4 +31,4 @@ check: all
 	python3 derive_alloc_classes.py --self-test
 
 clean:
-	rm -f g8_l2_calib __pycache__/*.pyc
+	rm -f g8_l2_calib g8_l2_thrash __pycache__/*.pyc

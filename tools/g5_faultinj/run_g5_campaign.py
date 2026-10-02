@@ -1825,6 +1825,9 @@ def _segment_details(segments: list[dict]) -> list[dict]:
         "snapshot_sha256": seg["extra"].get("snapshot_sha256", ""),
         "total_sites": seg["extra"].get("total_sites"),
         "campaign_window_ns": seg["extra"].get("campaign_window_ns"),
+        # G8 cache mode: this segment's own residency map, self-check
+        # values and n_cache (per process -- may differ between segments)
+        "g8_cache": seg["extra"].get("g8_cache"),
     } for seg in segments]
 
 
@@ -1978,6 +1981,14 @@ def run_once(args: argparse.Namespace) -> int:
         # segment's never-run tail was re-sampled later and is NOT added
         "total_sites": args.trials * level["bits"],
         "surface_excludes": first.get("surface_excludes", []),
+        # G8 cache mode summary (per-segment detail in segment_details)
+        "g8_cache_ber": getattr(args, "cache_ber", None),
+        "g8_cache_ber_frozen": False if getattr(args, "cache_ber", None)
+        is not None else None,
+        "g8_n_cache_per_segment": [
+            (seg["extra"].get("g8_cache") or {}).get("n_cache")
+            for seg in segments] if getattr(args, "cache_ber", None)
+        is not None else None,
         "surface_resident_bytes": first.get("surface_resident_bytes"),
         "work_output": str(work_output),
         "work_sha256": sha256(work_output),
