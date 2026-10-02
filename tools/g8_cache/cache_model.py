@@ -30,8 +30,14 @@ Self-checks (T2-b, per process, fail-closed; thresholds below):
   - in-gap share: the share of in-situ probe latencies inside the T0
     calibration gap -- a blurred hit/miss separation (e.g. co-tenant
     queueing) makes the threshold unreliable;
-  - direction-locked share: units whose residency follows the probe
-    direction (the sweep's own fills evicting not-yet-probed sectors);
+  - order effect: hit rate of units probed in the first half of their
+    sweep minus the second half (runner-counted, map json
+    `order_effect`). The sweep's own fills evict not-yet-probed sectors,
+    so the artifact reads late < early; with alternating direction every
+    unit is sometimes early and sometimes late, so genuine residency
+    changes cancel. (The per-unit direction-locked share is kept as an
+    informational diagnostic only: under a bursty co-tenant, genuinely
+    flickering units with few observations fake it.)
   - the map must describe this process: same allocations at the same VAs
     as the gate registry, the campaign's image count, the frozen surface.
 
@@ -61,7 +67,12 @@ MAX_OVERLAP_REDRAWS = 64
 # T2-b self-check thresholds (fail-closed).
 CALIBRATION_GAP = (400, 480)   # T0/T1 single-lane calibration, cycles
 MAX_IN_GAP_SHARE = 0.005       # idle GPU 0 measured <= 0.2 %
-MAX_LOCKED_SHARE = 0.02        # by bytes; ViT-B at stride 64 measured ~1 %
+MAX_LOCKED_SHARE = 0.02        # informational (see module docstring)
+# |early - late| probe hit rate. Calibration (GPU 0): idle ViT-B stride
+# 16 (known sweep artifact) -3.87 pp; every production configuration
+# idle or under a controlled co-tenant within +-2.3 pp (the shared cases
+# are real-time eviction during the sweep, bounded the same way).
+MAX_ORDER_EFFECT = 0.03
 
 CACHE_WORK_FIELDS = ["trial_index", "cache_index", "target_id",
                      "allocation_id", "byte_offset", "bit_in_byte",
@@ -266,18 +277,36 @@ def locked_share(m: rm.ResidencyMap) -> float:
     return locked_bytes / (m.meta["surface_bits"] / 8)
 
 
+def order_effect(m: rm.ResidencyMap) -> dict:
+    """Early-minus-late probe hit rate of the pass (map json)."""
+    oe = m.meta.get("order_effect")
+    if not oe or not oe.get("early_n") or not oe.get("late_n"):
+        raise CacheModelError("map has no order_effect counts")
+    p_early = oe["early_hits"] / oe["early_n"]
+    p_late = oe["late_hits"] / oe["late_n"]
+    se = (p_early * (1 - p_early) / oe["early_n"]
+          + p_late * (1 - p_late) / oe["late_n"]) ** 0.5
+    return {"early_hit_rate": p_early, "late_hit_rate": p_late,
+            "delta": p_early - p_late, "se": se}
+
+
 def map_self_checks(prefix: str, m: rm.ResidencyMap, *, images: int,
                     frozen_r: int, live_bases: dict[str, int]) -> dict:
     """T2-b per-process checks; returns {"values": ..., "failures": [...]}."""
     failures = []
     gap_share = in_gap_share(Path(prefix + "_hist.csv"))
-    lock = locked_share(m)
+    lock = locked_share(m)   # informational only (module docstring)
     if gap_share > MAX_IN_GAP_SHARE:
         failures.append(f"in-gap share {gap_share:.4%} > {MAX_IN_GAP_SHARE:.2%}"
                         " (hit/miss separation blurred)")
-    if lock > MAX_LOCKED_SHARE:
-        failures.append(f"direction-locked share {lock:.3%} > "
-                        f"{MAX_LOCKED_SHARE:.1%} (probe self-eviction)")
+    try:
+        oe = order_effect(m)
+    except CacheModelError as exc:
+        oe = None
+        failures.append(str(exc))
+    if oe is not None and abs(oe["delta"]) > MAX_ORDER_EFFECT:
+        failures.append(f"order effect {oe['delta']:+.2%} beyond "
+                        f"+-{MAX_ORDER_EFFECT:.0%} (sweep-order artifact)")
     if m.images != images:
         failures.append(f"map has {m.images} images, campaign {images}")
     if m.meta["surface_bits"] != 8 * frozen_r:
@@ -289,6 +318,7 @@ def map_self_checks(prefix: str, m: rm.ResidencyMap, *, images: int,
             failures.append(f"{r['allocation_id']}: map VA {r['gpu_va']} != "
                             f"live registry VA {live}")
     return {"values": {"in_gap_share": gap_share, "locked_share": lock,
+                       "order_effect": oe,
                        "stride": m.meta["stride"],
                        "stride_rule": m.meta.get("stride_rule"),
                        "r_eff_bits": m.r_eff,
@@ -316,7 +346,9 @@ def _fixture(tmp: Path, periods_per_unit, images=10, times=None,
     import json
     meta = json.loads(Path(p + "_residency.json").read_text())
     meta.update({"alternate": alternate, "stride": stride,
-                 "observation_window_images": stride})
+                 "observation_window_images": stride,
+                 "order_effect": {"early_hits": 500, "early_n": 1000,
+                                  "late_hits": 495, "late_n": 1000}})
     Path(p + "_residency.json").write_text(json.dumps(meta))
     with open(p + "_hist.csv", "w", newline="") as handle:
         w = csv.writer(handle)
@@ -407,7 +439,22 @@ def self_test() -> int:
             csv.writer(handle).writerow(["trt-internal-0", 432, 20])
         chk = map_self_checks(p, m, images=10, frozen_r=116, live_bases=live)
         assert any("in-gap" in f for f in chk["failures"]), chk
-        # direction-locked units are counted by bytes
+        # an order effect beyond +-3 pp fails; within passes
+        import json as _json
+        meta = _json.loads(Path(p + "_residency.json").read_text())
+        meta["order_effect"] = {"early_hits": 600, "early_n": 1000,
+                                "late_hits": 550, "late_n": 1000}
+        Path(p + "_residency.json").write_text(_json.dumps(meta))
+        bad_map = rm.load_map(p)
+        assert abs(order_effect(bad_map)["delta"] - 0.05) < 1e-12
+        with open(p + "_hist.csv", "w", newline="") as handle:
+            w = csv.writer(handle)
+            w.writerow(["allocation_id", "bin_lo_cycles", "count"])
+            w.writerow(["trt-internal-0", 304, 1000])
+        chk = map_self_checks(p, bad_map, images=10, frozen_r=116,
+                              live_bases=live)
+        assert any("order effect" in f for f in chk["failures"]), chk
+        # direction-locked units are counted by bytes (informational)
         p3dir = tmp / "lock"
         p3dir.mkdir()
         osc = [(i, i) for i in range(0, 40, 2)]   # resident on even sweeps

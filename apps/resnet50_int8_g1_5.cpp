@@ -48,8 +48,16 @@ constexpr float kSanityTolerance = 1.0e-4F;
 // G8: semantic label of the L2 probe's registered output buffer (never
 // probed, never part of the injection surface) and the `auto` stride rule.
 const char* const kL2ProbeOutputLabel = "G8_L2_PROBE_OUTPUT";
-constexpr std::size_t kAutoStrideLarge = 64;
+// `auto` stride rule (G8-T2, calibrated on GPU 0 idle and under a
+// controlled L2 co-tenant): a stride-64 pre-sweep measures the surface's
+// L2 miss fraction; <= 1 % -> stride 1 (nothing to self-evict), <= 50 % ->
+// 64, otherwise 256 (heavy contention: shorter sweeps, smaller order
+// effect -- heavy ResNet-50 order effect +2.2 pp at 64 vs -0.1 pp at 256).
+constexpr std::size_t kPresweepStride = 64;
+constexpr std::size_t kAutoStrideMid = 64;
+constexpr std::size_t kAutoStrideLarge = 256;
 constexpr double kAutoStrideMissFraction = 0.01;
+constexpr double kAutoStrideHeavyMissFraction = 0.5;
 const std::array<float, 3> kMean{{0.485F, 0.456F, 0.406F}};
 const std::array<float, 3> kStd{{0.229F, 0.224F, 0.225F}};
 
@@ -2293,7 +2301,7 @@ int run_l2_probe_pass(const Options& options,
     if (options.l2_probe_stride_auto) {
         gpu_m2d::L2Prober pre(ranges, options.l2_probe_unit,
                               options.l2_probe_threshold, options.l2_probe_per_sm,
-                              kAutoStrideLarge, false, false, probe_output,
+                              kPresweepStride, false, false, probe_output,
                               output_bytes);
         static_cast<void>(pre.probe(stream.get(), 0));
         std::uint64_t hits = 0;
@@ -2306,7 +2314,9 @@ int run_l2_probe_pass(const Options& options,
         presweep_miss_fraction =
             presweep_units ? 1.0 - static_cast<double>(hits) / presweep_units : 1.0;
         stride = presweep_miss_fraction <= kAutoStrideMissFraction ? 1
-                                                                   : kAutoStrideLarge;
+                 : presweep_miss_fraction <= kAutoStrideHeavyMissFraction
+                     ? kAutoStrideMid
+                     : kAutoStrideLarge;
         std::cout << "G8 stride rule: pre-sweep miss fraction "
                   << presweep_miss_fraction << " over " << presweep_units
                   << " units -> stride " << stride << '\n';
@@ -2375,6 +2385,12 @@ int run_l2_probe_pass(const Options& options,
                 prober.total_units(), static_cast<std::uint32_t>(samples.size()));
         }
         std::vector<double> image_ms(samples.size(), 0.0);
+        // Order effect (G8-T2): hit rate of units probed in the FIRST half
+        // of their sweep vs the SECOND half. A sweep's own fills evict
+        // not-yet-probed sectors, so the artifact shows as late < early;
+        // with alternating direction every unit is sometimes early and
+        // sometimes late, so genuine residency changes average out.
+        std::uint64_t early_hits = 0, early_n = 0, late_hits = 0, late_n = 0;
 
         observer.event("L2_PROBE_PASS_BEGIN");
         std::size_t mismatches = 0;
@@ -2396,8 +2412,22 @@ int run_l2_probe_pass(const Options& options,
                                    << ',' << hits[r] << '\n';
                 }
                 std::size_t r = 0;
+                const std::uint64_t probed_n =
+                    (prober.total_units() - prober.last_phase() + prober.stride() - 1) /
+                    prober.stride();
+                std::uint64_t k = 0;
                 for (std::uint64_t u = prober.last_phase(); u < prober.total_units();
-                     u += prober.stride()) {
+                     u += prober.stride(), ++k) {
+                    const std::uint64_t order =
+                        prober.last_reverse() ? probed_n - 1 - k : k;
+                    const bool hit = latency[u] < prober.threshold_cycles();
+                    if (2 * order < probed_n) {
+                        early_hits += hit ? 1 : 0;
+                        ++early_n;
+                    } else {
+                        late_hits += hit ? 1 : 0;
+                        ++late_n;
+                    }
                     while (r + 1 < prober.range_count() && u >= range_first[r + 1]) {
                         ++r;
                     }
@@ -2499,10 +2529,12 @@ int run_l2_probe_pass(const Options& options,
                  << "  \"stride\": " << prober.stride() << ",\n"
                  << "  \"stride_rule\": {\"mode\": \""
                  << (options.l2_probe_stride_auto ? "auto" : "fixed")
-                 << "\", \"presweep_stride\": " << kAutoStrideLarge
+                 << "\", \"presweep_stride\": " << kPresweepStride
                  << ", \"presweep_units\": " << presweep_units
                  << ", \"presweep_miss_fraction\": " << presweep_miss_fraction
                  << ", \"miss_fraction_limit\": " << kAutoStrideMissFraction
+                 << ", \"heavy_miss_fraction_limit\": "
+                 << kAutoStrideHeavyMissFraction
                  << "},\n"
                  << "  \"alternate\": " << (prober.alternate() ? "true" : "false") << ",\n"
                  << "  \"observation_window_images\": " << window << ",\n"
@@ -2514,6 +2546,9 @@ int run_l2_probe_pass(const Options& options,
                  << "  \"periods\": " << periods << ",\n"
                  << "  \"sweeps\": " << sweeps << ",\n"
                  << "  \"neutral_mismatches\": " << mismatches << ",\n"
+                 << "  \"order_effect\": {\"early_hits\": " << early_hits
+                 << ", \"early_n\": " << early_n << ", \"late_hits\": "
+                 << late_hits << ", \"late_n\": " << late_n << "},\n"
                  << "  \"surface_bits\": " << surface_bits << ",\n"
                  << "  \"t_total_ms\": " << infer_ms_total << ",\n"
                  << "  \"r_eff_bits\": " << r_eff_bits << ",\n"
