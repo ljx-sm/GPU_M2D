@@ -31,9 +31,14 @@ public:
     // stride > 1: each probe() sweeps only units u with
     // u % stride == sweep_index % stride (staggered sub-sampling that bounds
     // the sweep's own fill traffic); reverse: probe in descending order.
+    // alternate: the direction flips for each unit's successive
+    // observations, i.e. sweep s probes in reverse iff (s / stride) is odd
+    // (overrides `reverse`; averages out the in-sweep order effect T0
+    // measured on ViT-B scratch).
     L2Prober(std::vector<L2ProbeRange> ranges, std::size_t unit_bytes,
              std::uint32_t threshold_cycles, int probes_per_sm,
-             std::size_t stride = 1, bool reverse = false);
+             std::size_t stride = 1, bool reverse = false,
+             bool alternate = false);
     ~L2Prober();
     L2Prober(const L2Prober&) = delete;
     L2Prober& operator=(const L2Prober&) = delete;
@@ -51,6 +56,12 @@ public:
     std::uint32_t threshold_cycles() const noexcept { return threshold_; }
     std::size_t stride() const noexcept { return stride_; }
     bool reverse() const noexcept { return reverse_; }
+    bool alternate() const noexcept { return alternate_; }
+    // Direction actually used by the last probe().
+    bool last_reverse() const noexcept { return last_reverse_; }
+    // Bytes of each unit that lie inside its range (unit_bytes except for
+    // partial units at a range edge), in global unit order.
+    std::vector<std::uint16_t> unit_resident_bytes() const;
     // Phase of the last probe(): the probed units are u % stride == phase.
     std::uint64_t last_phase() const noexcept { return phase_; }
     bool probed_last(std::uint64_t unit) const noexcept {
@@ -78,6 +89,8 @@ private:
     std::uint32_t threshold_{0};
     std::size_t stride_{1};
     bool reverse_{false};
+    bool alternate_{false};
+    bool last_reverse_{false};
     std::uint64_t phase_{0};
     int blocks_{0};
     int block_threads_{0};

@@ -32,6 +32,7 @@ target_compile_options(gpu_m2d_g2_capability_probe PRIVATE
 
 add_library(gpu_m2d_semantic STATIC
     src/semantic/allocation_registry.cpp
+    src/semantic/residency_map.cpp
     src/semantic/tensor_mapping.cpp
 )
 target_include_directories(gpu_m2d_semantic PUBLIC include)
@@ -60,6 +61,10 @@ if(GPU_M2D_BUILD_TESTS)
     add_executable(test_allocation_registry tests/test_allocation_registry.cpp)
     target_link_libraries(test_allocation_registry PRIVATE gpu_m2d_semantic)
     add_test(NAME allocation_registry COMMAND test_allocation_registry)
+
+    add_executable(test_residency_map tests/test_residency_map.cpp)
+    target_link_libraries(test_residency_map PRIVATE gpu_m2d_semantic)
+    add_test(NAME residency_map COMMAND test_residency_map)
 
     add_executable(test_cuda_injector tests/test_cuda_injector.cu)
     target_link_libraries(test_cuda_injector PRIVATE

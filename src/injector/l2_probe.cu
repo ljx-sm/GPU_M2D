@@ -35,12 +35,13 @@ std::uint64_t units_overlapping(const void* base, std::size_t bytes,
 
 L2Prober::L2Prober(std::vector<L2ProbeRange> ranges, std::size_t unit_bytes,
                    std::uint32_t threshold_cycles, int probes_per_sm,
-                   std::size_t stride, bool reverse)
+                   std::size_t stride, bool reverse, bool alternate)
     : ranges_(std::move(ranges)),
       unit_bytes_(unit_bytes),
       threshold_(threshold_cycles),
       stride_(stride),
-      reverse_(reverse) {
+      reverse_(reverse),
+      alternate_(alternate) {
     if (stride_ == 0) {
         throw std::invalid_argument("L2 probe stride must be >= 1");
     }
@@ -113,7 +114,8 @@ float L2Prober::probe(cudaStream_t stream, std::uint64_t sweep_index) {
     params.unit = unit_bytes_;
     params.stride = stride_;
     params.phase = phase_;
-    params.reverse = reverse_ ? 1 : 0;
+    last_reverse_ = alternate_ ? ((sweep_index / stride_) % 2 == 1) : reverse_;
+    params.reverse = last_reverse_ ? 1 : 0;
     params.lanes = 1;
     for (std::size_t i = 0; i < ranges_.size(); ++i) {
         params.r[i].base = static_cast<const std::uint8_t*>(ranges_[i].base);
@@ -151,6 +153,22 @@ std::vector<std::uint64_t> L2Prober::hits_per_range() const {
         hits[i] = h;
     }
     return hits;
+}
+
+std::vector<std::uint16_t> L2Prober::unit_resident_bytes() const {
+    std::vector<std::uint16_t> bytes(total_units_, 0);
+    for (std::size_t i = 0; i < ranges_.size(); ++i) {
+        const auto base = reinterpret_cast<std::uintptr_t>(ranges_[i].base);
+        const std::uintptr_t end = base + ranges_[i].bytes;
+        const std::uintptr_t aligned =
+            base & ~static_cast<std::uintptr_t>(unit_bytes_ - 1);
+        for (std::uint64_t k = 0; k < units_[i]; ++k) {
+            const std::uintptr_t lo = std::max(aligned + k * unit_bytes_, base);
+            const std::uintptr_t hi = std::min(aligned + (k + 1) * unit_bytes_, end);
+            bytes[first_unit_[i] + k] = static_cast<std::uint16_t>(hi - lo);
+        }
+    }
+    return bytes;
 }
 
 std::vector<std::uint64_t> L2Prober::probed_per_range() const {

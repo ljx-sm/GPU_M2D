@@ -1,6 +1,7 @@
 #include "gpu_m2d/allocation_registry.hpp"
 #include "gpu_m2d/device_bit_injector.hpp"
 #include "gpu_m2d/l2_probe.hpp"
+#include "gpu_m2d/residency_map.hpp"
 #include "gpu_m2d/tensor_mapping.hpp"
 
 #include <NvInfer.h>
@@ -516,6 +517,12 @@ struct Options {
     // descending unit order (contamination detector).
     std::size_t l2_probe_stride{1};
     bool l2_probe_reverse{false};
+    // G8-T1: flip the probe direction for each unit's successive
+    // observations; build and write the per-unit residency map; repeat the
+    // probed pass N times in this process (same-process stability).
+    bool l2_probe_alternate{false};
+    bool l2_probe_map{false};
+    std::size_t l2_probe_passes{1};
 };
 
 struct Sample {
@@ -699,6 +706,21 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--l2-probe-reverse must be 0 or 1");
             }
             options.l2_probe_reverse = value == "1";
+        } else if (key == "--l2-probe-alternate") {
+            if (value != "0" && value != "1") {
+                throw std::invalid_argument("--l2-probe-alternate must be 0 or 1");
+            }
+            options.l2_probe_alternate = value == "1";
+        } else if (key == "--l2-probe-map") {
+            if (value != "0" && value != "1") {
+                throw std::invalid_argument("--l2-probe-map must be 0 or 1");
+            }
+            options.l2_probe_map = value == "1";
+        } else if (key == "--l2-probe-passes") {
+            options.l2_probe_passes = std::stoull(value);
+            if (options.l2_probe_passes == 0) {
+                throw std::invalid_argument("--l2-probe-passes must be > 0");
+            }
         } else if (key == "--l2-probe-per-sm") {
             options.l2_probe_per_sm = std::stoi(value);
             if (options.l2_probe_per_sm <= 0) {
@@ -731,7 +753,8 @@ Options parse_options(int argc, char** argv) {
             "[--l2-probe-out PREFIX --l2-probe-threshold CYCLES "
             "--l2-probe-every N --l2-probe-unit 32|128 "
             "--l2-probe-per-sm N --l2-probe-stride N "
-            "--l2-probe-reverse 0|1]");
+            "--l2-probe-reverse 0|1 --l2-probe-alternate 0|1 "
+            "--l2-probe-map 0|1 --l2-probe-passes N]");
     }
     if (options.injection_work.empty() != options.injection_release.empty()) {
         throw std::invalid_argument(
@@ -1963,19 +1986,44 @@ void write_g5_clean_pass(const std::string& path,
 }  // namespace
 
 // ---- G8 L2 residency probe pass (docs/G8_CACHE_FAULT_PLAN.md §4) ----
-// A second, FAULTLESS pass over every evaluation image after the strict
-// clean pass. Every `l2_probe_every` images, at the image boundary (before
-// the image's input is staged), one probe sweep classifies every unit of
-// every registered allocation as L2-resident or not. Each inference is
-// timed with CUDA events around the enqueue (probe time excluded: it runs
-// between images). Every output must equal the clean pass bit-for-bit --
-// the probe is read-only, so any mismatch is a neutrality failure.
-// Outputs (CSV, prefix = --l2-probe-out):
+// FAULTLESS pass(es) over every evaluation image after the strict clean
+// pass. Every `l2_probe_every` images, at the image boundary (before the
+// image's input is staged), one probe sweep classifies the probed units of
+// every registered allocation as L2-resident or not (stride > 1: a
+// staggered 1/stride subset per sweep; alternate: each unit's successive
+// observations flip probe direction). Each inference is timed with CUDA
+// events around the enqueue (probe time excluded: it runs between images).
+// Every output must equal the clean pass bit-for-bit -- the probe is
+// read-only, so any mismatch is a neutrality failure.
+// --l2-probe-passes N repeats the pass N times in the SAME process (G8-T1
+// same-process stability); with N > 1 each pass writes under PREFIX_p<i>.
+// Outputs per pass (prefix = --l2-probe-out [+ _p<i>]):
 //   _ranges.csv      probed allocations (id, VA, bytes, units, label)
 //   _images.csv      per image: inference ms, bit-identical flags
-//   _boundaries.csv  per probe sweep x allocation: units, L2 hits, probe ms
+//   _boundaries.csv  per probe sweep x allocation: units, probed, L2 hits
 //   _hist.csv        per allocation: latency histogram over all sweeps
 //                    (16-cycle bins) -- in-situ check of the T0 threshold
+//   with --l2-probe-map 1 (G8-T1 residency map):
+//   _residency.bin   per-unit residency periods + per-image inference
+//                    times + per-unit resident bytes (ResidencyMapBuilder)
+//   _residency.json  metadata, ranges, T_total, R_eff_bits, bin sha256
+std::string json_escape(const std::string& value) {
+    std::string out;
+    for (char c : value) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+            out += buf;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
 int run_l2_probe_pass(const Options& options,
                       nvinfer1::IExecutionContext& context,
                       std::vector<void*>& binding_pointers,
@@ -2005,151 +2053,241 @@ int run_l2_probe_pass(const Options& options,
     gpu_m2d::L2Prober prober(ranges, options.l2_probe_unit,
                              options.l2_probe_threshold,
                              options.l2_probe_per_sm,
-                             options.l2_probe_stride, options.l2_probe_reverse);
-
-    const std::string prefix = options.l2_probe_out;
-    {
-        std::ofstream out(prefix + "_ranges.csv");
-        if (!out) {
-            throw std::runtime_error("cannot write " + prefix + "_ranges.csv");
-        }
-        out << "allocation_id,gpu_va,size_bytes,units,unit_bytes,"
-               "allocation_phase,semantic_label\n";
-        for (std::size_t i = 0; i < prober.range_count(); ++i) {
-            out << active[i].allocation_id << ','
-                << hex_address(active[i].base_gpu_va) << ','
-                << active[i].size_bytes << ',' << prober.range_units(i) << ','
-                << prober.unit_bytes() << ',' << active[i].allocation_phase
-                << ',' << active[i].semantic_label << '\n';
-        }
+                             options.l2_probe_stride, options.l2_probe_reverse,
+                             options.l2_probe_alternate);
+    const std::vector<std::uint16_t> unit_bytes = prober.unit_resident_bytes();
+    std::uint64_t surface_bits = 0;
+    for (std::uint16_t b : unit_bytes) {
+        surface_bits += 8ull * b;
     }
-    std::ofstream images_csv(prefix + "_images.csv");
-    std::ofstream boundaries_csv(prefix + "_boundaries.csv");
-    if (!images_csv || !boundaries_csv) {
-        throw std::runtime_error("cannot write L2 probe outputs: " + prefix);
-    }
-    images_csv << "image_index,infer_ms,probability_bit_identical,"
-                  "class_identical\n";
-    boundaries_csv << "image_index,probe_ms,allocation_id,units,probed,"
-                      "l2_hits\n";
-
-    constexpr std::size_t kBinCycles = 16;
-    constexpr std::size_t kBins = 4096 / kBinCycles;  // last bin = overflow
-    std::vector<std::vector<std::uint64_t>> histogram(
-        prober.range_count(), std::vector<std::uint64_t>(kBins, 0));
     std::vector<std::uint64_t> range_first(prober.range_count(), 0);
     for (std::size_t i = 1; i < prober.range_count(); ++i) {
         range_first[i] = range_first[i - 1] + prober.range_units(i - 1);
     }
+    const std::uint64_t window =
+        static_cast<std::uint64_t>(options.l2_probe_every) * prober.stride();
 
+    constexpr std::size_t kBinCycles = 16;
+    constexpr std::size_t kBins = 4096 / kBinCycles;  // last bin = overflow
     cudaEvent_t infer_start = nullptr;
     cudaEvent_t infer_stop = nullptr;
     check_cuda(cudaEventCreate(&infer_start), "create inference start event");
     check_cuda(cudaEventCreate(&infer_stop), "create inference stop event");
-
-    observer.event("L2_PROBE_PASS_BEGIN");
-    std::size_t mismatches = 0;
-    std::size_t sweeps = 0;
-    double infer_ms_total = 0.0;
-    double probe_ms_total = 0.0;
     void* input_device = binding_pointers[input_binding.index];
-    for (std::size_t image = 0; image < samples.size(); ++image) {
-        if (image % options.l2_probe_every == 0) {
-            const float probe_ms = prober.probe(stream.get(), sweeps);
-            probe_ms_total += probe_ms;
-            ++sweeps;
-            const std::vector<std::uint64_t> hits = prober.hits_per_range();
-            const std::vector<std::uint64_t> probed = prober.probed_per_range();
-            const std::vector<std::uint16_t>& latency = prober.latencies();
+    std::size_t mismatches_all = 0;
+
+    for (std::size_t pass = 0; pass < options.l2_probe_passes; ++pass) {
+        const std::string prefix =
+            options.l2_probe_passes > 1
+                ? options.l2_probe_out + "_p" + std::to_string(pass)
+                : options.l2_probe_out;
+        {
+            std::ofstream out(prefix + "_ranges.csv");
+            if (!out) {
+                throw std::runtime_error("cannot write " + prefix + "_ranges.csv");
+            }
+            out << "allocation_id,gpu_va,size_bytes,units,unit_bytes,"
+                   "allocation_phase,semantic_label\n";
+            for (std::size_t i = 0; i < prober.range_count(); ++i) {
+                out << active[i].allocation_id << ','
+                    << hex_address(active[i].base_gpu_va) << ','
+                    << active[i].size_bytes << ',' << prober.range_units(i) << ','
+                    << prober.unit_bytes() << ',' << active[i].allocation_phase
+                    << ',' << active[i].semantic_label << '\n';
+            }
+        }
+        std::ofstream images_csv(prefix + "_images.csv");
+        std::ofstream boundaries_csv(prefix + "_boundaries.csv");
+        if (!images_csv || !boundaries_csv) {
+            throw std::runtime_error("cannot write L2 probe outputs: " + prefix);
+        }
+        images_csv << "image_index,infer_ms,probability_bit_identical,"
+                      "class_identical\n";
+        boundaries_csv << "image_index,probe_ms,reverse,allocation_id,units,"
+                          "probed,l2_hits\n";
+        std::vector<std::vector<std::uint64_t>> histogram(
+            prober.range_count(), std::vector<std::uint64_t>(kBins, 0));
+        std::unique_ptr<gpu_m2d::ResidencyMapBuilder> map;
+        if (options.l2_probe_map) {
+            map = std::make_unique<gpu_m2d::ResidencyMapBuilder>(
+                prober.total_units(), static_cast<std::uint32_t>(samples.size()));
+        }
+        std::vector<double> image_ms(samples.size(), 0.0);
+
+        observer.event("L2_PROBE_PASS_BEGIN");
+        std::size_t mismatches = 0;
+        std::size_t sweeps = 0;
+        double probe_ms_total = 0.0;
+        for (std::size_t image = 0; image < samples.size(); ++image) {
+            if (image % options.l2_probe_every == 0) {
+                const float probe_ms = prober.probe(stream.get(), sweeps);
+                probe_ms_total += probe_ms;
+                ++sweeps;
+                const std::vector<std::uint64_t> hits = prober.hits_per_range();
+                const std::vector<std::uint64_t> probed = prober.probed_per_range();
+                const std::vector<std::uint16_t>& latency = prober.latencies();
+                for (std::size_t r = 0; r < prober.range_count(); ++r) {
+                    boundaries_csv << image << ',' << probe_ms << ','
+                                   << (prober.last_reverse() ? 1 : 0) << ','
+                                   << prober.range(r).id << ','
+                                   << prober.range_units(r) << ',' << probed[r]
+                                   << ',' << hits[r] << '\n';
+                }
+                std::size_t r = 0;
+                for (std::uint64_t u = prober.last_phase(); u < prober.total_units();
+                     u += prober.stride()) {
+                    while (r + 1 < prober.range_count() && u >= range_first[r + 1]) {
+                        ++r;
+                    }
+                    histogram[r][std::min<std::size_t>(latency[u] / kBinCycles,
+                                                       kBins - 1)]++;
+                    if (map) {
+                        map->observe(u, static_cast<std::uint32_t>(image),
+                                     latency[u] < prober.threshold_cycles());
+                    }
+                }
+            }
+            check_cuda(cudaMemcpyAsync(input_device,
+                                       &inputs[image * input_binding.element_count],
+                                       input_binding.size_bytes,
+                                       cudaMemcpyHostToDevice, stream.get()),
+                       "copy probe-pass image to device");
+            check_cuda(cudaEventRecord(infer_start, stream.get()),
+                       "record inference start");
+            if (!enqueue_inference(context, binding_pointers, stream.get())) {
+                throw std::runtime_error("TensorRT enqueue returned false");
+            }
+            check_cuda(cudaEventRecord(infer_stop, stream.get()),
+                       "record inference stop");
+            Prediction got;
+            check_cuda(cudaMemcpyAsync(&got.probability,
+                                       binding_pointers[probability_binding.index],
+                                       sizeof(got.probability),
+                                       cudaMemcpyDeviceToHost, stream.get()),
+                       "copy probability to host");
+            check_cuda(cudaMemcpyAsync(&got.class_index,
+                                       binding_pointers[class_binding.index],
+                                       sizeof(got.class_index),
+                                       cudaMemcpyDeviceToHost, stream.get()),
+                       "copy class index to host");
+            check_cuda(cudaStreamSynchronize(stream.get()), "synchronize probe pass");
+            float infer_ms = 0.0F;
+            check_cuda(cudaEventElapsedTime(&infer_ms, infer_start, infer_stop),
+                       "inference elapsed time");
+            image_ms[image] = infer_ms;
+            const bool prob_same = std::memcmp(&got.probability,
+                                               &clean[image].probability,
+                                               sizeof(float)) == 0;
+            const bool class_same = got.class_index == clean[image].class_index;
+            if (!prob_same || !class_same) {
+                ++mismatches;
+            }
+            images_csv << image << ',' << infer_ms << ',' << (prob_same ? 1 : 0)
+                       << ',' << (class_same ? 1 : 0) << '\n';
+        }
+        observer.event("L2_PROBE_PASS_END");
+        mismatches_all += mismatches;
+
+        {
+            std::ofstream out(prefix + "_hist.csv");
+            if (!out) {
+                throw std::runtime_error("cannot write " + prefix + "_hist.csv");
+            }
+            out << "allocation_id,bin_lo_cycles,count\n";
             for (std::size_t r = 0; r < prober.range_count(); ++r) {
-                boundaries_csv << image << ',' << probe_ms << ','
-                               << prober.range(r).id << ','
-                               << prober.range_units(r) << ',' << probed[r]
-                               << ',' << hits[r] << '\n';
-                std::vector<std::uint64_t>& h = histogram[r];
-                const std::uint64_t first = range_first[r];
-                for (std::uint64_t u = first; u < first + prober.range_units(r);
-                     ++u) {
-                    if (prober.probed_last(u)) {
-                        h[std::min<std::size_t>(latency[u] / kBinCycles,
-                                                kBins - 1)]++;
+                for (std::size_t b = 0; b < kBins; ++b) {
+                    if (histogram[r][b] != 0) {
+                        out << prober.range(r).id << ',' << b * kBinCycles << ','
+                            << histogram[r][b] << '\n';
                     }
                 }
             }
         }
-        check_cuda(cudaMemcpyAsync(input_device,
-                                   &inputs[image * input_binding.element_count],
-                                   input_binding.size_bytes,
-                                   cudaMemcpyHostToDevice, stream.get()),
-                   "copy probe-pass image to device");
-        check_cuda(cudaEventRecord(infer_start, stream.get()),
-                   "record inference start");
-        if (!enqueue_inference(context, binding_pointers, stream.get())) {
-            throw std::runtime_error("TensorRT enqueue returned false");
+        double infer_ms_total = 0.0;
+        for (double ms : image_ms) {
+            infer_ms_total += ms;
         }
-        check_cuda(cudaEventRecord(infer_stop, stream.get()),
-                   "record inference stop");
-        Prediction got;
-        check_cuda(cudaMemcpyAsync(&got.probability,
-                                   binding_pointers[probability_binding.index],
-                                   sizeof(got.probability),
-                                   cudaMemcpyDeviceToHost, stream.get()),
-                   "copy probability to host");
-        check_cuda(cudaMemcpyAsync(&got.class_index,
-                                   binding_pointers[class_binding.index],
-                                   sizeof(got.class_index),
-                                   cudaMemcpyDeviceToHost, stream.get()),
-                   "copy class index to host");
-        check_cuda(cudaStreamSynchronize(stream.get()), "synchronize probe pass");
-        float infer_ms = 0.0F;
-        check_cuda(cudaEventElapsedTime(&infer_ms, infer_start, infer_stop),
-                   "inference elapsed time");
-        infer_ms_total += infer_ms;
-        const bool prob_same = std::memcmp(&got.probability,
-                                           &clean[image].probability,
-                                           sizeof(float)) == 0;
-        const bool class_same = got.class_index == clean[image].class_index;
-        if (!prob_same || !class_same) {
-            ++mismatches;
+        double r_eff_bits = -1.0;
+        std::uint64_t periods = 0;
+        if (map) {
+            map->finish();
+            r_eff_bits = map->r_eff_bits(image_ms, unit_bytes);
+            periods = map->periods().size();
+            const std::string bin_path = prefix + "_residency.bin";
+            map->write_binary(bin_path, static_cast<std::uint32_t>(prober.unit_bytes()),
+                              image_ms, unit_bytes);
+            const std::string bin_sha =
+                to_hex(sha256_file(bin_path, "residency map"));
+            std::ofstream json(prefix + "_residency.json");
+            if (!json) {
+                throw std::runtime_error("cannot write " + prefix + "_residency.json");
+            }
+            json.precision(17);
+            json << "{\n"
+                 << "  \"schema\": \"gpu-m2d.g8.residency-map.v1\",\n"
+                 << "  \"bin_file\": \"" << json_escape(bin_path) << "\",\n"
+                 << "  \"bin_sha256\": \"" << bin_sha << "\",\n"
+                 << "  \"engine\": \"" << json_escape(options.engine_path) << "\",\n"
+                 << "  \"sample_csv\": \"" << json_escape(options.sample_csv) << "\",\n"
+                 << "  \"device\": " << options.device << ",\n"
+                 << "  \"pass_index\": " << pass << ",\n"
+                 << "  \"passes_in_process\": " << options.l2_probe_passes << ",\n"
+                 << "  \"unit_bytes\": " << prober.unit_bytes() << ",\n"
+                 << "  \"probe_every\": " << options.l2_probe_every << ",\n"
+                 << "  \"stride\": " << prober.stride() << ",\n"
+                 << "  \"alternate\": " << (prober.alternate() ? "true" : "false") << ",\n"
+                 << "  \"observation_window_images\": " << window << ",\n"
+                 << "  \"threshold_cycles\": " << prober.threshold_cycles() << ",\n"
+                 << "  \"probes_per_sm\": " << options.l2_probe_per_sm << ",\n"
+                 << "  \"images\": " << samples.size() << ",\n"
+                 << "  \"units\": " << prober.total_units() << ",\n"
+                 << "  \"observed_units\": " << map->observed_units() << ",\n"
+                 << "  \"periods\": " << periods << ",\n"
+                 << "  \"sweeps\": " << sweeps << ",\n"
+                 << "  \"neutral_mismatches\": " << mismatches << ",\n"
+                 << "  \"surface_bits\": " << surface_bits << ",\n"
+                 << "  \"t_total_ms\": " << infer_ms_total << ",\n"
+                 << "  \"r_eff_bits\": " << r_eff_bits << ",\n"
+                 << "  \"ranges\": [\n";
+            for (std::size_t i = 0; i < prober.range_count(); ++i) {
+                json << "    {\"allocation_id\": \""
+                     << json_escape(active[i].allocation_id) << "\", \"gpu_va\": \""
+                     << hex_address(active[i].base_gpu_va) << "\", \"size_bytes\": "
+                     << active[i].size_bytes << ", \"first_unit\": "
+                     << range_first[i] << ", \"units\": " << prober.range_units(i)
+                     << ", \"allocation_phase\": \""
+                     << json_escape(active[i].allocation_phase)
+                     << "\", \"semantic_label\": \""
+                     << json_escape(active[i].semantic_label) << "\"}"
+                     << (i + 1 < prober.range_count() ? "," : "") << '\n';
+            }
+            json << "  ]\n}\n";
         }
-        images_csv << image << ',' << infer_ms << ',' << (prob_same ? 1 : 0)
-                   << ',' << (class_same ? 1 : 0) << '\n';
+        const double images = static_cast<double>(samples.size());
+        std::cout << (mismatches == 0 ? "GPU_M2D_L2_PROBE_PASS"
+                                      : "GPU_M2D_L2_PROBE_FAIL")
+                  << " pass=" << pass << " images=" << samples.size()
+                  << " mismatches=" << mismatches << " sweeps=" << sweeps
+                  << " every=" << options.l2_probe_every
+                  << " unit=" << prober.unit_bytes()
+                  << " units=" << prober.total_units()
+                  << " ranges=" << prober.range_count()
+                  << " threshold=" << prober.threshold_cycles()
+                  << " stride=" << prober.stride()
+                  << " reverse=" << (prober.reverse() ? 1 : 0)
+                  << " alternate=" << (prober.alternate() ? 1 : 0)
+                  << " infer_ms_total=" << infer_ms_total
+                  << " infer_ms_mean=" << infer_ms_total / images
+                  << " probe_ms_mean=" << (sweeps ? probe_ms_total / sweeps : 0.0);
+        if (map) {
+            std::cout << " periods=" << periods << " r_eff_bits=" << r_eff_bits
+                      << " surface_bits=" << surface_bits;
+        }
+        std::cout << '\n';
     }
-    observer.event("L2_PROBE_PASS_END");
     cudaEventDestroy(infer_start);
     cudaEventDestroy(infer_stop);
-
-    {
-        std::ofstream out(prefix + "_hist.csv");
-        if (!out) {
-            throw std::runtime_error("cannot write " + prefix + "_hist.csv");
-        }
-        out << "allocation_id,bin_lo_cycles,count\n";
-        for (std::size_t r = 0; r < prober.range_count(); ++r) {
-            for (std::size_t b = 0; b < kBins; ++b) {
-                if (histogram[r][b] != 0) {
-                    out << prober.range(r).id << ',' << b * kBinCycles << ','
-                        << histogram[r][b] << '\n';
-                }
-            }
-        }
-    }
-    const double images = static_cast<double>(samples.size());
-    std::cout << (mismatches == 0 ? "GPU_M2D_L2_PROBE_PASS"
-                                  : "GPU_M2D_L2_PROBE_FAIL")
-              << " images=" << samples.size() << " mismatches=" << mismatches
-              << " sweeps=" << sweeps << " every=" << options.l2_probe_every
-              << " unit=" << prober.unit_bytes()
-              << " units=" << prober.total_units()
-              << " ranges=" << prober.range_count()
-              << " threshold=" << prober.threshold_cycles()
-              << " stride=" << prober.stride()
-              << " reverse=" << (prober.reverse() ? 1 : 0)
-              << " infer_ms_total=" << infer_ms_total
-              << " infer_ms_mean=" << infer_ms_total / images
-              << " probe_ms_mean=" << (sweeps ? probe_ms_total / sweeps : 0.0)
-              << '\n';
-    return mismatches == 0 ? 0 : 1;
+    return mismatches_all == 0 ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
