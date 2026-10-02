@@ -4,7 +4,8 @@ Tooling for the G8 L2 cache fault plan
 ([docs/G8_CACHE_FAULT_PLAN.md](../../docs/G8_CACHE_FAULT_PLAN.md)).
 **G8-T0 status (2026-10-01, GPU 0): V6 probe calibration PASS, V7 hook
 neutrality PASS. G8-T1 status (2026-10-02): residency maps built and
-verified, V9 reproducibility PASS (last section).**
+verified for all six G7-v2 models, V9 reproducibility PASS (last
+section).**
 
 ## Probe kernel
 
@@ -195,7 +196,7 @@ so stale files are deleted after rebuilds.
 ## T1 — residency map (`--l2-probe-map 1`, `residency_map.py`)
 
 **Status (2026-10-02, GPU 0 idle): residency maps built and verified for
-ResNet-50 v2 and ViT-B; reproducibility gate V9 PASS.**
+all six G7-v2 models; reproducibility gate V9 PASS.**
 
 ### What it produces
 
@@ -305,6 +306,47 @@ neutral, with R_eff recomputed and matching the runner.
   - the input binding, which is streamed in and evicted within each
     inference, also receives none. That is the plan's stated image-level
     time-resolution limit.
+
+
+### All six G7-v2 models (2026-10-02, GPU 0 idle)
+
+Each model ran 2 passes in one process plus a second process: 18
+passes, all neutral, and every map independently verified. Engine and
+preprocessing come from each model's G7-v2 bootstrap record; the frozen R
+and the exclusions come from `fault_model.WORKLOADS`.
+
+- MobileNetV3's map leaves out `trt-internal-5/6` (248,320 B), exactly as
+  its injection surface does.
+- The four models measured after the scoping fix ran with
+  `--l2-probe-expect-surface-bytes`, so the runner itself refused any
+  other surface.
+- The ResNet-50 v2 and ViT-B maps predate those flags. Their surface was
+  checked against the frozen R afterwards and matches exactly.
+
+| Model | Stride | Sectors | Frozen R (B) | Map surface = R | R_eff | R_eff / R | Weight sectors: always / never / partial | Same class: same proc / cross proc | Max R_eff diff | Direction-locked sectors | Mismatches (3 passes) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ResNet-50 v2 | 1 | 901,011 | 28,832,268 | yes | 28.832 MB | **100.00 %** | 100.0 / 0.0 / 0.0 % | 99.98 / 99.99 % | 0.00006 % | 2 (0.000 %) | 0 |
+| MobileNetV3-L | 1 | 283,999 | 9,087,912 (scoped) | yes | 9.088 MB | **100.00 %** | 99.9 / 0.0 / 0.1 % | 99.95 / 99.95 % | 0.00001 % | 0 | 0 |
+| EfficientNet-B0 | 1 | 535,759 | 17,144,232 | yes | 17.144 MB | **100.00 %** | 100.0 / 0.0 / 0.0 % | 99.96 / 99.97 % | 0.00001 % | 6 (0.001 %) | 0 |
+| DeiT-S | 1 | 812,841 | 26,010,832 | yes | 26.011 MB | **100.00 %** | 100.0 / 0.0 / 0.0 % | 99.99 / 100.00 % | 0.00000 % | 0 | 0 |
+| Swin-T | 1 | 1,368,740 | 43,799,616 | yes | 43.800 MB | **100.00 %** | 100.0 / 0.0 / 0.0 % | 99.99 / 99.99 % | 0.00000 % | 0 | 0 |
+| ViT-B | 64 | 2,933,369 | 93,867,728 | yes | 74.212 MB | **79.06 %** | 79.1 / 19.7 / 1.1 % | 99.77 / 99.77 % | 0.00043 % | 30,022 (1.02 %) | 0 |
+
+**Reading**:
+
+- **The five models smaller than L2 (9–44 MB) are entirely L2-resident**
+  for the whole 10K-image run on an idle GPU, so R_eff = R. In T2 their
+  cache flips are counted from R, placed uniformly over the surface, and
+  every read-only flip lasts until the trial ends.
+- **ViT-B, the one model larger than L2, holds ≈ 74 MB resident**, the
+  L2's effective capacity:
+  - 79 % of its weight sectors are always resident and 20 % never are;
+  - its flips concentrate on the resident part;
+  - its stride-64 map carries the documented ~1 % probe-order residual.
+- Small allocations such as `trt-internal-3` (2 KB) read absent only at
+  the first boundary, which makes them "partial" with 0.9999 resident time.
+- EfficientNet's input binding has 2.3 % partial sectors, which leave L2
+  occasionally.
 
 Artifacts (untracked) are under `artifacts/g8/t1/`, including the
 superseded stride-16/64/256 comparison maps `vit_compact*`.

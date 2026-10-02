@@ -2,9 +2,9 @@
 
 Status: **DESIGN CONFIRMED by the user, 2026-10-01. G8-T0 complete
 2026-10-01 (GPU 0): probe calibration V6 PASS, hook neutrality V7 PASS
-(§11). G8-T1 complete 2026-10-02 (GPU 0): residency maps for ResNet-50 v2
-and ViT-B built, independently verified, and reproducible, V9 PASS
-(§12). Next: G8-T2 (injection).** This
+(§11). G8-T1 complete 2026-10-02 (GPU 0): residency maps for all six
+G7-v2 models built, independently verified, and reproducible, V9 PASS
+(§12). Next: G8-T2 (injection), on all six models.** This
 file has been revised in place through the 2026-09-29 … 10-01 discussion
 (earlier versions are in git history; §10 records what changed and why).
 One parameter is still open: the cache upset rate BER_cache (§3.3).
@@ -530,8 +530,31 @@ process, all neutral and verified.
 | Same class, same process / cross process | 99.98 % / 99.99 % | 99.77 % / 99.77 % |
 | R_eff difference, same process / cross process | ≤ 0.0001 % | ≤ 0.0004 % |
 
-**V9 residency stability: PASS.** Agreement is ≥ 99.77 % per sector, and
-the R_eff difference is ≤ 0.0004 % within a process and across processes.
+**All six models.** The first T1 round measured only ResNet-50 v2 and
+ViT-B. After a scoping fix, the other four were measured the same way:
+
+- **The scoping fix.** `--l2-probe-exclude` and
+  `--l2-probe-expect-surface-bytes` make the map cover exactly each
+  workload's injection surface. MobileNetV3 excludes its ctx pools
+  `trt-internal-5/6`. Every map's surface equals the frozen R.
+- **Settings.** Stride 1 for the five models smaller than L2, 64 for
+  ViT-B. Each model ran 2 passes in one process plus a second process: 18
+  passes, all neutral.
+
+| Model | Stride | Sectors | Frozen R (B) | Map surface = R | R_eff | R_eff / R | Weight sectors: always / never / partial | Same class: same proc / cross proc | Max R_eff diff | Direction-locked sectors | Mismatches (3 passes) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ResNet-50 v2 | 1 | 901,011 | 28,832,268 | yes | 28.832 MB | **100.00 %** | 100.0 / 0.0 / 0.0 % | 99.98 / 99.99 % | 0.00006 % | 2 (0.000 %) | 0 |
+| MobileNetV3-L | 1 | 283,999 | 9,087,912 (scoped) | yes | 9.088 MB | **100.00 %** | 99.9 / 0.0 / 0.1 % | 99.95 / 99.95 % | 0.00001 % | 0 | 0 |
+| EfficientNet-B0 | 1 | 535,759 | 17,144,232 | yes | 17.144 MB | **100.00 %** | 100.0 / 0.0 / 0.0 % | 99.96 / 99.97 % | 0.00001 % | 6 (0.001 %) | 0 |
+| DeiT-S | 1 | 812,841 | 26,010,832 | yes | 26.011 MB | **100.00 %** | 100.0 / 0.0 / 0.0 % | 99.99 / 100.00 % | 0.00000 % | 0 | 0 |
+| Swin-T | 1 | 1,368,740 | 43,799,616 | yes | 43.800 MB | **100.00 %** | 100.0 / 0.0 / 0.0 % | 99.99 / 99.99 % | 0.00000 % | 0 | 0 |
+| ViT-B | 64 | 2,933,369 | 93,867,728 | yes | 74.212 MB | **79.06 %** | 79.1 / 19.7 / 1.1 % | 99.77 / 99.77 % | 0.00043 % | 30,022 (1.02 %) | 0 |
+
+**V9 residency stability: PASS for all six.** Agreement is ≥ 99.77 % per
+sector, and the R_eff difference is ≤ 0.0004 % within a process and
+across processes. **Every model smaller than L2 is 100 % resident for the
+whole run on an idle GPU**, so R_eff = R. Only ViT-B is partially
+resident, at ≈ 74 MB, which is about the L2's capacity.
 
 **Probe-footprint artifacts.** Measuring per sector exposed two artifacts
 that T0's allocation-level counts had hidden:
