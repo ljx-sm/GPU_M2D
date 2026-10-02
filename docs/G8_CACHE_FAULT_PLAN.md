@@ -78,8 +78,8 @@ Workload surfaces (frozen R from G7-v2) against the 72 MiB L2:
 | Step | DRAM faults (existing) | Cache faults (new) |
 | --- | --- | --- |
 | 1. Start | the runner allocates, the observer records VA→PA, then the clean pass runs | same process, same clean pass |
-| 2. Sampling basis | **snapshot**: this process's allocations × VA→PA map × G3 GDDR table (the table is measured once, long-lived hardware rule) | **residency map**: one 10K-image probe pass recording every line's residency periods (§4), measured fresh in this process |
-| 3. Plan all trials up front | orchestrator draws every trial's DRAM sites → work file | orchestrator draws every trial's cache sites → the same work file |
+| 2. Sampling basis | **snapshot**: this process's allocations × VA→PA map × G3 GDDR table (the table is measured once, long-lived hardware rule) | **residency map**: one 10K-image probe pass recording every line's residency periods and every image's inference time (§4), measured fresh in this process; from it the process's average exposure R_eff_bits (§3.2) |
+| 3. Plan all trials up front | orchestrator draws every trial's DRAM sites (B frozen per level) → work file | orchestrator computes n_cache from R_eff_bits and draws every trial's cache sites → the same work file |
 | 4. Trials | runner executes the pre-planned flips | runner executes the pre-planned flips and removals |
 
 - **What varies between trials** is only the random draws: the DRAM cells,
@@ -92,16 +92,43 @@ Workload surfaces (frozen R from G7-v2) against the 72 MiB L2:
 
 ### 3.2 Number of cache flips per trial
 
+Unlike DRAM, where the whole model stays resident all the time, the cache
+holds only part of the model at any moment, and that part keeps changing.
+The count is therefore based on the model's **average exposure in L2**:
+the time-averaged number of model bits resident in L2 during the 10K-image
+inference.
+
 ```text
-n_cache = round(BER_cache × R_bits)
+R_eff_bits = Σ_ℓ ( bits_ℓ × T_ℓ ) / T_total
+n_cache    = round( BER_cache × R_eff_bits )
+
+bits_ℓ  = the line's resident bits: 1,024 for a full 128-B line, fewer for a
+          partial line at an allocation edge / on a shared page
+T_ℓ     = the inference time during which line ℓ was resident
+          (the sum of its residency periods, §4)
+T_total = the total inference time of the 10K images (§4)
 ```
 
-- R_bits is the workload's frozen injection surface in bits: the same R
-  as the DRAM BER, `resident_bytes_nominal × 8` in `fault_model.WORKLOADS`.
-- The count is **fixed** per level and trial, just like the DRAM B.
-  Residency decides only *which lines* and *when* (§3.4), never *how many*.
+- **Same unit in numerator and denominator.** T_ℓ and T_total are both
+  GPU inference time, measured per image, with probe time excluded (§4).
+  Dividing by Σ T_ℓ instead would always give ~1,024 bits (one line),
+  because the residency times cancel, so the denominator must be the total
+  inference time.
+- **Limit checks**:
+  - every line resident throughout gives R_eff_bits = R_bits, the DRAM
+    case;
+  - every line resident half the time gives R_bits / 2;
+  - for ViT-B (94 MB > 72 MiB), R_eff_bits is automatically ≤ the L2
+    size, because no more than 72 MiB can be resident at any moment.
+- **Per-process, not frozen per level.** R_eff_bits comes from each
+  process's own residency measurement, so n_cache is computed per process
+  (per restart segment). All trials of one process use the same n_cache.
+  Each process's T_total, R_eff_bits and n_cache are recorded in the work
+  file metadata and in `summary.json` (§5).
 - This counts upsets in the model's own data only. Upsets in L2 lines that
   hold other processes' data, or nothing, are outside the count.
+- The injection surface is the same as the DRAM sampler's
+  (`fault_model.surface_rows_for`), so Σ_ℓ bits_ℓ = R_bits.
 
 ### 3.3 Cache upset rate BER_cache — open (user, later)
 
@@ -118,13 +145,18 @@ has the same small chance to flip at every moment. Hence, for each of the
 n_cache flips:
 
 1. **Line**: pick a cache line ℓ of the injection surface with
-   probability **∝ its total measured resident time** T_ℓ, the number of
-   images it was resident across all its residency periods in the
-   measurement pass. A line resident for 8,000 images gets about 8× the
-   flips of one resident for 1,000. A line never observed resident gets
-   none.
-2. **Start image**: pick t **uniformly among the images in which ℓ was
-   resident**. A flip never starts while its line is absent.
+   probability **`bits_ℓ × T_ℓ / Σ (bits × T)`**, i.e. ∝ its measured
+   exposure: its resident bits × its total resident inference time. This
+   is the same quantity as the numerator of R_eff_bits (§3.2), so the
+   count and the placement come from one exposure measure. For full lines
+   this is simply ∝ T_ℓ: a line resident for 80 % of the inference time
+   gets about 8× the flips of one resident for 10 %. A line never observed
+   resident gets none.
+2. **Start image**: pick t **uniformly in time within ℓ's residency
+   periods**, i.e. among the images in which ℓ was resident, each with
+   probability ∝ its measured inference time. With fixed-shape batch-1
+   inference these times are nearly equal, so this is close to uniform over
+   those images. A flip never starts while its line is absent.
 3. **Byte and bit**: uniform byte within the line (0–127, restricted to
    resident bytes for lines at allocation edges or on shared pages) and a
    uniform bit (0–7).
@@ -207,8 +239,9 @@ inherited from G5/G7.
 
 **Purpose**: give every cache line ℓ of the injection surface its
 **residency timeline** over the 10,000 images: the list of residency
-periods `[start, end]` in image indices, and the total resident time
-T_ℓ. These feed §3.4.
+periods `[start, end]` in image indices, and its total resident inference
+time T_ℓ. Also give the total inference time T_total and the process's
+average exposure R_eff_bits. These feed §3.2 and §3.4.
 
 **Where in the flow**: after the clean pass and before trial sampling, in
 the same process and at the same physical addresses as the trials it
@@ -224,20 +257,27 @@ pass with no faults.
    from a GDDR fetch (the G3 technique; thresholds calibrated in T0).
 2. A hit at boundary *i* marks ℓ as resident for the images
    `[i, i + k − 1]`. Consecutive resident blocks form a residency period;
-   a miss ends the period. T_ℓ is the sum of its periods.
-3. **Choice of k**: it is set from the probe throughput measured in T0,
+   a miss ends the period.
+3. **Inference time per image**: each image's inference is timed on the
+   GPU with CUDA events around its enqueue, giving t_i. Probe kernels run
+   *between* images and are **excluded**: the measurement pass is slower
+   than a real pass, but only inference time enters the timeline.
+   - T_ℓ is the sum of t_i over the images in ℓ's residency periods.
+   - T_total is the sum of t_i over all 10,000 images.
+   - Then R_eff_bits = Σ bits_ℓ × T_ℓ / T_total (§3.2).
+4. **Choice of k**: it is set from the probe throughput measured in T0,
    so the pass costs an acceptable time. The faultless inference itself
    takes ~35–53 s per 10K INT8 pass (G7-T0), and probes add per-boundary
    time. Smaller k means finer timelines.
-4. **Perturbation**: a probe that misses loads the line into L2. The
+5. **Perturbation**: a probe that misses loads the line into L2. The
    engine reads every weight and constant line in every inference anyway,
    so this barely changes their behaviour. Lines the engine does not touch
    every inference can show slightly extended residency; this is recorded
    as a limitation.
-5. **Resolution limit**: an eviction plus refetch that happens entirely
+6. **Resolution limit**: an eviction plus refetch that happens entirely
    between two probes is invisible. Residency periods are known to ±k
    images, so read-only flip lifetimes can be slightly overestimated.
-6. **Neutrality check, built in**: the measurement pass's outputs must be
+7. **Neutrality check, built in**: the measurement pass's outputs must be
    bit-identical to the clean pass, image by image, which proves the
    probes do not change computation.
 
@@ -250,10 +290,14 @@ campaign is a stated limitation.
 
 **Output**, per process (segment):
 
-- `residency_map` file: per line, the allocation, line offset, class and
-  residency periods, plus the probe thresholds, k, and the co-tenancy
-  record;
-- its sha256 is recorded in the work-file metadata and in `summary.json`.
+- `residency_map` file containing:
+  - per line: the allocation, line offset, bits_ℓ, class, residency
+    periods and T_ℓ;
+  - per image: the inference time t_i;
+  - per process: T_total and R_eff_bits;
+  - the probe thresholds, k, and the co-tenancy record;
+- its sha256 is recorded in the work-file metadata and in `summary.json`,
+  together with T_total, R_eff_bits and the resulting n_cache.
 
 ## 5. Logging and verification
 
@@ -282,7 +326,10 @@ Verification:
   per-image apply and remove events;
 - the sampler re-check confirms that every cache site starts inside a
   measured residency period of its line, and that its last image is that
-  period's end (read-only) or the start image (engine-written).
+  period's end (read-only) or the start image (engine-written);
+- the orchestrator **recomputes R_eff_bits and n_cache** from the
+  residency map (Σ bits_ℓ × T_ℓ / T_total) and requires every trial of the
+  process to carry exactly n_cache cache sites.
 
 Reported metrics:
 
@@ -312,7 +359,8 @@ Reported metrics:
 - **V9 Residency stability**: in T1, two passes in the same process agree,
   and the cross-process variation is reported.
 - **V10 Plan consistency**: every cache site starts inside a measured
-  residency period, and its lifetime matches §3.4.
+  residency period, and its lifetime matches §3.4. R_eff_bits and n_cache
+  recomputed from the residency map match the values the process used.
 - The existing V4/V5 (per-site XOR checks, byte-exact trial restore,
   sanity inference) still apply.
 
@@ -321,7 +369,8 @@ Reported metrics:
 **Claimed**:
 
 - L2 SBUs on the workload's data, with a per-trial count of
-  `round(BER_cache × R_bits)`;
+  `round(BER_cache × R_eff_bits)`, where R_eff_bits is the model's
+  time-averaged resident bits in L2 measured in the same process;
 - placement and start times weighted by each line's residency measured in
   the same process;
 - lifetimes equal to the remaining residency period (read-only data) or
@@ -359,5 +408,5 @@ Reported metrics:
 | Each cache flip lives exactly one image | Ignores that read-only lines can stay resident across many images. Replaced by residency-derived lifetimes. |
 | Allocation-level weighting (size × resident fraction), uniform line within the allocation, start uniform over the trial, duration drawn independently from a survival curve | Too coarse, and inconsistent: a flip could start while its line is absent, and its duration was decoupled from its start. Replaced by per-line residency-time weighting, start uniform within the line's residency periods, and duration = remaining period (§3.4). |
 | Residency measured in separate runs (1K, then 10K paired probes) | Per-line residency depends on the process's physical addresses and on co-tenant load, so it does not transfer between processes. Replaced by an in-process 10K-image timeline before each campaign segment's trials (§4). |
-| `n = BER × L2_bits × occupancy`, then `n = BER × min(R_bits, L2_bits)` | Replaced by `n = BER_cache × R_bits` (user decision 2026-10-01): the same R basis as the DRAM BER, with residency deciding only placement and timing. |
+| `n = BER × L2_bits × occupancy`, then `n = BER × min(R_bits, L2_bits)`, then `n = BER_cache × R_bits` | R_bits assumes the whole model is present all the time, which is true for DRAM but not for the cache. Replaced by `n = BER_cache × R_eff_bits` with `R_eff_bits = Σ bits_ℓ × T_ℓ / T_total`, the time-averaged resident bits (user decision 2026-10-01, §3.2). A denominator of Σ T_ℓ was rejected because it always reduces to ~1,024 bits (one line); the denominator is the total inference time of the 10K images. |
 | Mid-inference injection via CUDA-graph capture; L1/shared via NVBit; three cards | More complex than needed. Scope set to L2 only, image-boundary resolution, GPU 0 only (user decision 2026-09-30). |
