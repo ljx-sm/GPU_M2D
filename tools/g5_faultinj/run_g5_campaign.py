@@ -93,6 +93,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(PROJECT / "tools/g2_observer"))
 sys.path.insert(0, str(PROJECT / "tools/g3_probe"))
 sys.path.insert(0, str(PROJECT / "tools/g4_dualaddr"))
+sys.path.insert(0, str(PROJECT / "tools/g8_cache"))
 
 from g2_observer import (  # noqa: E402
     DEFAULT_CONTRACT,
@@ -126,6 +127,8 @@ from run_g4_t2_injection import (  # noqa: E402
 )
 from build_snapshot import run_build  # noqa: E402
 import fault_model  # noqa: E402
+import cache_model  # noqa: E402
+import residency_map  # noqa: E402
 
 G5_SCHEMA = "gpu-m2d.g5.campaign.v1"
 PASS_MARKER = "GPU_M2D_G5_CAMPAIGN_PASS"
@@ -151,7 +154,23 @@ CAMPAIGN_SKELETON = [
     "TEARDOWN_BEGIN",
     "PROCESS_END",
 ]
+# G8-T2 L2 cache mode (--cache-ber): the residency pass runs between the
+# clean pass and the gate; cache flips are applied/removed per image.
+G8_SKELETON_AFTER = "CLEAN_PASS_END"
+G8_SKELETON_EVENTS = ["L2_PROBE_PASS_BEGIN", "L2_PROBE_PASS_END"]
+G8_PROBE_ARGS = ["--l2-probe-threshold", "440", "--l2-probe-per-sm", "16",
+                 "--l2-probe-unit", "32", "--l2-probe-every", "1",
+                 "--l2-probe-stride", "auto", "--l2-probe-alternate", "1",
+                 "--l2-probe-map", "1", "--l2-probe-passes", "1"]
+CACHE_RESULT_FIELDS = [
+    "run_id", "device", "trial_index", "cache_index", "target_id",
+    "allocation_id", "byte_offset", "bit_in_byte", "xor_mask", "gpu_va",
+    "expected_gpu_va", "cache_class", "start_image", "last_image", "applied",
+    "apply_image", "before", "after", "removal", "removal_image",
+    "remove_before", "remove_after",
+]
 CAMPAIGN_VARIABLE_EVENTS = {"ALLOCATED", "FREE", "TRIAL_BEGIN",
+                            "CACHE_FLIPPED", "CACHE_REMOVED",
                             "SITE_FLIPPED", "TRIAL_INJECTED_END",
                             "SITE_RESTORED", "TRIAL_SANITY_BEGIN",
                             "TRIAL_SANITY_END", "TRIAL_END"}
@@ -439,6 +458,133 @@ def parse_all_events(output: str) -> list[tuple[str, dict[str, str]]]:
     return events
 
 
+def expected_skeleton_for(hold_seconds: int, cache_mode: bool) -> list[str]:
+    """The fixed lifecycle skeleton of one campaign process; in G8 cache
+    mode the residency pass sits between the clean pass and the gate."""
+    skeleton = [name for name in CAMPAIGN_SKELETON
+                if not (name in ("HOLD_BEGIN", "HOLD_END")
+                        and hold_seconds <= 0)]
+    if cache_mode:
+        at = skeleton.index(G8_SKELETON_AFTER) + 1
+        skeleton[at:at] = G8_SKELETON_EVENTS
+    return skeleton
+
+
+def verify_cache_rows(cache_campaign: list[list[dict]], rows: list[dict],
+                      trial_rows: list[dict]) -> list[str]:
+    """Independent re-verification of the G8 cache result rows of every
+    COMPLETED trial (plan §5) against the sampled cache work:
+      - one row per sampled site, identical identity (target, allocation,
+        byte, bit, expected VA, start/last image, class);
+      - a site whose start image the trial reached was applied at exactly
+        its start image, at the expected VA, with after == before ^ mask;
+      - removal at its last image -- or at the trial's last evaluated image
+        when a DUE aborted the pass first (and only then);
+      - read-only: re_xor back to exactly the pre-cache value;
+        engine-written: restored (back to the pre-cache value) or
+        overwritten (the engine rewrote the byte);
+      - a site the aborted trial never reached: not applied."""
+    failures: list[str] = []
+    by_trial: dict[int, list[dict]] = {}
+    for row in rows:
+        by_trial.setdefault(int(row["trial_index"]), []).append(row)
+    trials = {int(t["trial_index"]): t for t in trial_rows}
+    for t in sorted(set(by_trial) - set(trials)):
+        failures.append(f"cache rows for trial {t} without a trial row")
+    for t, trow in sorted(trials.items()):
+        sites = cache_campaign[t] if t < len(cache_campaign) else []
+        got = sorted(by_trial.get(t, []), key=lambda r: int(r["cache_index"]))
+        if len(got) != len(sites):
+            failures.append(f"trial {t}: {len(got)} cache rows != "
+                            f"{len(sites)} sampled sites")
+            continue
+        last_eval = int(trow["images_evaluated"]) - 1
+        due = trow["injected_outcome"] == "DUE_INVALID_OUTPUT"
+        for site, row in zip(sites, got):
+            tag = f"trial {t} cache {site['cache_index']}"
+            mask = 1 << site["bit_in_byte"]
+            identity = (
+                row["target_id"] == site["target_id"]
+                and row["allocation_id"] == site["allocation_id"]
+                and int(row["byte_offset"]) == site["byte_offset"]
+                and int(row["bit_in_byte"]) == site["bit_in_byte"]
+                and int(row["expected_gpu_va"], 16) == site["expected_gpu_va"]
+                and int(row["start_image"]) == site["start_image"]
+                and int(row["last_image"]) == site["last_image"]
+                and row["cache_class"] == site["cache_class"])
+            if not identity:
+                failures.append(f"{tag}: row disagrees with the sampled work")
+                continue
+            if site["start_image"] > last_eval:
+                if not (due and row["applied"] == "0"
+                        and row["removal"] == "not_applied"):
+                    failures.append(f"{tag}: unreached site must be "
+                                    "not_applied (and only after a DUE)")
+                continue
+            before, after = int(row["before"]), int(row["after"])
+            if row["applied"] != "1" or \
+                    int(row["apply_image"]) != site["start_image"] or \
+                    int(row["gpu_va"], 16) != site["expected_gpu_va"] or \
+                    int(row["xor_mask"]) != mask or after != before ^ mask:
+                failures.append(f"{tag}: apply verification failed")
+                continue
+            want_removal_image = site["last_image"]
+            if site["last_image"] > last_eval:
+                if not due:
+                    failures.append(f"{tag}: lifetime past the pass without "
+                                    "a DUE abort")
+                want_removal_image = last_eval
+            if int(row["removal_image"]) != want_removal_image:
+                failures.append(f"{tag}: removed at image "
+                                f"{row['removal_image']} != "
+                                f"{want_removal_image}")
+            r_before, r_after = int(row["remove_before"]), \
+                int(row["remove_after"])
+            if site["cache_class"] == cache_model.READ_ONLY:
+                if row["removal"] != "re_xor" or r_before != after or \
+                        r_after != before:
+                    failures.append(f"{tag}: read-only removal must re-XOR "
+                                    "to the pre-cache value")
+            elif row["removal"] == "restored":
+                if r_before != after or r_after != before:
+                    failures.append(f"{tag}: conditional restore inconsistent")
+            elif row["removal"] == "overwritten":
+                if r_before == after or r_after != r_before:
+                    failures.append(f"{tag}: 'overwritten' but the byte still "
+                                    "held the flipped value")
+            else:
+                failures.append(f"{tag}: bad removal {row['removal']!r}")
+    return failures
+
+
+def verify_cache_events(output: str, rows: list[dict]) -> list[str]:
+    """CACHE_FLIPPED / CACHE_REMOVED events must match the applied rows of
+    the completed trials one-to-one (counts and before/after values)."""
+    failures: list[str] = []
+    applied = {(row["trial_index"], row["cache_index"]): row
+               for row in rows if row["applied"] == "1"}
+    trials = {row["trial_index"] for row in rows}
+    events = [(n, f) for n, f in parse_all_events(output)
+              if n in ("CACHE_FLIPPED", "CACHE_REMOVED")
+              and f.get("trial_index") in trials]
+    for kind, before_key, after_key in (("CACHE_FLIPPED", "before", "after"),
+                                        ("CACHE_REMOVED", "remove_before",
+                                         "remove_after")):
+        seen = [f for n, f in events if n == kind]
+        if len(seen) != len(applied):
+            failures.append(f"{kind}: {len(seen)} events != "
+                            f"{len(applied)} applied cache rows")
+            continue
+        for f in seen:
+            row = applied.get((f.get("trial_index"), f.get("cache_index")))
+            if row is None or f.get("before") != row[before_key] or \
+                    f.get("after") != row[after_key]:
+                failures.append(f"{kind} {f.get('trial_index')}/"
+                                f"{f.get('cache_index')}: disagrees with "
+                                "the cache result CSV")
+    return failures
+
+
 def analyze_process_death(output: str, campaign: list[list[dict]]
                           ) -> tuple[dict | None, list[str]]:
     """Classify a runner process that died mid-campaign (restart
@@ -508,6 +654,15 @@ MERGE_CSV_SPECS: dict[str, tuple[list[str], int, int | None]] = {
 }
 
 
+# G8 cache-mode result files (present only with --cache-ber): merged like
+# the G5 files; a segment's cache rows exist only for its completed
+# trials, its cache work for every slot it was assigned.
+G8_MERGE_CSV_SPECS: dict[str, tuple[list[str], int, int | None]] = {
+    "g1_5_g8_cache_site_result.csv": (CACHE_RESULT_FIELDS, 2, 4),
+    "cache_work.csv": (cache_model.CACHE_WORK_FIELDS, 0, 2),
+}
+
+
 def shift_trial_fields(fields: list[str], delta: int, trial_col: int,
                        target_col: int | None = None) -> list[str]:
     """One CSV row with its trial_index (and target_id's t%03d prefix)
@@ -517,10 +672,11 @@ def shift_trial_fields(fields: list[str], delta: int, trial_col: int,
     shifted[trial_col] = str(global_index)
     if target_col is not None:
         head, sep, rest = shifted[target_col].partition("-")
-        if not head.startswith("t") or not sep:
+        # t%03d-...: DRAM sites; c%03d-...: G8 cache sites
+        if head[:1] not in ("t", "c") or not sep:
             raise RuntimeError(f"malformed target_id "
                                f"{shifted[target_col]!r}")
-        shifted[target_col] = f"t{global_index:03d}-{rest}"
+        shifted[target_col] = f"{head[0]}{global_index:03d}-{rest}"
     return shifted
 
 
@@ -580,8 +736,11 @@ def merge_campaign_outputs(level_dir: Path, segments: list[dict],
         "g1_5_allocations_gate.csv", "gpu_va_pa_map.csv",
         "gpu_va_pa_map_gate.csv", "events.csv",
     ]
+    g8_names = [name for name in G8_MERGE_CSV_SPECS
+                if (segments[0]["dir"] / name).is_file()]
     if single:
-        for name in standard_names + ["work_detail.json", "harness.log"]:
+        for name in standard_names + g8_names + ["work_detail.json",
+                                                 "harness.log"]:
             source = segments[0]["dir"] / name
             if source.is_file():
                 os.link(source, level_dir / name)
@@ -605,6 +764,19 @@ def merge_campaign_outputs(level_dir: Path, segments: list[dict],
             merged[name].extend(
                 shift_trial_fields(row, delta, trial_col, target_col)
                 for row in rows if int(row[trial_col]) < consumed)
+    for name in g8_names:
+        fields, trial_col, target_col = G8_MERGE_CSV_SPECS[name]
+        rows_out: list[list[str]] = []
+        for segment in segments:
+            consumed = consumed_of(segment)
+            completed = segment["completed"]
+            keep = consumed if name == "cache_work.csv" else completed
+            rows = read_result_csv(segment["dir"] / name, fields)
+            rows_out.extend(
+                shift_trial_fields(row, segment["first_trial"], trial_col,
+                                   target_col)
+                for row in rows if int(row[trial_col]) < keep)
+        write_merged_csv(level_dir / name, fields, rows_out)
     for name, (fields, _, _) in MERGE_CSV_SPECS.items():
         write_merged_csv(level_dir / name, fields, merged[name],
                          comment=("gpu-m2d g5 campaign merged over restart "
@@ -838,6 +1010,14 @@ def parse_args() -> argparse.Namespace:
                              "preprocessing of every evaluation image) "
                              "before the pre-allocation gate; the G7 10K "
                              "ImageNet pass needs more than the G5 default")
+    parser.add_argument("--cache-ber", type=float, default=None,
+                        help="G8 L2 cache faults: BER_cache per trial "
+                             "(n_cache = round(BER_cache x R_eff_bits) from "
+                             "this process's residency map). Enables the "
+                             "in-process residency pass, the map "
+                             "self-checks and per-image cache flips. Until "
+                             "the cache level table is frozen (G8-T3) the "
+                             "value is an explicit, recorded parameter")
     parser.add_argument("--bootstrap", action="store_true",
                         help="measure-only run: attach the observer, build "
                              "the per-run snapshot, record the live "
@@ -867,7 +1047,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
     parser.add_argument("--output-root", type=Path,
                         default=PROJECT / "artifacts/g5/campaign")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.cache_ber is not None:
+        if args.bootstrap:
+            parser.error("--cache-ber cannot be combined with --bootstrap")
+        if args.cache_ber < 0:
+            parser.error("--cache-ber must be >= 0")
+    return args
 
 
 def finalize(failures: list[str], run_dir: Path, test_log: Path,
@@ -988,6 +1174,10 @@ def execute_segment(args: argparse.Namespace, contract: dict,
     trial_result_output = segment_dir / "g1_5_g5_trial_result.csv"
     image_detail_output = segment_dir / "g1_5_g5_image_detail.csv"
     clean_pass_output = segment_dir / "g1_5_g5_clean_pass.csv"
+    cache_mode = getattr(args, "cache_ber", None) is not None
+    cache_work_output = segment_dir / "cache_work.csv"
+    cache_result_output = segment_dir / "g1_5_g8_cache_site_result.csv"
+    residency_prefix = segment_dir / "g1_5_l2"
     gate = segment_dir / f".gate_{os.getpid()}_{time.time_ns()}"
     release = segment_dir / f".release_{os.getpid()}_{time.time_ns()}"
     run_id = segment_name
@@ -1021,6 +1211,17 @@ def execute_segment(args: argparse.Namespace, contract: dict,
         runner_passthrough += ["--std", args.std]
     if args.image_cache_dir is not None:
         runner_passthrough += ["--image-cache-dir", str(args.image_cache_dir)]
+    g8_runner_args: list[str] = []
+    if cache_mode:
+        g8_runner_args = [
+            "--l2-probe-out", str(residency_prefix.resolve()),
+            *G8_PROBE_ARGS,
+            "--l2-probe-expect-surface-bytes", str(r_nominal),
+            "--campaign-cache-work", str(cache_work_output.resolve()),
+        ]
+        excludes_g8 = workload_entry.get("surface_excludes", ())
+        if excludes_g8:
+            g8_runner_args += ["--l2-probe-exclude", ",".join(excludes_g8)]
 
     observer: G2Observer | None = None
     process: subprocess.Popen[bytes] | None = None
@@ -1073,6 +1274,7 @@ def execute_segment(args: argparse.Namespace, contract: dict,
                 "--campaign-gate-timeout-seconds",
                 str(max(600, int(args.timeout_seconds))),
                 *runner_passthrough,
+                *g8_runner_args,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1284,6 +1486,62 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             "total_sites": total_sites,
         })
 
+        # ---- G8-T2 cache sites from THIS process's residency map
+        cache_campaign: list[list[dict]] = []
+        if cache_mode:
+            classes = workload_entry.get("cache_alloc_classes")
+            if classes is None:
+                raise RuntimeError(f"workload {args.workload} has no "
+                                   "cache_alloc_classes (G8-T2c)")
+            try:
+                rmap = residency_map.load_map(residency_prefix)
+            except residency_map.MapError as exc:
+                raise RuntimeError(f"residency map refused: {exc}") from exc
+            live_bases = {row["allocation_id"]: int(row["gpu_va"], 16)
+                          for row in registry}
+            images_at_gate = len(read_csv_rows(clean_pass_output,
+                                               CLEAN_PASS_FIELDS))
+            checks = cache_model.map_self_checks(
+                str(residency_prefix), rmap, images=images_at_gate,
+                frozen_r=r_nominal, live_bases=live_bases)
+            print(f"[{run_id}] G8 residency map: R_eff "
+                  f"{rmap.r_eff / 8e6:.3f} MB of {r_nominal / 1e6:.3f} MB, "
+                  f"stride {checks['values']['stride']}, in-gap "
+                  f"{checks['values']['in_gap_share']:.4%}, locked "
+                  f"{checks['values']['locked_share']:.3%}")
+            if checks["failures"]:
+                raise RuntimeError("G8 residency-map self-check failed "
+                                   "(fail-closed): "
+                                   + "; ".join(checks["failures"]))
+            try:
+                n_cache, cache_campaign = cache_model.sample_cache_campaign(
+                    rmap, classes, args.cache_ber, trials, seed, live_bases)
+            except cache_model.CacheModelError as exc:
+                raise RuntimeError(f"cache sampling refused: {exc}") from exc
+            cache_failures = cache_model.verify_cache_work(
+                rmap, classes, n_cache, cache_campaign)
+            if cache_failures:
+                raise RuntimeError("sampled cache sites violate the model: "
+                                   + "; ".join(cache_failures[:10]))
+            cache_model.write_cache_work(cache_work_output, cache_campaign)
+            os.chmod(cache_work_output, 0o644)
+            print(f"[{run_id}] G8 cache sampler: BER_cache {args.cache_ber:g} "
+                  f"x R_eff_bits {rmap.r_eff:.0f} -> n_cache {n_cache} per "
+                  f"trial, {n_cache * trials} cache sites")
+            extra["g8_cache"] = {
+                "cache_ber": args.cache_ber,
+                "cache_ber_frozen": False,
+                "n_cache": n_cache,
+                "r_eff_bits": rmap.r_eff,
+                "surface_bits": rmap.meta["surface_bits"],
+                "residency_map_json": str(residency_prefix) + "_residency.json",
+                "residency_map_bin_sha256": rmap.meta["bin_sha256"],
+                "self_checks": checks["values"],
+                "cache_work_output": str(cache_work_output),
+                "cache_work_sha256": sha256(cache_work_output),
+                "cache_sites_total": n_cache * trials,
+            }
+
         release.write_text(f"campaign_ready target_tgid={process.pid}\n",
                            encoding="utf-8")
         os.chmod(release, 0o644)
@@ -1324,6 +1582,12 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             failures.extend(verify_site_rows(prefix, site_rows, registry))
             trial_rows = read_csv_rows(trial_result_output,
                                        TRIAL_RESULT_FIELDS)
+            if cache_mode:
+                cache_rows = read_csv_rows(cache_result_output,
+                                           CACHE_RESULT_FIELDS)
+                failures.extend(verify_cache_rows(cache_campaign, cache_rows,
+                                                  trial_rows))
+                failures.extend(verify_cache_events(output, cache_rows))
             clean_rows = read_csv_rows(clean_pass_output, CLEAN_PASS_FIELDS)
             images_total = len(clean_rows)
             if images_total == 0:
@@ -1383,9 +1647,8 @@ def execute_segment(args: argparse.Namespace, contract: dict,
         allocated, lifecycle, times = parse_harness_output(output)
         skeleton = [name for name in lifecycle
                     if name not in CAMPAIGN_VARIABLE_EVENTS]
-        expected_skeleton = [name for name in CAMPAIGN_SKELETON
-                             if not (name in ("HOLD_BEGIN", "HOLD_END")
-                                     and args.hold_seconds <= 0)]
+        expected_skeleton = expected_skeleton_for(args.hold_seconds,
+                                                  cache_mode)
         if skeleton != expected_skeleton:
             failures.append(f"lifecycle skeleton mismatch: {skeleton}")
 
@@ -1431,6 +1694,21 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             failures.extend(verify_image_rows(image_rows, trial_rows,
                                               clean_rows))
         failures.extend(verify_event_structure(output, campaign, site_rows))
+        if cache_mode:
+            cache_rows = read_csv_rows(cache_result_output, CACHE_RESULT_FIELDS)
+            failures.extend(verify_cache_rows(cache_campaign, cache_rows,
+                                              trial_rows))
+            failures.extend(verify_cache_events(output, cache_rows))
+            removal_counts: dict[str, int] = {}
+            for row in cache_rows:
+                removal_counts[row["removal"]] = \
+                    removal_counts.get(row["removal"], 0) + 1
+            extra.setdefault("g8_cache", {}).update({
+                "cache_result_output": str(cache_result_output),
+                "cache_result_sha256": sha256(cache_result_output),
+                "cache_rows": len(cache_rows),
+                "removal_counts": removal_counts,
+            })
 
         outcome_histogram = dict.fromkeys(OUTCOMES, 0)
         image_totals = {"images_benign": 0, "images_sdc_numeric": 0,
@@ -2210,6 +2488,95 @@ def self_test() -> int:
         assert len(merge["trial_rows"]) == 3
         assert (solo_dir / "g1_5_g5_site_result.csv").read_text() == \
             (solo_seg_dir / "g1_5_g5_site_result.csv").read_text()
+
+    # ---- G8-T2 cache verifiers -------------------------------------------
+    def cache_site(trial, k, cls, start, last, byte=10, bit=3):
+        return {"trial_index": trial, "cache_index": k,
+                "target_id": f"c{trial:03d}-{k}",
+                "allocation_id": "trt-internal-0", "byte_offset": byte,
+                "bit_in_byte": bit, "expected_gpu_va": 0x1000 + byte,
+                "start_image": start, "last_image": last, "cache_class": cls}
+
+    def cache_row(site, applied=True, before=0x40, removal=None,
+                  removal_image=None, remove_before=None, remove_after=None):
+        mask = 1 << site["bit_in_byte"]
+        after = before ^ mask
+        if removal is None:
+            removal = "re_xor" if site["cache_class"] == "read_only" \
+                else "restored"
+        return {
+            "trial_index": str(site["trial_index"]),
+            "cache_index": str(site["cache_index"]),
+            "target_id": site["target_id"],
+            "allocation_id": site["allocation_id"],
+            "byte_offset": str(site["byte_offset"]),
+            "bit_in_byte": str(site["bit_in_byte"]),
+            "xor_mask": str(mask),
+            "gpu_va": hex(site["expected_gpu_va"]) if applied else "NA",
+            "expected_gpu_va": hex(site["expected_gpu_va"]),
+            "cache_class": site["cache_class"],
+            "start_image": str(site["start_image"]),
+            "last_image": str(site["last_image"]),
+            "applied": "1" if applied else "0",
+            "apply_image": str(site["start_image"] if applied else 0),
+            "before": str(before if applied else 0),
+            "after": str(after if applied else 0),
+            "removal": removal if applied else "not_applied",
+            "removal_image": str(site["last_image"] if removal_image is None
+                                 else removal_image),
+            "remove_before": str(after if remove_before is None
+                                 else remove_before),
+            "remove_after": str(before if remove_after is None
+                                else remove_after)}
+
+    ro = cache_site(0, 0, "read_only", 2, 9)
+    ew = cache_site(0, 1, "engine_written", 4, 4, byte=11)
+    ew_over = cache_site(0, 2, "engine_written", 5, 5, byte=12)
+    cache_camp = [[ro, ew, ew_over]]
+    good_rows = [cache_row(ro), cache_row(ew),
+                 cache_row(ew_over, removal="overwritten", remove_before=7,
+                           remove_after=7)]
+    full_trial = [{"trial_index": "0", "images_evaluated": "10",
+                   "injected_outcome": "SDC_NUMERIC"}]
+    assert verify_cache_rows(cache_camp, good_rows, full_trial) == []
+    # DUE at image 4: the read-only flip is removed at 4, the one starting
+    # at 5 was never applied
+    due_trial = [{"trial_index": "0", "images_evaluated": "5",
+                  "injected_outcome": "DUE_INVALID_OUTPUT"}]
+    due_rows = [cache_row(ro, removal_image=4), cache_row(ew),
+                cache_row(ew_over, applied=False)]
+    assert verify_cache_rows(cache_camp, due_rows, due_trial) == []
+    # the same early removal without a DUE is refused
+    assert verify_cache_rows(cache_camp, due_rows, full_trial)
+    # read-only removal not back to the pre-cache value is refused
+    bad = [cache_row(ro, remove_after=0x41), cache_row(ew),
+           good_rows[2]]
+    assert any("read-only" in f for f in
+               verify_cache_rows(cache_camp, bad, full_trial))
+    # 'overwritten' while the byte still held the flipped value is refused
+    bad = [good_rows[0], good_rows[1],
+           cache_row(ew_over, removal="overwritten")]
+    assert any("overwritten" in f for f in
+               verify_cache_rows(cache_camp, bad, full_trial))
+    # a missing row is refused
+    assert verify_cache_rows(cache_camp, good_rows[:2], full_trial)
+    # events must match the applied rows one-to-one
+    events = "".join(
+        f"GPU_M2D_EVENT,event=CACHE_FLIPPED,trial_index=0,cache_index="
+        f"{r['cache_index']},before={r['before']},after={r['after']}\n"
+        f"GPU_M2D_EVENT,event=CACHE_REMOVED,trial_index=0,cache_index="
+        f"{r['cache_index']},before={r['remove_before']},"
+        f"after={r['remove_after']}\n" for r in good_rows)
+    assert verify_cache_events(events, good_rows) == []
+    assert verify_cache_events(events.replace("before=64", "before=65", 1),
+                               good_rows)
+    # skeleton: the residency pass sits between clean pass and gate
+    sk = expected_skeleton_for(1, True)
+    at = sk.index("CLEAN_PASS_END")
+    assert sk[at + 1:at + 3] == G8_SKELETON_EVENTS
+    assert expected_skeleton_for(1, False) == CAMPAIGN_SKELETON
+    # restart merge renumbers cache target ids like DRAM ones
+    assert shift_trial_fields(["2", "c002-7"], 5, 0, 1) == ["7", "c007-7"]
 
     print("g5 campaign self-test: PASS")
     return 0

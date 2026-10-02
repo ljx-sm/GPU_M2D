@@ -79,6 +79,11 @@
 #                       mobilenetv3's frozen R is its EXCLUSION-scoped
 #                       injection surface -- fault_model.surface_rows_for)
 #   [--bootstrap]       measure-only R run; no --level (see above)
+#   [--cache-ber X]     G8 L2 cache faults on top of the level's DRAM faults:
+#                       in-process residency pass + map self-checks before
+#                       the gate, n_cache = round(X * R_eff_bits) cache SBUs
+#                       per trial applied/removed per image (unfrozen value
+#                       until G8-T3; recorded in summary.json)
 #   G7 runner passthrough (unset flags keep the G5 defaults byte-identical):
 #   [--engine PATH] [--sample-csv PATH] [--output-root DIR]
 #   [--class-count N] [--preprocess legacy|canonical] [--resize-scale N]
@@ -119,7 +124,7 @@ while [[ $# -gt 0 ]]; do
         --rep-uniform|--rep-seed) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --table|--binding-bit|--internal-bit|--sample-index|\
-        --level|--trials|--seed) \
+        --level|--trials|--seed|--cache-ber) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --engine|--sample-csv|--workload|--class-count|\
         --preprocess|--resize-scale|--interp|--mean|--std|\

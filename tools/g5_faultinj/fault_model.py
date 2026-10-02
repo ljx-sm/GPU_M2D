@@ -492,6 +492,11 @@ def level_by_name(name: str, workload: str = DEFAULT_WORKLOAD) -> dict:
                      f"one of {[e['level'] for e in levels]}")
 
 
+# Semantic label of the G8 L2 probe's registered output buffer
+# (apps/resnet50_int8_g1_5.cpp kL2ProbeOutputLabel).
+INSTRUMENTATION_LABEL = "G8_L2_PROBE_OUTPUT"
+
+
 def surface_rows_for(workload: str, snapshot_rows: list[dict]) -> list[dict]:
     """Snapshot rows restricted to the workload's INJECTION SURFACE: the
     full dual-addressing residency minus the workload's surface_excludes
@@ -504,10 +509,17 @@ def surface_rows_for(workload: str, snapshot_rows: list[dict]) -> list[dict]:
     R of a scoped workload is the surface total, so residency guards must
     compare against THIS function's output, never the raw snapshot."""
     excludes = set(workload_by_name(workload).get("surface_excludes", ()))
+    # G8 instrumentation (the L2 probe's registered output buffer) is never
+    # workload data: always outside the injection surface, for every
+    # workload; snapshots without it pass through unchanged.
+    rows = snapshot_rows
+    if any(row.get("semantic_label") == INSTRUMENTATION_LABEL
+           for row in snapshot_rows):
+        rows = [row for row in snapshot_rows
+                if row.get("semantic_label") != INSTRUMENTATION_LABEL]
     if not excludes:
-        return snapshot_rows
-    return [row for row in snapshot_rows
-            if row["allocation_id"] not in excludes]
+        return rows
+    return [row for row in rows if row["allocation_id"] not in excludes]
 
 
 # ---------------------------------------------------------------------------
@@ -973,6 +985,14 @@ def self_test() -> int:
     except ModelError:
         pass
 
+    # the G8 probe buffer is outside every workload's surface
+    probe_row = {"allocation_id": "g8-l2-probe-output-gpu-0",
+                 "semantic_label": INSTRUMENTATION_LABEL}
+    data_row = {"allocation_id": "trt-internal-0",
+                "semantic_label": "TENSORRT_INTERNAL_UNKNOWN"}
+    for workload_name in WORKLOADS:
+        assert surface_rows_for(workload_name, [probe_row, data_row]) == \
+            [data_row], workload_name
     # G8 cache classes: disjoint, TRT-internal only, never an excluded
     # allocation
     for workload_name, entry in WORKLOADS.items():

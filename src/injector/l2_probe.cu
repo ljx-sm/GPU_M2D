@@ -35,7 +35,8 @@ std::uint64_t units_overlapping(const void* base, std::size_t bytes,
 
 L2Prober::L2Prober(std::vector<L2ProbeRange> ranges, std::size_t unit_bytes,
                    std::uint32_t threshold_cycles, int probes_per_sm,
-                   std::size_t stride, bool reverse, bool alternate)
+                   std::size_t stride, bool reverse, bool alternate,
+                   void* external_output, std::size_t external_output_bytes)
     : ranges_(std::move(ranges)),
       unit_bytes_(unit_bytes),
       threshold_(threshold_cycles),
@@ -87,8 +88,16 @@ L2Prober::L2Prober(std::vector<L2ProbeRange> ranges, std::size_t unit_bytes,
     block_threads_ = std::min(threads_per_sm, 512);
     blocks_ = std::max(1, sms * threads_per_sm / block_threads_);
 
-    check_cuda(cudaMalloc(&device_latency_, total_units_ * sizeof(std::uint16_t)),
-               "allocate L2 probe output");
+    if (external_output != nullptr) {
+        if (external_output_bytes < total_units_ * sizeof(std::uint16_t)) {
+            throw std::invalid_argument("L2 probe external output buffer too small");
+        }
+        device_latency_ = static_cast<std::uint16_t*>(external_output);
+        owns_output_ = false;
+    } else {
+        check_cuda(cudaMalloc(&device_latency_, total_units_ * sizeof(std::uint16_t)),
+                   "allocate L2 probe output");
+    }
     host_latency_.resize(total_units_);
     check_cuda(cudaEventCreate(&start_), "create probe start event");
     check_cuda(cudaEventCreate(&stop_), "create probe stop event");
@@ -101,9 +110,18 @@ L2Prober::~L2Prober() {
     if (stop_ != nullptr) {
         cudaEventDestroy(stop_);
     }
-    if (device_latency_ != nullptr) {
+    if (device_latency_ != nullptr && owns_output_) {
         cudaFree(device_latency_);
     }
+}
+
+std::uint64_t L2Prober::count_units(const std::vector<L2ProbeRange>& ranges,
+                                    std::size_t unit_bytes) {
+    std::uint64_t total = 0;
+    for (const L2ProbeRange& range : ranges) {
+        total += units_overlapping(range.base, range.bytes, unit_bytes);
+    }
+    return total;
 }
 
 float L2Prober::probe(cudaStream_t stream, std::uint64_t sweep_index) {

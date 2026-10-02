@@ -35,10 +35,25 @@ public:
     // observations, i.e. sweep s probes in reverse iff (s / stride) is odd
     // (overrides `reverse`; averages out the in-sweep order effect T0
     // measured on ViT-B scratch).
+    // external_output: a caller-owned device buffer of at least
+    // required_output_bytes(ranges, unit_bytes) bytes for the latencies
+    // (the runner passes a REGISTERED allocation so the G2/G5 ledger
+    // covers it); nullptr = the prober cudaMallocs its own.
     L2Prober(std::vector<L2ProbeRange> ranges, std::size_t unit_bytes,
              std::uint32_t threshold_cycles, int probes_per_sm,
              std::size_t stride = 1, bool reverse = false,
-             bool alternate = false);
+             bool alternate = false, void* external_output = nullptr,
+             std::size_t external_output_bytes = 0);
+
+    // Units of `ranges` at `unit_bytes` (sum over ranges) and the output
+    // buffer size a prober over them needs.
+    static std::uint64_t count_units(const std::vector<L2ProbeRange>& ranges,
+                                     std::size_t unit_bytes);
+    static std::size_t required_output_bytes(
+        const std::vector<L2ProbeRange>& ranges, std::size_t unit_bytes) {
+        return static_cast<std::size_t>(count_units(ranges, unit_bytes)) *
+               sizeof(std::uint16_t);
+    }
     ~L2Prober();
     L2Prober(const L2Prober&) = delete;
     L2Prober& operator=(const L2Prober&) = delete;
@@ -95,6 +110,7 @@ private:
     int blocks_{0};
     int block_threads_{0};
     std::uint16_t* device_latency_{nullptr};
+    bool owns_output_{true};
     std::vector<std::uint16_t> host_latency_;
     std::vector<std::uint16_t> compact_;
     cudaEvent_t start_{nullptr};

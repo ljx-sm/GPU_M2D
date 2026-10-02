@@ -21,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -44,6 +45,11 @@ constexpr float kProbabilityTolerance = 1.0e-6F;
 // a fixed engine and input, so a fully restored run must reproduce the
 // clean output; the tolerance only absorbs float reduction wobble.
 constexpr float kSanityTolerance = 1.0e-4F;
+// G8: semantic label of the L2 probe's registered output buffer (never
+// probed, never part of the injection surface) and the `auto` stride rule.
+const char* const kL2ProbeOutputLabel = "G8_L2_PROBE_OUTPUT";
+constexpr std::size_t kAutoStrideLarge = 64;
+constexpr double kAutoStrideMissFraction = 0.01;
 const std::array<float, 3> kMean{{0.485F, 0.456F, 0.406F}};
 const std::array<float, 3> kStd{{0.229F, 0.224F, 0.225F}};
 
@@ -478,6 +484,10 @@ struct Options {
     std::string campaign_work;
     std::string campaign_release;
     int campaign_gate_timeout_seconds{0};
+    // G8-T2 L2 cache faults: per-image cache sites (start/last image) the
+    // orchestrator sampled from this process's residency map; applied
+    // before the start image's inference, removed after the last one.
+    std::string campaign_cache_work;
     // G7 workload parameterization. Defaults keep the G5 RESISC45 behavior
     // byte-identical; a G7 invocation overrides them from the model's
     // model_meta.json (the single source of preprocessing truth) via the
@@ -516,6 +526,10 @@ struct Options {
     // L2 fill traffic for surfaces larger than L2); reverse probes in
     // descending unit order (contamination detector).
     std::size_t l2_probe_stride{1};
+    // --l2-probe-stride auto (G8-T2 stride rule): a stride-64 pre-sweep
+    // measures the L2 miss fraction of the surface; <= 1 % -> stride 1
+    // (no self-eviction to fear), otherwise stride 64.
+    bool l2_probe_stride_auto{false};
     bool l2_probe_reverse{false};
     // G8-T1: flip the probe direction for each unit's successive
     // observations; build and write the per-unit residency map; repeat the
@@ -651,6 +665,8 @@ Options parse_options(int argc, char** argv) {
             options.campaign_work = value;
         } else if (key == "--campaign-release") {
             options.campaign_release = value;
+        } else if (key == "--campaign-cache-work") {
+            options.campaign_cache_work = value;
         } else if (key == "--campaign-gate-timeout-seconds") {
             options.campaign_gate_timeout_seconds = std::stoi(value);
             if (options.campaign_gate_timeout_seconds <= 0) {
@@ -703,9 +719,13 @@ Options parse_options(int argc, char** argv) {
             }
             options.l2_probe_threshold = static_cast<std::uint32_t>(threshold);
         } else if (key == "--l2-probe-stride") {
-            options.l2_probe_stride = std::stoull(value);
-            if (options.l2_probe_stride == 0) {
-                throw std::invalid_argument("--l2-probe-stride must be > 0");
+            if (value == "auto") {
+                options.l2_probe_stride_auto = true;
+            } else {
+                options.l2_probe_stride = std::stoull(value);
+                if (options.l2_probe_stride == 0) {
+                    throw std::invalid_argument("--l2-probe-stride must be > 0 or auto");
+                }
             }
         } else if (key == "--l2-probe-reverse") {
             if (value != "0" && value != "1") {
@@ -798,11 +818,25 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument(
             "--campaign-* and --injection-* are mutually exclusive modes");
     }
+    if (!options.campaign_cache_work.empty() &&
+        (options.campaign_work.empty() || options.l2_probe_out.empty())) {
+        throw std::invalid_argument(
+            "--campaign-cache-work needs --campaign-work and the residency "
+            "pass (--l2-probe-out)");
+    }
     if (!options.l2_probe_out.empty()) {
-        if (!options.campaign_work.empty() || !options.injection_work.empty()) {
+        if (!options.injection_work.empty()) {
             throw std::invalid_argument(
-                "--l2-probe-out is a measure-only mode; it excludes "
-                "--campaign-* and --injection-*");
+                "--l2-probe-out cannot be combined with --injection-*");
+        }
+        // G8-T2: inside a campaign the residency pass runs ONCE before the
+        // campaign gate and must produce the map the orchestrator samples
+        // cache sites from.
+        if (!options.campaign_work.empty() &&
+            (!options.l2_probe_map || options.l2_probe_passes != 1)) {
+            throw std::invalid_argument(
+                "campaign residency pass needs --l2-probe-map 1 and "
+                "--l2-probe-passes 1");
         }
         if (options.l2_probe_threshold == 0) {
             throw std::invalid_argument(
@@ -1700,6 +1734,127 @@ std::vector<std::vector<CampaignSite>> read_campaign_work(
     return trials;
 }
 
+// ---- G8-T2 cache sites (docs/G8_CACHE_FAULT_PLAN.md §3.4-§3.7) ----
+// Work file (tools/g8_cache/cache_model.py write_cache_work):
+// "trial_index,cache_index,target_id,allocation_id,byte_offset,bit_in_byte,
+//  expected_gpu_va,start_image,last_image,cache_class"; a trial may have
+// no cache sites (n_cache = 0).
+struct CacheSite {
+    InjectionTarget target;
+    std::size_t trial_index{0};
+    std::size_t cache_index{0};
+    std::size_t start_image{0};
+    std::size_t last_image{0};
+    bool read_only{false};
+};
+
+std::vector<std::vector<CacheSite>> read_cache_work(const std::string& path,
+                                                    std::size_t trials,
+                                                    std::size_t images) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("cannot open cache work file: " + path);
+    }
+    std::vector<std::vector<CacheSite>> out(trials);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty() || line.front() == '#' ||
+            line.rfind("trial_index,", 0) == 0) {
+            continue;
+        }
+        const std::vector<std::string> f = split_csv_line(line);
+        if (f.size() != 10) {
+            throw std::runtime_error("malformed cache work row: " + line);
+        }
+        CacheSite site;
+        site.trial_index = std::stoull(f[0]);
+        site.cache_index = std::stoull(f[1]);
+        site.target.target_id = f[2];
+        site.target.allocation_id = f[3];
+        site.target.byte_offset = std::stoull(f[4]);
+        site.target.bit_in_byte = std::stoul(f[5]);
+        site.target.expected_gpu_va = std::stoull(f[6], nullptr, 16);
+        site.start_image = std::stoull(f[7]);
+        site.last_image = std::stoull(f[8]);
+        if (f[9] != "read_only" && f[9] != "engine_written") {
+            throw std::runtime_error("bad cache_class in cache work: " + line);
+        }
+        site.read_only = f[9] == "read_only";
+        if (site.trial_index >= trials || site.target.bit_in_byte > 7 ||
+            site.start_image > site.last_image || site.last_image >= images ||
+            site.target.expected_gpu_va == 0 ||
+            site.cache_index != out[site.trial_index].size()) {
+            throw std::runtime_error("invalid cache work row: " + line);
+        }
+        out[site.trial_index].push_back(std::move(site));
+    }
+    return out;
+}
+
+// One cache site's life within a trial.
+struct CacheRecord {
+    CacheSite site;
+    bool applied{false};
+    std::size_t apply_image{0};
+    gpu_m2d::BitFlipResult flip{};
+    // re_xor (read-only, back to the pre-cache value), restored
+    // (engine-written, byte still flipped -> conditionally restored),
+    // overwritten (engine-written, the engine rewrote the byte),
+    // not_applied (trial aborted before the start image)
+    std::string removal{"not_applied"};
+    std::size_t removal_image{0};
+    std::uint8_t remove_before{0};
+    std::uint8_t remove_after{0};
+};
+
+// Per-trial flushed cache result stream (same durability rule as
+// G5ResultStreams: a trial's rows reach the OS at its TRIAL_END).
+struct G8CacheStream {
+    std::ofstream out;
+    std::string run_id;
+    int device{0};
+    G8CacheStream(const std::string& prefix, const Options& options,
+                  const std::string& run_id_)
+        : run_id(run_id_), device(options.device) {
+        out.open(prefix + "_g8_cache_site_result.csv",
+                 std::ios::out | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("cannot open G8 cache result CSV at " + prefix);
+        }
+        out << "run_id,device,trial_index,cache_index,target_id,allocation_id,"
+               "byte_offset,bit_in_byte,xor_mask,gpu_va,expected_gpu_va,"
+               "cache_class,start_image,last_image,applied,apply_image,before,"
+               "after,removal,removal_image,remove_before,remove_after\n";
+    }
+    void flush_trial(const std::vector<CacheRecord>& records) {
+        for (const CacheRecord& r : records) {
+            out << run_id << ',' << device << ',' << r.site.trial_index << ','
+                << r.site.cache_index << ',' << r.site.target.target_id << ','
+                << r.site.target.allocation_id << ','
+                << r.site.target.byte_offset << ','
+                << r.site.target.bit_in_byte << ','
+                << static_cast<unsigned>(r.flip.xor_mask) << ','
+                << (r.applied ? hex_address(r.flip.gpu_va) : std::string("NA"))
+                << ',' << hex_address(r.site.target.expected_gpu_va) << ','
+                << (r.site.read_only ? "read_only" : "engine_written") << ','
+                << r.site.start_image << ',' << r.site.last_image << ','
+                << (r.applied ? 1 : 0) << ',' << r.apply_image << ','
+                << static_cast<unsigned>(r.flip.before) << ','
+                << static_cast<unsigned>(r.flip.after) << ',' << r.removal
+                << ',' << r.removal_image << ','
+                << static_cast<unsigned>(r.remove_before) << ','
+                << static_cast<unsigned>(r.remove_after) << '\n';
+        }
+        out.flush();
+        if (!out) {
+            throw std::runtime_error("flushing G8 cache result CSV failed");
+        }
+    }
+};
+
 std::vector<Sample> read_all_samples(const std::string& csv_path) {
     std::ifstream input(csv_path);
     if (!input) {
@@ -1764,7 +1919,8 @@ ImageOutcome run_campaign_image(nvinfer1::IExecutionContext& context,
                                 std::size_t probability_size,
                                 const std::vector<InjectionTarget>& probability_sites,
                                 void* class_base, std::size_t class_size,
-                                const std::vector<InjectionTarget>& class_sites) {
+                                const std::vector<InjectionTarget>& class_sites,
+                                const std::function<void()>& before_enqueue = {}) {
     check_cuda(cudaMemcpyAsync(binding_pointers[input_index], input_host,
                                input_bytes, cudaMemcpyHostToDevice,
                                stream.get()),
@@ -1775,6 +1931,11 @@ ImageOutcome run_campaign_image(nvinfer1::IExecutionContext& context,
         static_cast<void>(gpu_m2d::flip_device_bit(
             input_base, input_size, site.byte_offset,
             static_cast<std::uint8_t>(site.bit_in_byte)));
+    }
+    // G8-T2: cache flips starting at this image (after the input is staged
+    // and its held DRAM faults re-applied, before the inference).
+    if (before_enqueue) {
+        before_enqueue();
     }
     if (!enqueue_inference(context, binding_pointers, stream.get())) {
         throw std::runtime_error("TensorRT enqueue returned false");
@@ -2064,12 +2225,14 @@ int run_l2_probe_pass(const Options& options,
                       const std::vector<Sample>& samples,
                       const std::vector<float>& inputs,
                       const std::vector<Prediction>& clean,
-                      const gpu_m2d::AllocationRegistry& registry,
+                      gpu_m2d::AllocationRegistry& registry,
+                      std::vector<DeviceBuffer>& buffers,
                       ObserverEmitter& observer) {
     std::vector<gpu_m2d::AllocationDescriptor> active;
     std::vector<gpu_m2d::AllocationDescriptor> excluded;
     for (const gpu_m2d::AllocationDescriptor& d : registry.allocations()) {
-        if (!d.active) {
+        // the probe's own output buffer is instrumentation, never probed
+        if (!d.active || d.semantic_label == kL2ProbeOutputLabel) {
             continue;
         }
         const bool skip = std::find(options.l2_probe_exclude.begin(),
@@ -2105,11 +2268,55 @@ int run_l2_probe_pass(const Options& options,
                           reinterpret_cast<const void*>(d.base_gpu_va),
                           d.size_bytes});
     }
+    // The probe's latency buffer is a REGISTERED runner allocation (label
+    // G8_L2_PROBE_OUTPUT) that lives until teardown, so the G2/G5 observer
+    // ledger covers it like every other allocation; fault_model excludes
+    // it from the injection surface by label.
+    const std::size_t output_bytes =
+        gpu_m2d::L2Prober::required_output_bytes(ranges, options.l2_probe_unit);
+    const std::string probe_buffer_id =
+        "g8-l2-probe-output-gpu-" + std::to_string(options.device);
+    buffers.emplace_back(output_bytes, registry, probe_buffer_id, options.device,
+                         kL2ProbeOutputLabel);
+    void* probe_output = buffers.back().get();
+    observer.allocated(probe_buffer_id, "cudaMalloc-l2-probe-output",
+                       reinterpret_cast<std::uintptr_t>(probe_output),
+                       output_bytes, "l2_probe_pass", kL2ProbeOutputLabel,
+                       query_buffer_id(probe_output));
+
+    // Stride rule: fixed, or `auto` from a stride-64 pre-sweep's miss
+    // fraction (G8-T2): a surface that is (almost) entirely resident has no
+    // probe miss fills to self-evict with, so it is swept fully every image.
+    std::size_t stride = options.l2_probe_stride;
+    double presweep_miss_fraction = -1.0;
+    std::uint64_t presweep_units = 0;
+    if (options.l2_probe_stride_auto) {
+        gpu_m2d::L2Prober pre(ranges, options.l2_probe_unit,
+                              options.l2_probe_threshold, options.l2_probe_per_sm,
+                              kAutoStrideLarge, false, false, probe_output,
+                              output_bytes);
+        static_cast<void>(pre.probe(stream.get(), 0));
+        std::uint64_t hits = 0;
+        for (std::uint64_t h : pre.hits_per_range()) {
+            hits += h;
+        }
+        for (std::uint64_t p : pre.probed_per_range()) {
+            presweep_units += p;
+        }
+        presweep_miss_fraction =
+            presweep_units ? 1.0 - static_cast<double>(hits) / presweep_units : 1.0;
+        stride = presweep_miss_fraction <= kAutoStrideMissFraction ? 1
+                                                                   : kAutoStrideLarge;
+        std::cout << "G8 stride rule: pre-sweep miss fraction "
+                  << presweep_miss_fraction << " over " << presweep_units
+                  << " units -> stride " << stride << '\n';
+    }
     gpu_m2d::L2Prober prober(ranges, options.l2_probe_unit,
                              options.l2_probe_threshold,
                              options.l2_probe_per_sm,
-                             options.l2_probe_stride, options.l2_probe_reverse,
-                             options.l2_probe_alternate);
+                             stride, options.l2_probe_reverse,
+                             options.l2_probe_alternate, probe_output,
+                             output_bytes);
     const std::vector<std::uint16_t> unit_bytes = prober.unit_resident_bytes();
     std::uint64_t surface_bits = 0;
     for (std::uint16_t b : unit_bytes) {
@@ -2290,6 +2497,13 @@ int run_l2_probe_pass(const Options& options,
                  << "  \"unit_bytes\": " << prober.unit_bytes() << ",\n"
                  << "  \"probe_every\": " << options.l2_probe_every << ",\n"
                  << "  \"stride\": " << prober.stride() << ",\n"
+                 << "  \"stride_rule\": {\"mode\": \""
+                 << (options.l2_probe_stride_auto ? "auto" : "fixed")
+                 << "\", \"presweep_stride\": " << kAutoStrideLarge
+                 << ", \"presweep_units\": " << presweep_units
+                 << ", \"presweep_miss_fraction\": " << presweep_miss_fraction
+                 << ", \"miss_fraction_limit\": " << kAutoStrideMissFraction
+                 << "},\n"
                  << "  \"alternate\": " << (prober.alternate() ? "true" : "false") << ",\n"
                  << "  \"observation_window_images\": " << window << ",\n"
                  << "  \"threshold_cycles\": " << prober.threshold_cycles() << ",\n"
@@ -2608,11 +2822,20 @@ int main(int argc, char** argv) {
         }
         if (!options.l2_probe_out.empty()) {
             allocator.set_phase("l2_probe_pass");
-            return run_l2_probe_pass(options, *context, binding_pointers,
-                                     input_binding, probability_binding,
-                                     class_binding, stream, campaign_samples,
-                                     campaign_input, campaign_clean,
-                                     allocation_registry, observer);
+            const int probe_rc = run_l2_probe_pass(
+                options, *context, binding_pointers, input_binding,
+                probability_binding, class_binding, stream, campaign_samples,
+                campaign_input, campaign_clean, allocation_registry, buffers,
+                observer);
+            if (options.campaign_work.empty()) {
+                return probe_rc;  // T0/T1 measure-only mode
+            }
+            // G8-T2: the campaign continues to its gate with the residency
+            // map written; a non-neutral pass is a tool failure.
+            if (probe_rc != 0) {
+                throw std::runtime_error(
+                    "G8 residency pass was not neutral (clean-pass mismatch)");
+            }
         }
 
         Prediction injected;
@@ -2691,6 +2914,32 @@ int main(int argc, char** argv) {
                         ": live chain disagrees with the sampled snapshot");
                 }
             }
+        }
+
+        // G8-T2 cache work: same live-chain pre-flight as the DRAM sites.
+        std::vector<std::vector<CacheSite>> cache_trials;
+        std::unique_ptr<G8CacheStream> cache_results;
+        if (!options.campaign_cache_work.empty()) {
+            cache_trials = read_cache_work(options.campaign_cache_work,
+                                           campaign_trials.size(),
+                                           campaign_samples.size());
+            for (const std::vector<CacheSite>& trial : cache_trials) {
+                for (const CacheSite& site : trial) {
+                    const auto forward =
+                        allocation_registry.allocation_bit_to_gpu_va(
+                            site.target.allocation_id, site.target.byte_offset,
+                            static_cast<std::uint8_t>(site.target.bit_in_byte));
+                    if (forward.gpu_va != site.target.expected_gpu_va ||
+                        allocation_refs.find(site.target.allocation_id) ==
+                            allocation_refs.end()) {
+                        throw std::runtime_error(
+                            "cache site " + site.target.target_id +
+                            ": live chain disagrees with the sampled map");
+                    }
+                }
+            }
+            cache_results = std::make_unique<G8CacheStream>(
+                options.output_prefix, options, run_id);
         }
 
         void* input_base = binding_pointers[input_binding.index];
@@ -2849,6 +3098,99 @@ int main(int argc, char** argv) {
             // image compared against the campaign's clean records. The
             // first invalid output is an honest DUE and aborts the rest of
             // the trial's images (marked evaluated=0/IMAGE_DUE).
+            // G8-T2: this trial's cache sites, indexed by start image.
+            std::vector<CacheRecord> cache_records;
+            std::vector<std::vector<std::size_t>> cache_starts(images_total);
+            std::vector<std::size_t> cache_active;
+            if (!cache_trials.empty()) {
+                for (const CacheSite& site : cache_trials[trial_index]) {
+                    CacheRecord record;
+                    record.site = site;
+                    cache_starts[site.start_image].push_back(cache_records.size());
+                    cache_records.push_back(std::move(record));
+                }
+            }
+            auto apply_cache = [&](std::size_t image) {
+                for (std::size_t index : cache_starts[image]) {
+                    CacheRecord& record = cache_records[index];
+                    const AllocationRef& ref =
+                        allocation_refs[record.site.target.allocation_id];
+                    record.flip = gpu_m2d::flip_device_bit(
+                        ref.base, ref.size_bytes, record.site.target.byte_offset,
+                        static_cast<std::uint8_t>(record.site.target.bit_in_byte));
+                    if (record.flip.gpu_va != record.site.target.expected_gpu_va ||
+                        record.flip.after !=
+                            static_cast<std::uint8_t>(record.flip.before ^
+                                                      record.flip.xor_mask)) {
+                        throw std::runtime_error("cache site " +
+                                                 record.site.target.target_id +
+                                                 ": flip verification failed");
+                    }
+                    record.applied = true;
+                    record.apply_image = image;
+                    cache_active.push_back(index);
+                    observer.event_with(
+                        "CACHE_FLIPPED",
+                        "trial_index=" + std::to_string(trial_index) +
+                            ",cache_index=" + std::to_string(record.site.cache_index) +
+                            ",image=" + std::to_string(image) +
+                            ",target_id=" + record.site.target.target_id +
+                            ",gpu_va=" + hex_address(record.flip.gpu_va) +
+                            ",before=" + std::to_string(record.flip.before) +
+                            ",after=" + std::to_string(record.flip.after));
+                }
+            };
+            // Removal after an image: every active site whose last image it
+            // was, or all of them when the trial aborts (DUE). Read-only:
+            // re-XOR, must land exactly on the pre-cache value (fail-closed:
+            // nothing else writes read-only data). Engine-written: restore
+            // only if the byte still holds the flipped value.
+            auto remove_cache = [&](std::size_t image, bool all) {
+                std::vector<std::size_t> keep;
+                for (std::size_t index : cache_active) {
+                    CacheRecord& record = cache_records[index];
+                    if (!all && record.site.last_image != image) {
+                        keep.push_back(index);
+                        continue;
+                    }
+                    const AllocationRef& ref =
+                        allocation_refs[record.site.target.allocation_id];
+                    std::uint8_t* cell = static_cast<std::uint8_t*>(ref.base) +
+                                         record.site.target.byte_offset;
+                    std::uint8_t current = 0;
+                    check_cuda(cudaMemcpy(&current, cell, 1, cudaMemcpyDeviceToHost),
+                               "read cache site before removal");
+                    record.remove_before = current;
+                    record.removal_image = image;
+                    if (record.site.read_only || current == record.flip.after) {
+                        const auto unflip = gpu_m2d::flip_device_bit(
+                            ref.base, ref.size_bytes, record.site.target.byte_offset,
+                            static_cast<std::uint8_t>(record.site.target.bit_in_byte));
+                        record.remove_after = unflip.after;
+                        if (record.site.read_only &&
+                            (current != record.flip.after ||
+                             unflip.after != record.flip.before)) {
+                            throw std::runtime_error(
+                                "cache site " + record.site.target.target_id +
+                                ": read-only byte changed during its lifetime");
+                        }
+                        record.removal = record.site.read_only ? "re_xor" : "restored";
+                    } else {
+                        record.remove_after = current;
+                        record.removal = "overwritten";
+                    }
+                    observer.event_with(
+                        "CACHE_REMOVED",
+                        "trial_index=" + std::to_string(trial_index) +
+                            ",cache_index=" + std::to_string(record.site.cache_index) +
+                            ",image=" + std::to_string(image) +
+                            ",removal=" + record.removal +
+                            ",before=" + std::to_string(record.remove_before) +
+                            ",after=" + std::to_string(record.remove_after));
+                }
+                cache_active.swap(keep);
+            };
+
             std::size_t images_evaluated = 0;
             std::size_t count_benign = 0;
             std::size_t count_numeric = 0;
@@ -2872,7 +3214,9 @@ int main(int argc, char** argv) {
                     input_base,
                     input_binding.size_bytes, input_sites, probability_base,
                     probability_binding.size_bytes, probability_sites,
-                    class_base, class_binding.size_bytes, class_sites);
+                    class_base, class_binding.size_bytes, class_sites,
+                    [&] { apply_cache(image_index); });
+                remove_cache(image_index, !outcome.valid);
                 images_evaluated++;
                 last_evaluated = image_index;
                 row.have_injected = outcome.valid;
@@ -3115,6 +3459,14 @@ int main(int argc, char** argv) {
             g5_site_records.insert(
                 g5_site_records.end(), std::make_move_iterator(records.begin()),
                 std::make_move_iterator(records.end()));
+            if (!cache_active.empty()) {
+                throw std::runtime_error("campaign trial " +
+                                         std::to_string(trial_index) +
+                                         ": cache flips still active at trial end");
+            }
+            if (cache_results) {
+                cache_results->flush_trial(cache_records);
+            }
             observer.event_with("TRIAL_END",
                                 "trial_index=" + std::to_string(trial_index) +
                                     ",outcome=" + trial_outcome);
