@@ -523,6 +523,12 @@ struct Options {
     bool l2_probe_alternate{false};
     bool l2_probe_map{false};
     std::size_t l2_probe_passes{1};
+    // Injection-surface scoping (fault_model.WORKLOADS surface_excludes):
+    // these allocations are neither probed nor part of the map; with an
+    // expected surface the pass refuses unless the probed allocations sum
+    // to exactly the workload's frozen R.
+    std::vector<std::string> l2_probe_exclude;
+    std::uint64_t l2_probe_expect_surface_bytes{0};
 };
 
 struct Sample {
@@ -721,6 +727,29 @@ Options parse_options(int argc, char** argv) {
             if (options.l2_probe_passes == 0) {
                 throw std::invalid_argument("--l2-probe-passes must be > 0");
             }
+        } else if (key == "--l2-probe-exclude") {
+            std::size_t position = 0;
+            while (position <= value.size()) {
+                const std::size_t comma = value.find(',', position);
+                const std::string id = value.substr(
+                    position, comma == std::string::npos ? std::string::npos
+                                                         : comma - position);
+                if (id.empty()) {
+                    throw std::invalid_argument(
+                        "--l2-probe-exclude expects ID[,ID...]: " + value);
+                }
+                options.l2_probe_exclude.push_back(id);
+                if (comma == std::string::npos) {
+                    break;
+                }
+                position = comma + 1;
+            }
+        } else if (key == "--l2-probe-expect-surface-bytes") {
+            options.l2_probe_expect_surface_bytes = std::stoull(value);
+            if (options.l2_probe_expect_surface_bytes == 0) {
+                throw std::invalid_argument(
+                    "--l2-probe-expect-surface-bytes must be > 0");
+            }
         } else if (key == "--l2-probe-per-sm") {
             options.l2_probe_per_sm = std::stoi(value);
             if (options.l2_probe_per_sm <= 0) {
@@ -754,7 +783,8 @@ Options parse_options(int argc, char** argv) {
             "--l2-probe-every N --l2-probe-unit 32|128 "
             "--l2-probe-per-sm N --l2-probe-stride N "
             "--l2-probe-reverse 0|1 --l2-probe-alternate 0|1 "
-            "--l2-probe-map 0|1 --l2-probe-passes N]");
+            "--l2-probe-map 0|1 --l2-probe-passes N "
+            "--l2-probe-exclude ID[,ID] --l2-probe-expect-surface-bytes N]");
     }
     if (options.injection_work.empty() != options.injection_release.empty()) {
         throw std::invalid_argument(
@@ -2037,10 +2067,35 @@ int run_l2_probe_pass(const Options& options,
                       const gpu_m2d::AllocationRegistry& registry,
                       ObserverEmitter& observer) {
     std::vector<gpu_m2d::AllocationDescriptor> active;
+    std::vector<gpu_m2d::AllocationDescriptor> excluded;
     for (const gpu_m2d::AllocationDescriptor& d : registry.allocations()) {
-        if (d.active) {
-            active.push_back(d);
+        if (!d.active) {
+            continue;
         }
+        const bool skip = std::find(options.l2_probe_exclude.begin(),
+                                    options.l2_probe_exclude.end(),
+                                    d.allocation_id) != options.l2_probe_exclude.end();
+        (skip ? excluded : active).push_back(d);
+    }
+    // Fail-closed scoping: every excluded id must exist, and the probed
+    // surface must equal the workload's frozen R when one is given.
+    for (const std::string& id : options.l2_probe_exclude) {
+        const bool found = std::any_of(excluded.begin(), excluded.end(),
+                                       [&](const auto& d) { return d.allocation_id == id; });
+        if (!found) {
+            throw std::runtime_error("--l2-probe-exclude: no active allocation " + id);
+        }
+    }
+    std::uint64_t surface_bytes = 0;
+    for (const gpu_m2d::AllocationDescriptor& d : active) {
+        surface_bytes += d.size_bytes;
+    }
+    if (options.l2_probe_expect_surface_bytes != 0 &&
+        surface_bytes != options.l2_probe_expect_surface_bytes) {
+        throw std::runtime_error(
+            "L2 probe surface " + std::to_string(surface_bytes) +
+            " B != expected (frozen R) " +
+            std::to_string(options.l2_probe_expect_surface_bytes) + " B");
     }
     std::sort(active.begin(), active.end(),
               [](const auto& a, const auto& b) { return a.base_gpu_va < b.base_gpu_va; });
@@ -2248,6 +2303,15 @@ int run_l2_probe_pass(const Options& options,
                  << "  \"surface_bits\": " << surface_bits << ",\n"
                  << "  \"t_total_ms\": " << infer_ms_total << ",\n"
                  << "  \"r_eff_bits\": " << r_eff_bits << ",\n"
+                 << "  \"expected_surface_bytes\": "
+                 << options.l2_probe_expect_surface_bytes << ",\n"
+                 << "  \"excluded_allocations\": [";
+            for (std::size_t i = 0; i < excluded.size(); ++i) {
+                json << (i ? ", " : "") << "{\"allocation_id\": \""
+                     << json_escape(excluded[i].allocation_id)
+                     << "\", \"size_bytes\": " << excluded[i].size_bytes << "}";
+            }
+            json << "],\n"
                  << "  \"ranges\": [\n";
             for (std::size_t i = 0; i < prober.range_count(); ++i) {
                 json << "    {\"allocation_id\": \""

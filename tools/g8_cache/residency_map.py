@@ -184,6 +184,12 @@ def load_map(prefix: Path | str, require_neutral: bool = True) -> ResidencyMap:
         raise MapError(f"{prefix}: ranges cover {nxt} of {units} units")
     if sum(8 * b for b in unit_bytes_arr) != meta["surface_bits"]:
         raise MapError(f"{prefix}: surface_bits disagrees with unit bytes")
+    if sum(8 * r["size_bytes"] for r in meta["ranges"]) != meta["surface_bits"]:
+        raise MapError(f"{prefix}: surface_bits disagrees with range sizes")
+    expected = meta.get("expected_surface_bytes", 0)
+    if expected and 8 * expected != meta["surface_bits"]:
+        raise MapError(f"{prefix}: surface {meta['surface_bits'] // 8} B != "
+                       f"expected (frozen R) {expected} B")
 
     m = ResidencyMap(meta, image_time, unit_bytes_arr, offsets, flat)
     if not math.isclose(m.t_total, meta["t_total_ms"], rel_tol=REL_TOL):
@@ -361,8 +367,10 @@ def _write_synthetic(prefix: str, unit_bytes: int, image_time, unit_bytes_arr,
 def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         p = str(Path(tmp) / "m")
-        ranges = [{"allocation_id": "w", "first_unit": 0, "units": 3},
-                  {"allocation_id": "s", "first_unit": 3, "units": 1}]
+        ranges = [{"allocation_id": "w", "first_unit": 0, "units": 3,
+                   "size_bytes": 96},
+                  {"allocation_id": "s", "first_unit": 3, "units": 1,
+                   "size_bytes": 8}]
         times = [1.0] * 9 + [11.0]  # total 20
         periods = [[(0, 9)], [], [(0, 2), (7, 9)], [(4, 9)]]
         _write_synthetic(p, 32, times, [32, 32, 32, 8], periods, ranges)
@@ -386,13 +394,29 @@ def self_test() -> int:
         _write_synthetic(dl, 32, [1.0] * 16, [32, 32],
                          [[(0, 1), (4, 5), (8, 9), (12, 13)],
                           [(1, 2), (5, 6), (11, 12), (15, 15)]],
-                         [{"allocation_id": "w", "first_unit": 0, "units": 2}])
+                         [{"allocation_id": "w", "first_unit": 0, "units": 2,
+                           "size_bytes": 64}])
         meta = json.loads(Path(dl + "_residency.json").read_text())
         meta["stride"] = 2
         meta["observation_window_images"] = 2
         Path(dl + "_residency.json").write_text(json.dumps(meta))
         d = direction_lock(load_map(dl), min_periods=4)["per_range"]["w"]
         assert d["forward_locked"] == 1 and d["mixed"] == 1, d
+        # expected surface (frozen R) must match
+        meta = json.loads(Path(p + "_residency.json").read_text())
+        meta["expected_surface_bytes"] = 104
+        Path(p + "_residency.json").write_text(json.dumps(meta))
+        load_map(p)
+        meta["expected_surface_bytes"] = 105
+        Path(p + "_residency.json").write_text(json.dumps(meta))
+        try:
+            load_map(p)
+        except MapError:
+            pass
+        else:
+            raise AssertionError("surface != expected must be refused")
+        meta["expected_surface_bytes"] = 0
+        Path(p + "_residency.json").write_text(json.dumps(meta))
         # fail-closed paths
         for kind in ("tamper", "neutral", "overlap", "sha"):
             q = str(Path(tmp) / kind)
