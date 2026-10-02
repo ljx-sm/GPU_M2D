@@ -96,6 +96,7 @@ private:
     int block_threads_{0};
     std::uint16_t* device_latency_{nullptr};
     std::vector<std::uint16_t> host_latency_;
+    std::vector<std::uint16_t> compact_;
     cudaEvent_t start_{nullptr};
     cudaEvent_t stop_{nullptr};
 };

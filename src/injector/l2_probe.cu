@@ -129,11 +129,20 @@ float L2Prober::probe(cudaStream_t stream, std::uint64_t sweep_index) {
                                     stream>>>(params, device_latency_);
     check_cuda(cudaGetLastError(), "launch L2 probe");
     check_cuda(cudaEventRecord(stop_, stream), "record probe stop");
-    check_cuda(cudaMemcpyAsync(host_latency_.data(), device_latency_,
-                               total_units_ * sizeof(std::uint16_t),
+    // Compact output: only the n probed units' latencies come back (the
+    // copy reads n * 2 bytes of device memory, not the whole array), then
+    // scatter to the per-unit host array.
+    const std::uint64_t n =
+        total_units_ > phase_ ? (total_units_ - phase_ + stride_ - 1) / stride_ : 0;
+    compact_.resize(n);
+    check_cuda(cudaMemcpyAsync(compact_.data(), device_latency_,
+                               n * sizeof(std::uint16_t),
                                cudaMemcpyDeviceToHost, stream),
                "copy probe latencies");
     check_cuda(cudaStreamSynchronize(stream), "synchronize probe");
+    for (std::uint64_t k = 0; k < n; ++k) {
+        host_latency_[phase_ + k * stride_] = compact_[k];
+    }
     float ms = 0.0F;
     check_cuda(cudaEventElapsedTime(&ms, start_, stop_), "probe elapsed time");
     return ms;

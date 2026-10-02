@@ -23,6 +23,10 @@
 //     in calibration.
 //   - Range descriptors travel as a by-value kernel parameter (no device
 //     table to read), so the probe's own L2 footprint is the output array.
+//     The output is COMPACT (latency of the k-th probed unit at out[k]):
+//     a scattered out[u] layout dirtied one L2 sector per probed unit at
+//     stride >= 16 (5.9 MB per ViT-B sweep), evicting workload lines
+//     mid-sweep (G8-T1 finding).
 //   - A probe that MISSES loads the line into L2 (unavoidable for any
 //     load-based probe); see the plan's perturbation note.
 
@@ -117,10 +121,11 @@ timed_load_cg (const std::uint8_t *p, volatile std::uint32_t *sink)
   return dt > 0xffffffffull ? 0xffffffffu : static_cast<std::uint32_t> (dt);
 }
 
-// Grid-stride probe of the selected units (u % stride == phase); latency
-// (cycles, saturated to 16 bits) written at each probed unit's global
-// index, other entries untouched. Launch with blockDim.x <= 1024 and
-// dynamic shared memory = blockDim.x * sizeof(uint32_t).
+// Grid-stride probe of the selected units (u % stride == phase); the
+// latency (cycles, saturated to 16 bits) of unit u = phase + k * stride is
+// written COMPACTLY at out[k], k = 0 .. n-1 (n = number of probed units).
+// Launch with blockDim.x <= 1024 and dynamic shared memory =
+// blockDim.x * sizeof(uint32_t).
 __global__ void
 probe_latency_kernel (ProbeRanges ranges, std::uint16_t *__restrict__ out)
 {
@@ -150,7 +155,7 @@ probe_latency_kernel (ProbeRanges ranges, std::uint16_t *__restrict__ out)
       const std::uint64_t k = ranges.reverse ? n - 1 - g : g;
       const std::uint64_t u = ranges.phase + k * sweep_stride;
       const std::uint32_t dt = timed_load_cg (line_address (ranges, u), sink);
-      out[u] = dt > 0xffffu ? 0xffffu : static_cast<std::uint16_t> (dt);
+      out[k] = dt > 0xffffu ? 0xffffu : static_cast<std::uint16_t> (dt);
     }
 }
 
