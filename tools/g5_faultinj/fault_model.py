@@ -117,6 +117,15 @@ WORKLOADS = {
     # match -- no re-bootstrap). All B < 3000 so every literal is
     # an exhaustive-solver literal.
     "g7v2_imagenet1k_resnet50": {
+        # G8 cache-flip lifetime classes of the TRT-internal allocations
+        # (tools/g8_cache/derive_alloc_classes.py over this workload's
+        # 9 VERIFIED G7-v2 campaign runs: read-only = every
+        # restore_check `exact`); bindings (TENSOR:*) are engine-written
+        # by definition and resolved by label at sampling time.
+        "cache_alloc_classes": {
+            "read_only": ('trt-internal-0', 'trt-internal-1', 'trt-internal-2'),
+            "engine_written": ('trt-internal-3',),
+        },
         "resident_bytes_nominal": 28_832_268,
         "levels": [
             {"level": "L1", "ber": 1e-08, "bits": 2, "s": 2, "d": 0, "t": 0},
@@ -167,6 +176,15 @@ WORKLOADS = {
     # EXHAUSTIVE-solver literal. Frozen in place by
     # tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_mobilenetv3_large_100": {
+        # G8 cache-flip lifetime classes of the TRT-internal allocations
+        # (tools/g8_cache/derive_alloc_classes.py over this workload's
+        # 7 VERIFIED G7-v2 campaign runs: read-only = every
+        # restore_check `exact`); bindings (TENSOR:*) are engine-written
+        # by definition and resolved by label at sampling time.
+        "cache_alloc_classes": {
+            "read_only": ('trt-internal-0', 'trt-internal-1', 'trt-internal-2', 'trt-internal-3', 'trt-internal-4'),
+            "engine_written": ('trt-internal-7',),
+        },
         "resident_bytes_nominal": 9_087_912,
         "surface_excludes": ("trt-internal-5", "trt-internal-6"),
         "levels": [
@@ -201,6 +219,15 @@ WORKLOADS = {
     # cross-checked against the windowed path). Frozen in place
     # by tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_efficientnet_b0": {
+        # G8 cache-flip lifetime classes of the TRT-internal allocations
+        # (tools/g8_cache/derive_alloc_classes.py over this workload's
+        # 7 VERIFIED G7-v2 campaign runs: read-only = every
+        # restore_check `exact`); bindings (TENSOR:*) are engine-written
+        # by definition and resolved by label at sampling time.
+        "cache_alloc_classes": {
+            "read_only": ('trt-internal-0', 'trt-internal-1', 'trt-internal-2', 'trt-internal-3'),
+            "engine_written": ('trt-internal-4',),
+        },
         "resident_bytes_nominal": 17_144_232,
         "levels": [
             {"level": "L1", "ber": 1e-07, "bits": 14, "s": 6, "d": 1, "t": 2},
@@ -235,6 +262,15 @@ WORKLOADS = {
     # cross-checked against the windowed path). Frozen in place
     # by tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_vit_base_patch16_224": {
+        # G8 cache-flip lifetime classes of the TRT-internal allocations
+        # (tools/g8_cache/derive_alloc_classes.py over this workload's
+        # 7 VERIFIED G7-v2 campaign runs: read-only = every
+        # restore_check `exact`); bindings (TENSOR:*) are engine-written
+        # by definition and resolved by label at sampling time.
+        "cache_alloc_classes": {
+            "read_only": ('trt-internal-0', 'trt-internal-1', 'trt-internal-2', 'trt-internal-3'),
+            "engine_written": ('trt-internal-4',),
+        },
         "resident_bytes_nominal": 93_867_728,
         "levels": [
             {"level": "L1", "ber": 1e-07, "bits": 75, "s": 28, "d": 10,
@@ -271,6 +307,15 @@ WORKLOADS = {
     # cross-checked against the windowed path). Frozen in place
     # by tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_deit_small_patch16_224": {
+        # G8 cache-flip lifetime classes of the TRT-internal allocations
+        # (tools/g8_cache/derive_alloc_classes.py over this workload's
+        # 7 VERIFIED G7-v2 campaign runs: read-only = every
+        # restore_check `exact`); bindings (TENSOR:*) are engine-written
+        # by definition and resolved by label at sampling time.
+        "cache_alloc_classes": {
+            "read_only": ('trt-internal-0', 'trt-internal-1', 'trt-internal-2', 'trt-internal-3'),
+            "engine_written": ('trt-internal-4',),
+        },
         "resident_bytes_nominal": 26_010_832,
         "levels": [
             {"level": "L1", "ber": 1e-07, "bits": 21, "s": 8, "d": 2, "t": 3},
@@ -306,6 +351,15 @@ WORKLOADS = {
     # cross-checked against the windowed path). Frozen in place
     # by tools/g7_prep/freeze_g7v2_workload.py.
     "g7v2_imagenet1k_swin_tiny_patch4_window7_224": {
+        # G8 cache-flip lifetime classes of the TRT-internal allocations
+        # (tools/g8_cache/derive_alloc_classes.py over this workload's
+        # 7 VERIFIED G7-v2 campaign runs: read-only = every
+        # restore_check `exact`); bindings (TENSOR:*) are engine-written
+        # by definition and resolved by label at sampling time.
+        "cache_alloc_classes": {
+            "read_only": ('trt-internal-0', 'trt-internal-1', 'trt-internal-2', 'trt-internal-3'),
+            "engine_written": ('trt-internal-4',),
+        },
         "resident_bytes_nominal": 43_799_616,
         "levels": [
             {"level": "L1", "ber": 1e-07, "bits": 35, "s": 13, "d": 5, "t": 4},
@@ -919,6 +973,18 @@ def self_test() -> int:
     except ModelError:
         pass
 
+    # G8 cache classes: disjoint, TRT-internal only, never an excluded
+    # allocation
+    for workload_name, entry in WORKLOADS.items():
+        classes = entry.get("cache_alloc_classes")
+        if classes is None:
+            continue
+        ro = set(classes["read_only"])
+        ew = set(classes["engine_written"])
+        assert not ro & ew, workload_name
+        assert all(a.startswith("trt-internal-") for a in ro | ew), workload_name
+        assert not (ro | ew) & set(entry.get("surface_excludes", ())), \
+            workload_name
     # fault-surface scoping: a workload with surface_excludes never
     # samples those allocations (and never aliases the caller's list);
     # a workload without the field keeps the FULL residency, identity
