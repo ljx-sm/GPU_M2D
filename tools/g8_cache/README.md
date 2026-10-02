@@ -3,7 +3,8 @@
 Tooling for the G8 L2 cache fault plan
 ([docs/G8_CACHE_FAULT_PLAN.md](../../docs/G8_CACHE_FAULT_PLAN.md)).
 **G8-T0 status (2026-10-01, GPU 0): V6 probe calibration PASS, V7 hook
-neutrality PASS.**
+neutrality PASS. G8-T1 status (2026-10-02): residency maps built and
+verified, V9 reproducibility PASS (last section).**
 
 ## Probe kernel
 
@@ -23,6 +24,9 @@ calibrated threshold.
   its lanes' data has returned, so with 32 active lanes every lane would
   time the *slowest* of 32 units. Concurrency therefore comes from many
   single-lane warps: `probes_per_sm`, 16 in production.
+- **Compact output.** The k-th probed unit's latency goes to `out[k]`,
+  and only those entries are copied back. A scattered `out[u]` layout
+  dirtied one L2 sector per probed unit (T1 finding).
 - **Staggered sub-sampling** (`stride`, `phase`). Sweep *s* probes units
   `u % stride == s % stride`, so one sweep's own L2 fill traffic is about
   1/stride of the surface. `reverse` probes in descending order and serves
@@ -187,3 +191,120 @@ threshold 440, k = 1):
 Artifacts (untracked) are under `artifacts/g8/t0/`. The host image cache
 is under `artifacts/g8/image_cache/`; its key includes the runner binary,
 so stale files are deleted after rebuilds.
+
+## T1 — residency map (`--l2-probe-map 1`, `residency_map.py`)
+
+**Status (2026-10-02, GPU 0 idle): residency maps built and verified for
+ResNet-50 v2 and ViT-B; reproducibility gate V9 PASS.**
+
+### What it produces
+
+The runner's probe pass, with `--l2-probe-map 1`, feeds every probed
+unit's hit/miss into `gpu_m2d::ResidencyMapBuilder`
+(`include/gpu_m2d/residency_map.hpp`, unit test `ctest -R
+residency_map`). The builder turns the observations into **residency
+periods** `[start, end]` per unit:
+
+- a hit opens a period (back to image 0 on a unit's first observation);
+- a miss at boundary *b* closes it at *b − 1*;
+- open periods close at the last image.
+
+Each pass writes `PREFIX_residency.bin` and `PREFIX_residency.json`:
+
+- per-image GPU inference times;
+- per-unit resident bytes;
+- the periods;
+- T_total and R_eff_bits = Σ bits_ℓ·T_ℓ / T_total;
+- the bin's sha256.
+
+`--l2-probe-passes N` repeats the pass N times in one process.
+
+`tools/g8_cache/residency_map.py` is the stdlib reader the T2
+orchestrator will use. It is fail-closed:
+
+- it verifies the sha256, the structure and the neutrality;
+- it **independently recomputes T_total and R_eff_bits** and requires them
+  to equal the runner's values.
+
+```bash
+python3 tools/g8_cache/residency_map.py summary  <prefix>...
+python3 tools/g8_cache/residency_map.py compare  <prefix_a> <prefix_b>
+python3 tools/g8_cache/residency_map.py diagnose <prefix>...   # probe-order artifact check
+```
+
+Production settings (user decisions 2026-10-02):
+
+- **probe unit:** 32-B sector;
+- **probing:** every image (k = 1), with the direction alternating per
+  unit observation;
+- **stride:** 1 for surfaces smaller than L2, **64 for ViT-B** (see
+  below);
+- **probe:** 1 lane/warp, 16 probes/SM, threshold 440 cycles. V6 was
+  re-checked after the kernel change: gap [400, 464), PASS.
+
+### Two probe-footprint artifacts found and handled in T1
+
+T1 measures per sector, and that resolution exposed artifacts that T0's
+allocation-level counts had hidden.
+
+1. **Scattered output writes (fixed).** The probe wrote each latency at
+   `out[u]`. At stride 16 those 2-B writes were 32 B apart, so every probed
+   unit dirtied its own L2 sector: 5.9 MB per ViT-B sweep, interleaved with
+   the timed loads.
+   - **Fix:** the output is now compact (`out[k]`), and only the probed
+     entries are copied back.
+   - **Effect on ViT-B:** reverse-locked weight sectors fell from 36,218 to
+     88, and R_eff rose from 69.05 to 72.18 MB.
+2. **The sweep's own miss fills (bounded by the stride).** In a full L2
+   (ViT-B) every probe miss fills a sector and evicts another, sometimes
+   one the sweep has not probed yet. With alternating direction, such a
+   unit oscillates: it reads resident only on forward, or only on reverse,
+   observations. `diagnose` counts these units, and they shrink with
+   sweep size:
+
+   | ViT-B stride | Units per sweep | Weights direction-locked | Scratch direction-locked | R_eff |
+   | --- | --- | --- | --- | --- |
+   | 16 | 183 K | 4.97 % | 12.7 % | 72.18 MB |
+   | **64** | 46 K | **0.77 %** | **5.3 %** | **74.21 MB** |
+   | 256 | 11 K | 0.25 % | 0.79 % | 74.56 MB |
+
+   - **Stride 64 is the chosen trade-off.** Each unit is observed every 64
+     images (156 observations per run), and R_eff is within 0.5 % of the
+     stride-256 value.
+   - **The remaining bias is in one direction.** A hit is reliable
+     evidence, while a miss can be an artifact, so the true R_eff is at or
+     slightly above the measured value.
+   - **ResNet-50 is not affected.** Its whole surface is resident, so it
+     has almost no misses and the stride-1 maps carry no artifact.
+
+### Result — final maps, GPU 0 idle, 2026-10-02
+
+Each model ran 2 passes in one process plus a second process, all
+neutral, with R_eff recomputed and matching the runner.
+
+| | ResNet-50 v2 (stride 1) | ViT-B (stride 64) |
+| --- | --- | --- |
+| Units (32-B sectors) | 901,011 | 2,933,369 |
+| R_eff | **28.832 MB = 100.00 %** of R | **74.212 MB = 79.06 %** of R (≈ the L2's effective capacity) |
+| Weights (`trt-internal-0`) | 100 % of sectors always resident | 79.1 % always, 19.7 % never, 1.1 % partial (79.9 % of the time) |
+| Scratch | 99.3 % always, 0.7 % partial (~2 periods/unit) | 71.2 % always, 22.5 % never, 6.2 % partial |
+| Input binding, small buffers | resident | never resident at image boundaries |
+| **V9** same process: same class / R_eff difference | 99.98 % / 0.00002 % | 99.77 % / 0.0001 % |
+| **V9** cross process: same class / R_eff difference | 99.99 % / 0.0001 % | 99.77 % / 0.0004 % |
+| Map size (bin) | 17 MB | 64 MB |
+| Wall time per pass (incl. clean pass) | ~2.3 min | ~4 min |
+
+**What the maps mean for T2:**
+
+- **ResNet-50 v2** on an idle GPU 0:
+  `n_cache = round(BER_cache × R_bits)`, flips land uniformly over the
+  surface, and every read-only flip lasts until the trial ends.
+- **ViT-B**:
+  - flips concentrate on the ~80 % of weight sectors that stay resident;
+  - the ~20 % that are never resident at image boundaries receive none;
+  - the input binding, which is streamed in and evicted within each
+    inference, also receives none. That is the plan's stated image-level
+    time-resolution limit.
+
+Artifacts (untracked) are under `artifacts/g8/t1/`, including the
+superseded stride-16/64/256 comparison maps `vit_compact*`.

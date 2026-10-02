@@ -28,7 +28,15 @@ weights for residency-weighted sampling). CLI:
 
     residency_map.py summary PREFIX [PREFIX ...]
     residency_map.py compare PREFIX_A PREFIX_B
+    residency_map.py diagnose PREFIX [PREFIX ...]
     residency_map.py --self-test
+
+`diagnose` checks the probe-order artifact found in G8-T1: with
+--l2-probe-alternate each unit's successive observations flip probe
+direction, so a unit whose state is decided by the SWEEP (the sweep's
+own fills evicting it before it is probed) oscillates resident/absent and
+every one of its resident periods starts at an observation of the same
+direction. Such units are counted as direction-locked.
 
 Exit codes: 0 ok, 2 verification failure, 1 usage/input error.
 """
@@ -277,6 +285,43 @@ def compare(a: ResidencyMap, b: ResidencyMap) -> dict:
     }
 
 
+def direction_lock(m: ResidencyMap, min_periods: int | None = None) -> dict:
+    """Per allocation: units with >= min_periods periods whose resident
+    periods all start on forward (or all on reverse) observations.
+
+    Observation schedule (runner, --l2-probe-alternate): sweep s happens
+    before image s * every and probes units u % stride == s % stride in
+    reverse iff (s // stride) is odd; a period starting at image b > 0
+    began at the sweep b // every."""
+    meta = m.meta
+    if not meta.get("alternate"):
+        raise MapError("direction-lock diagnosis needs an --l2-probe-alternate map")
+    every, stride = meta["probe_every"], meta["stride"]
+    observations = m.images // (every * stride)
+    if min_periods is None:
+        # an oscillating unit has ~observations / 2 periods
+        min_periods = max(4, observations // 8)
+    out = {}
+    for r in m.ranges:
+        fwd = rev = mixed = 0
+        for u in range(r["first_unit"], r["first_unit"] + r["units"]):
+            lo, hi = m.offsets[u], m.offsets[u + 1]
+            if hi - lo < min_periods:
+                continue
+            parities = {((m.flat[2 * p] // every) // stride) % 2
+                        for p in range(lo, hi) if m.flat[2 * p] > 0}
+            if parities == {0}:
+                fwd += 1
+            elif parities == {1}:
+                rev += 1
+            else:
+                mixed += 1
+        out[r["allocation_id"]] = {"units": r["units"], "forward_locked": fwd,
+                                   "reverse_locked": rev, "mixed": mixed}
+    return {"min_periods": min_periods, "observations": observations,
+            "per_range": out}
+
+
 def _write_synthetic(prefix: str, unit_bytes: int, image_time, unit_bytes_arr,
                      periods_per_unit, ranges, neutral=0, tamper=False):
     flat = []
@@ -333,6 +378,21 @@ def self_test() -> int:
         # identical maps compare perfectly
         c = compare(m, load_map(p))
         assert c["mean_abs_diff"] == 0 and c["same_class"] == 1.0
+        # direction lock: stride 2, every 1 -> sweep s probes in reverse
+        # iff (s // 2) is odd. Unit 0 (phase 0) is resident only after
+        # forward observations (starts 0, 4, 8, 12); unit 1 (phase 1) has
+        # periods starting on forward (1, 5) and reverse (11, 15) sweeps.
+        dl = str(Path(tmp) / "dl")
+        _write_synthetic(dl, 32, [1.0] * 16, [32, 32],
+                         [[(0, 1), (4, 5), (8, 9), (12, 13)],
+                          [(1, 2), (5, 6), (11, 12), (15, 15)]],
+                         [{"allocation_id": "w", "first_unit": 0, "units": 2}])
+        meta = json.loads(Path(dl + "_residency.json").read_text())
+        meta["stride"] = 2
+        meta["observation_window_images"] = 2
+        Path(dl + "_residency.json").write_text(json.dumps(meta))
+        d = direction_lock(load_map(dl), min_periods=4)["per_range"]["w"]
+        assert d["forward_locked"] == 1 and d["mixed"] == 1, d
         # fail-closed paths
         for kind in ("tamper", "neutral", "overlap", "sha"):
             q = str(Path(tmp) / kind)
@@ -359,7 +419,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", nargs="?", choices=("summary", "compare"))
+    parser.add_argument("command", nargs="?",
+                        choices=("summary", "compare", "diagnose"))
     parser.add_argument("prefix", nargs="*")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -372,6 +433,18 @@ def main() -> int:
     except MapError as exc:
         print(f"G8_RESIDENCY_MAP_FAIL {exc}")
         return 2
+    if args.command == "diagnose":
+        for prefix, m in zip(args.prefix, maps):
+            d = direction_lock(m)
+            print(f"== {prefix}  (observations/unit {d['observations']}, "
+                  f"oscillation threshold {d['min_periods']} periods)")
+            for alloc, x in d["per_range"].items():
+                if x["forward_locked"] or x["reverse_locked"] or x["mixed"]:
+                    print(f"  {alloc:22s} units {x['units']:9d}  forward-locked "
+                          f"{x['forward_locked']:8d}  reverse-locked "
+                          f"{x['reverse_locked']:8d}  mixed {x['mixed']:6d}  "
+                          f"({100 * (x['forward_locked'] + x['reverse_locked']) / x['units']:.3f} % locked)")
+        return 0
     if args.command == "summary":
         for prefix, m in zip(args.prefix, maps):
             print_summary(prefix, m)
