@@ -3137,6 +3137,20 @@ int main(int argc, char** argv) {
             std::vector<CacheRecord> cache_records;
             std::vector<std::vector<std::size_t>> cache_starts(images_total);
             std::vector<std::size_t> cache_active;
+            // Per-byte state of the active cache flips: two independent
+            // upsets may hit different bits of one byte with overlapping
+            // lifetimes (the sampler only redraws same-bit overlaps). The
+            // byte must then read pristine ^ active_mask at all times
+            // (pristine = its value before the first active flip, DRAM
+            // flips included), whatever order the flips are removed in.
+            struct CacheByteState {
+                std::uint8_t pristine{0};
+                std::uint8_t active_mask{0};
+                std::size_t active_count{0};
+                bool overwritten{false};  // engine-written: engine rewrote it
+            };
+            std::map<std::pair<std::string, std::uint64_t>, CacheByteState>
+                cache_bytes;
             if (!cache_trials.empty()) {
                 for (const CacheSite& site : cache_trials[trial_index]) {
                     CacheRecord record;
@@ -3161,6 +3175,27 @@ int main(int argc, char** argv) {
                                                  record.site.target.target_id +
                                                  ": flip verification failed");
                     }
+                    const auto key = std::make_pair(record.site.target.allocation_id,
+                                                    static_cast<std::uint64_t>(
+                                                        record.site.target.byte_offset));
+                    auto found = cache_bytes.find(key);
+                    if (found == cache_bytes.end()) {
+                        found = cache_bytes.emplace(key, CacheByteState{}).first;
+                        found->second.pristine = record.flip.before;
+                    } else if (!found->second.overwritten &&
+                               record.flip.before !=
+                                   static_cast<std::uint8_t>(
+                                       found->second.pristine ^
+                                       found->second.active_mask)) {
+                        if (record.site.read_only) {
+                            throw std::runtime_error(
+                                "cache site " + record.site.target.target_id +
+                                ": read-only byte changed during its lifetime");
+                        }
+                        found->second.overwritten = true;
+                    }
+                    found->second.active_mask ^= record.flip.xor_mask;
+                    found->second.active_count++;
                     record.applied = true;
                     record.apply_image = image;
                     cache_active.push_back(index);
@@ -3177,9 +3212,12 @@ int main(int argc, char** argv) {
             };
             // Removal after an image: every active site whose last image it
             // was, or all of them when the trial aborts (DUE). Read-only:
-            // re-XOR, must land exactly on the pre-cache value (fail-closed:
-            // nothing else writes read-only data). Engine-written: restore
-            // only if the byte still holds the flipped value.
+            // re-XOR; the byte must hold pristine ^ active_mask before and
+            // pristine ^ (active_mask ^ mask) after (fail-closed: nothing
+            // else writes read-only data). For a byte with a single active
+            // flip this is exactly "flipped value -> pre-cache value".
+            // Engine-written: restore only if the byte still holds
+            // pristine ^ active_mask (the engine did not rewrite it).
             auto remove_cache = [&](std::size_t image, bool all) {
                 std::vector<std::size_t> keep;
                 for (std::size_t index : cache_active) {
@@ -3197,14 +3235,27 @@ int main(int argc, char** argv) {
                                "read cache site before removal");
                     record.remove_before = current;
                     record.removal_image = image;
-                    if (record.site.read_only || current == record.flip.after) {
+                    auto state = cache_bytes.find(std::make_pair(
+                        record.site.target.allocation_id,
+                        static_cast<std::uint64_t>(record.site.target.byte_offset)));
+                    if (state == cache_bytes.end()) {
+                        throw std::runtime_error("cache site " +
+                                                 record.site.target.target_id +
+                                                 ": no byte state at removal");
+                    }
+                    CacheByteState& byte_state = state->second;
+                    const auto expected = static_cast<std::uint8_t>(
+                        byte_state.pristine ^ byte_state.active_mask);
+                    const bool intact = !byte_state.overwritten && current == expected;
+                    if (record.site.read_only || intact) {
                         const auto unflip = gpu_m2d::flip_device_bit(
                             ref.base, ref.size_bytes, record.site.target.byte_offset,
                             static_cast<std::uint8_t>(record.site.target.bit_in_byte));
                         record.remove_after = unflip.after;
                         if (record.site.read_only &&
-                            (current != record.flip.after ||
-                             unflip.after != record.flip.before)) {
+                            (!intact ||
+                             unflip.after != static_cast<std::uint8_t>(
+                                                 expected ^ record.flip.xor_mask))) {
                             throw std::runtime_error(
                                 "cache site " + record.site.target.target_id +
                                 ": read-only byte changed during its lifetime");
@@ -3213,6 +3264,17 @@ int main(int argc, char** argv) {
                     } else {
                         record.remove_after = current;
                         record.removal = "overwritten";
+                        byte_state.overwritten = true;
+                    }
+                    byte_state.active_mask ^= record.flip.xor_mask;
+                    if (--byte_state.active_count == 0) {
+                        if (record.site.read_only &&
+                            record.remove_after != byte_state.pristine) {
+                            throw std::runtime_error(
+                                "cache site " + record.site.target.target_id +
+                                ": read-only byte not back to its pre-cache value");
+                        }
+                        cache_bytes.erase(state);
                     }
                     observer.event_with(
                         "CACHE_REMOVED",

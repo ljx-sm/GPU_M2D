@@ -250,6 +250,14 @@ pristine original.
   byte still holds the flipped value. **Input-binding** cache flips are
   applied after the per-image input copy, the same way the runner already
   re-applies input-binding DRAM faults.
+- **Several flips in one byte** (different bits, overlapping lifetimes;
+  same-bit overlaps are redrawn by the sampler). These are independent
+  upsets and are kept. The runner tracks each byte's pre-cache value P
+  and the XOR of its active masks M. The byte must read `P ^ M` at every
+  apply and removal, whatever the removal order, and a read-only byte is
+  back to P when its last flip is removed. With one flip this is exactly
+  the single-flip rule above. Added 2026-10-03, after ResNet-50 L7 trial
+  18 failed closed on such a pair (§15).
 
 ### 3.7 Trial loop
 
@@ -419,7 +427,9 @@ Reported metrics:
   pass bit-identically (built into §4).
 - **V8 Apply/remove exactness**: every cache apply and remove satisfies
   `after == before ^ mask`. After a read-only removal the byte equals its
-  pre-cache value, including the DRAM-overlap case.
+  pre-cache value, including the DRAM-overlap case. When several flips
+  share a byte, the post-run verifier replays them per byte in the
+  runner's order (`replay_cache_bytes`, §3.6).
 - **V9 Residency stability**: in T1, two passes in the same process agree,
   and the cross-process variation is reported.
 - **V10 Plan consistency**: every cache site starts inside a measured
@@ -781,3 +791,43 @@ reproduced the clean output.
 **Next (T4):** DRAM + L2 campaigns per model at the frozen levels (100
 trials × 10K images, `--cache-faults`), compared against the existing
 DRAM-only runs.
+
+## 15. G8-T4 progress (from 2026-10-03, GPU 0)
+
+ResNet-50 v2 (`scripts/run_g8_t4.sh resnet50`, run directories under
+`artifacts/g8/t4/campaign/`):
+
+| Level (BER) | n_cache / trial | Status |
+| --- | --- | --- |
+| L3 (1e-7) | 23 | VERIFIED |
+| L4 (5e-7) | 115 | VERIFIED |
+| L5 (1e-6) | 231 | VERIFIED |
+| L6 (3e-6) | 692 | VERIFIED |
+| L7–L9 | 1,153 / 1,615 / 2,307 | re-run after the fix below |
+
+**L7 fail-closed and fix (2026-10-03).**
+- **What happened.** Trial 18 drew two read-only cache flips on
+  different bits of the same byte with overlapping lifetimes: bit 4 from
+  image 5,824 and bit 2 from image 9,673, both resident to image 9,999.
+  The runner removes flips in application order. When it removed the
+  first flip, it found the byte still carrying the second one, so its
+  per-site check ("re-XOR lands on this flip's pre-cache value") threw.
+  The orchestrator then failed the level closed.
+- **Why now.** Such a pair is legitimate: two independent upsets. The
+  per-site checks had assumed one active flip per byte. The chance of a
+  pair grows with n_cache²: about 2 % per trial at L7, and none occurred
+  in L3–L6 (checked: zero same-byte groups).
+- **Fix.** The runner and the post-run verifier now treat a byte with
+  several active flips as P ^ M (§3.6). The runner also gives the same
+  treatment to engine-written bytes, where the old conditional restore
+  could have misjudged such a pair. With one flip per byte the behaviour
+  is unchanged, so L3–L6 stay valid as run.
+- **Validation.**
+  - New self-tests for FIFO, LIFO, corrupted and engine-written pairs;
+    ctest 4/4.
+  - A live test: ResNet-50, 2 trials, `--cache-ber 1e-4` (23,066 flips
+    per trial), under `artifacts/g8/t4_fixtest/`. It contained 16
+    overlapping same-byte pairs and finished G5_CAMPAIGN_VERIFIED.
+- **Bookkeeping.** The failed L7 run was moved to `artifacts/g8/t4/failed/`.
+  L7–L9 run with the rebuilt runner, so their summaries carry a different
+  `runner_sha256` from L3–L6.

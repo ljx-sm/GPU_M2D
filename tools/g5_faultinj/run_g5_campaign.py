@@ -483,7 +483,10 @@ def verify_cache_rows(cache_campaign: list[list[dict]], rows: list[dict],
       - read-only: re_xor back to exactly the pre-cache value;
         engine-written: restored (back to the pre-cache value) or
         overwritten (the engine rewrote the byte);
-      - a site the aborted trial never reached: not applied."""
+      - a site the aborted trial never reached: not applied.
+    Several flips may share one byte (different bits, overlapping
+    lifetimes): the per-row checks are single-bit XORs, and the byte-level
+    values are checked by replay_cache_bytes in the runner's order."""
     failures: list[str] = []
     by_trial: dict[int, list[dict]] = {}
     for row in rows:
@@ -500,6 +503,7 @@ def verify_cache_rows(cache_campaign: list[list[dict]], rows: list[dict],
             continue
         last_eval = int(trow["images_evaluated"]) - 1
         due = trow["injected_outcome"] == "DUE_INVALID_OUTPUT"
+        replay: list[tuple[dict, dict]] = []
         for site, row in zip(sites, got):
             tag = f"trial {t} cache {site['cache_index']}"
             mask = 1 << site["bit_in_byte"]
@@ -541,19 +545,85 @@ def verify_cache_rows(cache_campaign: list[list[dict]], rows: list[dict],
             r_before, r_after = int(row["remove_before"]), \
                 int(row["remove_after"])
             if site["cache_class"] == cache_model.READ_ONLY:
-                if row["removal"] != "re_xor" or r_before != after or \
-                        r_after != before:
-                    failures.append(f"{tag}: read-only removal must re-XOR "
-                                    "to the pre-cache value")
+                if row["removal"] != "re_xor" or r_after != r_before ^ mask:
+                    failures.append(f"{tag}: read-only removal must re-XOR")
+                    continue
             elif row["removal"] == "restored":
-                if r_before != after or r_after != before:
+                if r_after != r_before ^ mask:
                     failures.append(f"{tag}: conditional restore inconsistent")
+                    continue
             elif row["removal"] == "overwritten":
-                if r_before == after or r_after != r_before:
-                    failures.append(f"{tag}: 'overwritten' but the byte still "
-                                    "held the flipped value")
+                if r_after != r_before:
+                    failures.append(f"{tag}: 'overwritten' must leave the "
+                                    "byte untouched")
+                    continue
             else:
                 failures.append(f"{tag}: bad removal {row['removal']!r}")
+                continue
+            replay.append((site, row))
+        failures += replay_cache_bytes(t, replay)
+    return failures
+
+
+def replay_cache_bytes(trial: int, applied: list[tuple[dict, dict]]
+                       ) -> list[str]:
+    """Replay one trial's applied cache flips per byte in the runner's
+    order: at each image, applies (cache_index order) precede the
+    inference and removals follow it in application order (apply image,
+    then cache_index). A byte with active flips must read pristine ^
+    active_mask (pristine = its value before the first active flip):
+    every apply 'before' and every removal 'remove_before' equals the
+    replayed value -- except on an engine-written byte the engine rewrote
+    ('overwritten', after which the byte is no longer tracked) -- and a
+    read-only byte returns to pristine when its last flip is removed. With
+    one flip per byte this is exactly r_before == after, r_after == before."""
+    failures: list[str] = []
+    ops = []
+    for site, row in applied:
+        ops.append(((site["start_image"], 0, site["cache_index"]),
+                    "apply", site, row))
+        ops.append(((int(row["removal_image"]), 1, site["start_image"],
+                     site["cache_index"]), "remove", site, row))
+    ops.sort(key=lambda op: op[0])
+    state: dict[tuple[str, int], dict] = {}
+    for _, kind, site, row in ops:
+        key = (site["allocation_id"], site["byte_offset"])
+        read_only = site["cache_class"] == cache_model.READ_ONLY
+        tag = f"trial {trial} cache {site['cache_index']}"
+        byte = state.get(key)
+        if kind == "apply":
+            before = int(row["before"])
+            if byte is None:
+                byte = state[key] = {"pristine": before, "value": before,
+                                     "active": 0, "overwritten": False}
+            elif not byte["overwritten"] and before != byte["value"]:
+                if read_only:
+                    failures.append(f"{tag}: read-only byte changed before "
+                                    "this flip was applied")
+                byte["overwritten"] = True
+            byte["value"] = int(row["after"])
+            byte["active"] += 1
+            continue
+        if byte is None:
+            failures.append(f"{tag}: removed without an active flip")
+            continue
+        r_before, r_after = int(row["remove_before"]), int(row["remove_after"])
+        intact = not byte["overwritten"] and r_before == byte["value"]
+        if read_only and not intact:
+            failures.append(f"{tag}: read-only byte changed during its "
+                            "lifetime")
+        elif not read_only and (row["removal"] == "restored") != intact:
+            failures.append(f"{tag}: removal {row['removal']!r} disagrees "
+                            "with the byte's replayed value")
+        if row["removal"] == "overwritten":
+            byte["overwritten"] = True
+        byte["value"] = r_after
+        byte["active"] -= 1
+        if byte["active"] == 0:
+            if read_only and r_after != byte["pristine"]:
+                failures.append(f"{tag}: read-only byte not back to its "
+                                "pre-cache value")
+            del state[key]
     return failures
 
 
@@ -2605,6 +2675,45 @@ def self_test() -> int:
                verify_cache_rows(cache_camp, bad, full_trial))
     # a missing row is refused
     assert verify_cache_rows(cache_camp, good_rows[:2], full_trial)
+    # G8-T4 fix: two flips on different bits of ONE byte with overlapping
+    # lifetimes (the L7 trial-18 case: bit 4 from image 2, bit 2 from
+    # image 5, both removed at 9 in application order, i.e. FIFO)
+    sa = cache_site(0, 0, "read_only", 2, 9, byte=20, bit=4)
+    sb = cache_site(0, 1, "read_only", 5, 9, byte=20, bit=2)
+    pair = [[sa, sb]]
+    fifo = [cache_row(sa, before=238, remove_before=250, remove_after=234),
+            cache_row(sb, before=254, remove_before=234, remove_after=238)]
+    assert verify_cache_rows(pair, fifo, full_trial) == []
+    # LIFO (b removed first, at 7) is equally valid
+    sb7 = dict(sb, last_image=7)
+    lifo = [cache_row(sa, before=238, remove_before=254, remove_after=238),
+            cache_row(sb7, before=254, remove_before=250, remove_after=254)]
+    assert verify_cache_rows([[sa, sb7]], lifo, full_trial) == []
+    # a corrupted shared byte is still refused
+    bad = [fifo[0], cache_row(sb, before=254, remove_before=235,
+                              remove_after=239)]
+    assert any("read-only" in f for f in
+               verify_cache_rows(pair, bad, full_trial))
+    # ... and so is a second flip whose 'before' ignores the first one
+    bad = [fifo[0], cache_row(sb, before=238, remove_before=234,
+                              remove_after=238 ^ 4)]
+    assert verify_cache_rows(pair, bad, full_trial)
+    # engine-written pair in one image, both conditionally restored
+    ea = cache_site(0, 0, "engine_written", 4, 4, byte=30, bit=1)
+    eb = cache_site(0, 1, "engine_written", 4, 4, byte=30, bit=5)
+    e_rows = [cache_row(ea, before=0, remove_before=34, remove_after=32),
+              cache_row(eb, before=2, remove_before=32, remove_after=0)]
+    assert verify_cache_rows([[ea, eb]], e_rows, full_trial) == []
+    # the engine rewrote that byte: both 'overwritten' is valid, a restore
+    # after the rewrite is refused
+    e_over = [cache_row(ea, before=0, removal="overwritten",
+                        remove_before=99, remove_after=99),
+              cache_row(eb, before=2, removal="overwritten",
+                        remove_before=99, remove_after=99)]
+    assert verify_cache_rows([[ea, eb]], e_over, full_trial) == []
+    e_bad = [e_over[0], cache_row(eb, before=2, remove_before=99,
+                                  remove_after=99 ^ 32)]
+    assert verify_cache_rows([[ea, eb]], e_bad, full_trial)
     # events must match the applied rows one-to-one
     events = "".join(
         f"GPU_M2D_EVENT,event=CACHE_FLIPPED,trial_index=0,cache_index="
