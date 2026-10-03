@@ -496,6 +496,9 @@ struct Options {
     // orchestrator sampled from this process's residency map; applied
     // before the start image's inference, removed after the last one.
     std::string campaign_cache_work;
+    // explicit trial count of the campaign work (0 = implied by the rows);
+    // declared, a trial may have no DRAM sites (G8 SRAM-only campaigns)
+    std::size_t campaign_trials{0};
     // G7 workload parameterization. Defaults keep the G5 RESISC45 behavior
     // byte-identical; a G7 invocation overrides them from the model's
     // model_meta.json (the single source of preprocessing truth) via the
@@ -675,6 +678,11 @@ Options parse_options(int argc, char** argv) {
             options.campaign_release = value;
         } else if (key == "--campaign-cache-work") {
             options.campaign_cache_work = value;
+        } else if (key == "--campaign-trials") {
+            options.campaign_trials = std::stoull(value);
+            if (options.campaign_trials == 0) {
+                throw std::invalid_argument("--campaign-trials must be > 0");
+            }
         } else if (key == "--campaign-gate-timeout-seconds") {
             options.campaign_gate_timeout_seconds = std::stoi(value);
             if (options.campaign_gate_timeout_seconds <= 0) {
@@ -802,7 +810,7 @@ Options parse_options(int argc, char** argv) {
             "[--injection-work PATH --injection-release PATH "
             "--injection-gate-timeout-seconds N] "
             "[--campaign-work PATH --campaign-release PATH "
-            "--campaign-gate-timeout-seconds N] "
+            "--campaign-gate-timeout-seconds N --campaign-trials N] "
             "[--class-count N --preprocess legacy|canonical --resize-scale N "
             "--interp bicubic|bilinear --mean R,G,B --std R,G,B "
             "--dump-preprocessed PATH] "
@@ -1684,14 +1692,18 @@ struct CampaignSite {
 // Campaign work file:
 // "trial_index,event_index,site_index,target_id,allocation_id,byte_offset,
 //  bit_in_byte,expected_gpu_va" grouped into consecutive trials starting
-// at 0. Returns one site list per trial.
+// at 0. Returns one site list per trial. declared_trials > 0 fixes the
+// trial count instead (--campaign-trials): rows then only need
+// non-decreasing trial indices below it, and a trial may have no sites
+// (G8 SRAM-only campaigns carry no DRAM faults).
 std::vector<std::vector<CampaignSite>> read_campaign_work(
-    const std::string& path) {
+    const std::string& path, std::size_t declared_trials) {
     std::ifstream input(path);
     if (!input) {
         throw std::runtime_error("cannot open campaign work file: " + path);
     }
-    std::vector<std::vector<CampaignSite>> trials;
+    std::vector<std::vector<CampaignSite>> trials(declared_trials);
+    std::size_t last_trial = 0;
     std::string line;
     while (std::getline(input, line)) {
         if (!line.empty() && line.back() == '\r') {
@@ -1718,6 +1730,17 @@ std::vector<std::vector<CampaignSite>> read_campaign_work(
             site.target.bit_in_byte > 7 || site.target.expected_gpu_va == 0) {
             throw std::runtime_error("invalid campaign work row: " + line);
         }
+        if (declared_trials > 0) {
+            if (site.trial_index >= declared_trials ||
+                site.trial_index < last_trial) {
+                throw std::runtime_error(
+                    "campaign work row outside the declared, ordered " +
+                    std::to_string(declared_trials) + " trials: " + line);
+            }
+            last_trial = site.trial_index;
+            trials[site.trial_index].push_back(std::move(site));
+            continue;
+        }
         // Trials must arrive contiguous from 0: each row either continues
         // the current trial or opens trials.size().
         if (site.trial_index != trials.size() &&
@@ -1730,6 +1753,9 @@ std::vector<std::vector<CampaignSite>> read_campaign_work(
             trials.emplace_back();
         }
         trials.back().push_back(std::move(site));
+    }
+    if (declared_trials > 0) {
+        return trials;
     }
     if (trials.empty()) {
         throw std::runtime_error("campaign work file has no sites: " + path);
@@ -2909,7 +2935,7 @@ int main(int argc, char** argv) {
         }
         observer.event("CAMPAIGN_WORK_BEGIN");
         const std::vector<std::vector<CampaignSite>> campaign_trials =
-            read_campaign_work(options.campaign_work);
+            read_campaign_work(options.campaign_work, options.campaign_trials);
         campaign_trials_run = campaign_trials.size();
         if (campaign_trials_run == 0) {
             throw std::runtime_error("campaign work file has no trials");

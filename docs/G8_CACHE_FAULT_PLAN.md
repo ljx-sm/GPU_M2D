@@ -417,7 +417,7 @@ Reported metrics:
 | **G8-T1** Residency pass — **DONE 2026-10-02** | Implement the in-process measurement pass (§4) and the residency-map format. Validation runs per model: two passes in one process (same-process stability) and runs in separate processes (how much the per-line pattern changes, reported as allocation-level statistics). Start with ResNet-50 v2 (default; the user may pick another first model). | Residency maps; stability report. |
 | **G8-T2** Implementation — **DONE 2026-10-02** | Cache sampler (§3.2, §3.4) in `tools/g8_cache/cache_model.py` (classes in `fault_model.py`); runner per-image apply/remove; orchestrator flow (clean pass → residency pass → plan → trials, re-measure per restart segment) and independent re-verification; self-tests (apply/remove exactness, overlap with DRAM flips, engine-written skip, input re-staging, start-inside-residency check). | Self-tests PASS; a smoke campaign VERIFIED. |
 | **G8-T3** Cache rate — **DONE 2026-10-03** | The user derives BER_cache from the DRAM BER via prior work; the cache level table is frozen alongside the DRAM levels. Done: literature survey; ρ = 1 frozen in `fault_model`; `--cache-faults` mode; confirmation smoke (§14). | The frozen table, documented as for G5-T1 (§14). |
-| **G8-T4** Campaigns (GPU 0) — **in progress from 2026-10-03** | DRAM + L2 per model at the frozen levels, 100 trials × 10K images, compared against the existing DRAM-only runs. Levels: the seven BERs 1e-7 … 1e-5 of each model (ResNet-50 L3–L9, the others L1–L7), BER_cache = the same BER (ρ = 1), seed 7, the same engines, 10K split and preprocessing as G7-v2. One model at a time, ResNet-50 v2 first; the user reviews each model's results before the next. Driver: `scripts/run_g8_t4.sh`. | Accuracy curves (DRAM-only vs DRAM + L2) + the conditional cache-hit error rate. |
+| **G8-T4** Campaigns (GPU 0) — **in progress from 2026-10-03** | DRAM + L2 per model at the frozen levels, 100 trials × 10K images, compared against the existing DRAM-only runs. Levels: the seven BERs 1e-7 … 1e-5 of each model (ResNet-50 L3–L9, the others L1–L7), BER_cache = the same BER (ρ = 1), seed 7, the same engines, 10K split and preprocessing as G7-v2. One model at a time, ResNet-50 v2 first; the user reviews each model's results before the next. Driver: `scripts/run_g8_t4.sh`. Three results per model (user decision 2026-10-03): DRAM-only (the G7-v2 runs), SRAM-only (`--mode sram_only`) and DRAM + SRAM (`--mode dram_sram`). | Accuracy curves (DRAM-only vs DRAM + L2) + the conditional cache-hit error rate. |
 
 ## 7. Validation additions
 
@@ -886,4 +886,35 @@ difference is the cache contribution. Clean accuracy is 78.42 %.
     | L7 | −1.5 | −4.0 | −5.0 | −7.6 |
     | L9 | −2.2 | −6.9 | −9.2 | −13.8 |
 - **Outputs.** `artifacts/g8/t4/analysis/resnet50_{t4,g7_dram_only,paired}.txt`.
+
+### 15.2 Three-way comparison: SRAM-only mode (2026-10-03)
+
+User decision: every model gets three results at its seven levels:
+- **DRAM-only:** the existing G7-v2 runs.
+- **SRAM-only:** the level's L2 cache faults only.
+- **DRAM + SRAM:** both together (§15.1).
+
+The SRAM-only mode is `--no-dram-faults`, used with `--cache-faults`;
+in the driver it is `scripts/run_g8_t4.sh <model> --mode sram_only`, with
+output under `artifacts/g8/t4/sram_only/`. It is the dram_sram chain
+with the DRAM sampler switched off:
+- every trial has zero DRAM sites, and the runner gets
+  `--campaign-trials N` because the work file can no longer imply the
+  trial count;
+- the residency map, cache sampling and all verification are
+  unchanged;
+- `summary.json` records `fault_mode` (`dram_only` / `sram_only` /
+  `dram_sram`) and `total_sites = 0`.
+
+**Restart protocol in cache modes.** A cache flip in a context-phase
+pool can kill the process in the middle of a trial, not just at its
+first inference. The death-tail check counts only trial-skeleton events
+and ignores cache events, so such a death is classified like a DRAM
+one: the dying trial is PROCESS_FATAL and fresh segments run the rest.
+Self-tests now cover an SRAM-only mid-trial death. Not yet seen live.
+
+**Smoke.** ResNet-50 L9, 2 trials, `artifacts/g8/t4_sramtest/`:
+G5_CAMPAIGN_VERIFIED, 0 DRAM sites, 2 × 2,307 cache flips (re-XOR
+4,104 / restored 116 / overwritten 394), and `analyze_campaign.py`
+works unchanged.
 

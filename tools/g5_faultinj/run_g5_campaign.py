@@ -858,7 +858,8 @@ def merge_campaign_outputs(level_dir: Path, segments: list[dict],
     completed_total = sum(seg["completed"] for seg in segments)
     sites_expected = sum(len(sites) for seg in segments
                          for sites in seg["campaign"][:seg["completed"]])
-    bits = segments[0]["extra"]["level"]["bits"]
+    bits = segments[0]["extra"]["level"]["bits"] \
+        if segments[0]["extra"].get("dram_faults", True) else 0
     if len(merged["g1_5_g5_trial_result.csv"]) != completed_total:
         raise RuntimeError(f"merged trial rows "
                            f"{len(merged['g1_5_g5_trial_result.csv'])} != "
@@ -950,8 +951,10 @@ def merge_campaign_outputs(level_dir: Path, segments: list[dict],
 def expected_trial_sequence(campaign: list[list[dict]]
                             ) -> list[tuple[str, dict[str, str]]]:
     sequence: list[tuple[str, dict[str, str]]] = []
-    for sites in campaign:
-        trial = str(sites[0]["trial_index"])
+    # segment-local trials are contiguous from 0, so the position is the
+    # trial index (a G8 SRAM-only trial has no DRAM sites to read it from)
+    for position, sites in enumerate(campaign):
+        trial = str(position)
         sequence.append(("TRIAL_BEGIN", {"trial_index": trial}))
         for site in sites:
             sequence.append(("SITE_FLIPPED", {"target_id":
@@ -987,7 +990,7 @@ def verify_event_structure(output: str, campaign: list[list[dict]],
                 parse_all_events(output) if name in TRIAL_EVENT_NAMES]
     expected = expected_trial_sequence(campaign)
     if partial_trial is not None:
-        dying = str(partial_trial[0]["trial_index"])
+        dying = str(len(campaign))  # the trial right after the prefix
         expected.append(("TRIAL_BEGIN", {"trial_index": dying}))
         for site in partial_trial:
             expected.append(("SITE_FLIPPED", {"target_id":
@@ -1080,6 +1083,12 @@ def parse_args() -> argparse.Namespace:
                              "preprocessing of every evaluation image) "
                              "before the pre-allocation gate; the G7 10K "
                              "ImageNet pass needs more than the G5 default")
+    parser.add_argument("--no-dram-faults", action="store_true",
+                        help="G8 SRAM-only campaign: no DRAM faults, only "
+                             "the level's L2 cache faults (needs "
+                             "--cache-faults or --cache-ber); everything "
+                             "else -- gate, residency map, trials, "
+                             "verification -- is unchanged")
     parser.add_argument("--cache-faults", action="store_true",
                         help="G8 L2 cache faults with the FROZEN model "
                              "(G8-T3): BER_cache = rho x the level's DRAM "
@@ -1142,7 +1151,18 @@ def parse_args() -> argparse.Namespace:
             parser.error("--cache-ber cannot be combined with --bootstrap")
         if args.cache_ber < 0:
             parser.error("--cache-ber must be >= 0")
+    if args.no_dram_faults and args.cache_ber is None:
+        parser.error("--no-dram-faults needs --cache-faults or --cache-ber "
+                     "(an SRAM-only campaign)")
     return args
+
+
+def fault_mode(args: argparse.Namespace) -> str:
+    """dram_only / sram_only / dram_sram (G8-T4 three-way comparison)."""
+    if getattr(args, "cache_ber", None) is None:
+        return "dram_only"
+    return "sram_only" if getattr(args, "no_dram_faults", False) \
+        else "dram_sram"
 
 
 def finalize(failures: list[str], run_dir: Path, test_log: Path,
@@ -1311,6 +1331,10 @@ def execute_segment(args: argparse.Namespace, contract: dict,
         excludes_g8 = workload_entry.get("surface_excludes", ())
         if excludes_g8:
             g8_runner_args += ["--l2-probe-exclude", ",".join(excludes_g8)]
+        if getattr(args, "no_dram_faults", False):
+            # SRAM-only: every trial has zero DRAM sites, so the trial
+            # count is declared instead of implied by the work rows
+            g8_runner_args += ["--campaign-trials", str(trials)]
 
     observer: G2Observer | None = None
     process: subprocess.Popen[bytes] | None = None
@@ -1527,17 +1551,26 @@ def execute_segment(args: argparse.Namespace, contract: dict,
         anchor_pages = len(anchors)
         print(f"[{run_id}] anchors: {anchor_pages} pages with valid "
               "consensus masks")
-        campaign = fault_model.sample_campaign(
-            args.level, trials, surface_rows, anchors, seed,
-            resident_bytes_expected=r_nominal, workload=args.workload)
-        model_failures = verify_work_model(level, campaign)
-        if model_failures:
-            raise RuntimeError("sampled campaign violates the frozen model: "
-                               + "; ".join(model_failures[:10]))
+        if getattr(args, "no_dram_faults", False):
+            # G8 SRAM-only: the level supplies only the cache BER
+            campaign = [[] for _ in range(trials)]
+            print(f"[{run_id}] sampler: level {args.level} BER "
+                  f"{level['ber']:g} -- DRAM faults DISABLED (SRAM-only), "
+                  f"{trials} trials, 0 DRAM sites")
+        else:
+            campaign = fault_model.sample_campaign(
+                args.level, trials, surface_rows, anchors, seed,
+                resident_bytes_expected=r_nominal, workload=args.workload)
+            model_failures = verify_work_model(level, campaign)
+            if model_failures:
+                raise RuntimeError("sampled campaign violates the frozen "
+                                   "model: " + "; ".join(model_failures[:10]))
         total_sites = sum(len(sites) for sites in campaign)
-        print(f"[{run_id}] sampler: level {args.level} BER {level['ber']:g} "
-              f"B={level['bits']} (s,d,t)=({level['s']},{level['d']},"
-              f"{level['t']}), {trials} trials, {total_sites} sites")
+        if not getattr(args, "no_dram_faults", False):
+            print(f"[{run_id}] sampler: level {args.level} BER "
+                  f"{level['ber']:g} B={level['bits']} (s,d,t)=("
+                  f"{level['s']},{level['d']},{level['t']}), {trials} "
+                  f"trials, {total_sites} sites")
         fault_model.write_work_csv(work_output, campaign)
         work_detail = {
             "schema": "gpu-m2d.g5.campaign.work.v1",
@@ -1573,6 +1606,7 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             "resident_bytes": resident_bytes,
             "anchor_pages": anchor_pages,
             "total_sites": total_sites,
+            "dram_faults": not getattr(args, "no_dram_faults", False),
         })
 
         # ---- G8-T2 cache sites from THIS process's residency map
@@ -2081,7 +2115,9 @@ def run_once(args: argparse.Namespace) -> int:
         "anchor_pages": first.get("anchor_pages"),
         # sites of the level's trials exactly (trials x bits); a crashed
         # segment's never-run tail was re-sampled later and is NOT added
-        "total_sites": args.trials * level["bits"],
+        "total_sites": args.trials * level["bits"]
+        * (0 if getattr(args, "no_dram_faults", False) else 1),
+        "fault_mode": fault_mode(args),
         "surface_excludes": first.get("surface_excludes", []),
         # G8 cache mode summary (per-segment detail in segment_details)
         "g8_cache_ber": getattr(args, "cache_ber", None),
@@ -2724,6 +2760,33 @@ def self_test() -> int:
     assert verify_cache_events(events, good_rows) == []
     assert verify_cache_events(events.replace("before=64", "before=65", 1),
                                good_rows)
+    # G8-T4: a death in cache mode may come mid-trial; cache events are
+    # not trial-skeleton events, so the dying trial's tail is still its
+    # complete DRAM flip set -- empty for an SRAM-only campaign
+    death = ("GPU_M2D_EVENT,event=TRIAL_BEGIN,trial_index=0,sites=0\n"
+             "GPU_M2D_EVENT,event=TRIAL_INJECTED_END,trial_index=0\n"
+             "GPU_M2D_EVENT,event=TRIAL_SANITY_BEGIN,trial_index=0\n"
+             "GPU_M2D_EVENT,event=TRIAL_SANITY_END,trial_index=0\n"
+             "GPU_M2D_EVENT,event=TRIAL_END,trial_index=0\n"
+             "GPU_M2D_EVENT,event=TRIAL_BEGIN,trial_index=1,sites=0\n"
+             "GPU_M2D_EVENT,event=CACHE_FLIPPED,trial_index=1,cache_index=0\n"
+             "GPU_M2D_EVENT,event=CACHE_REMOVED,trial_index=1,cache_index=0\n"
+             "GPU_M2D_EVENT,event=CACHE_FLIPPED,trial_index=1,cache_index=1\n"
+             "GPU_M2D_G1_5_FAIL: CUDA error: an illegal memory access was "
+             "encountered\n")
+    verdict, why = analyze_process_death(death, [[], [], []])
+    assert verdict == {"completed": 1, "dying": 1}, why
+    seq = expected_trial_sequence([[], []])
+    assert [n for n, _ in seq] == ["TRIAL_BEGIN", "TRIAL_INJECTED_END",
+                                   "TRIAL_SANITY_BEGIN", "TRIAL_SANITY_END",
+                                   "TRIAL_END"] * 2
+    assert seq[5][1] == {"trial_index": "1"}
+    assert verify_event_structure(death, [[]], [], partial_trial=[]) == []
+    assert fault_mode(argparse.Namespace(cache_ber=None)) == "dram_only"
+    assert fault_mode(argparse.Namespace(cache_ber=1e-7,
+                                         no_dram_faults=True)) == "sram_only"
+    assert fault_mode(argparse.Namespace(cache_ber=1e-7,
+                                         no_dram_faults=False)) == "dram_sram"
     # skeleton: the residency pass sits between clean pass and gate
     sk = expected_skeleton_for(1, True)
     at = sk.index("CLEAN_PASS_END")

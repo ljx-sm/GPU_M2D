@@ -167,6 +167,10 @@ sudo scripts/run_g2_observer_probe.sh --api g5campaign --device 0 \
 level's DRAM BER` with ρ = `fault_model.CACHE_RHO` = 1 (space context;
 see the G8 plan §3.3 and §14). `--cache-ber X` instead sets an explicit
 cache BER, recorded as unfrozen; the two flags are mutually exclusive.
+`--no-dram-faults` (with `--cache-faults` or `--cache-ber`) runs an
+SRAM-only campaign: the level's cache faults with zero DRAM sites. It
+completes the three-way DRAM-only / SRAM-only / DRAM + SRAM comparison,
+and `summary.json` records `fault_mode`.
 n_cache uses `round()` like the DRAM count. If it rounds to 0, the
 process runs DRAM-only and the console prints `WARNING G8 n_cache = 0`.
 
