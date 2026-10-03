@@ -918,3 +918,64 @@ G5_CAMPAIGN_VERIFIED, 0 DRAM sites, 2 × 2,307 cache flips (re-XOR
 4,104 / restored 116 / overwritten 394), and `analyze_campaign.py`
 works unchanged.
 
+
+### 15.3 ResNet-50 v2: three-way results (2026-10-03)
+
+SRAM-only: `scripts/run_g8_t4.sh resnet50 --mode sram_only`. All seven
+levels VERIFIED in one segment each, with no crashes. Clean accuracy is
+78.42 %. Accuracy is over normally completed trials only; DUE and crash
+trials are counted out of 100.
+
+| Level | BER | DRAM bits / trial | SRAM bits / trial | DUE / crash: DRAM-only | SRAM-only | DRAM + SRAM | Top-1: DRAM-only | SRAM-only | DRAM + SRAM |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| L3 | 1e-7 | 23 | 23 | 0 / 0 | 0 / 0 | 0 / 0 | 78.34 | 78.03 | 77.91 |
+| L4 | 5e-7 | 115 | 115 | 0 / 0 | 0 / 0 | 0 / 0 | 77.13 | 77.30 | 75.98 |
+| L5 | 1e-6 | 231 | 231 | 0 / 0 | 0 / 0 | 0 / 0 | 76.68 | 76.74 | 74.93 |
+| L6 | 3e-6 | 692 | 692 | 0 / 0 | 1 / 0 | 1 / 0 | 73.08 | 75.33 | 69.84 |
+| L7 | 5e-6 | 1,153 | 1,153 | 0 / 0 | 1 / 0 | 1 / 0 | 66.62 | 74.34 | 62.09 |
+| L8 | 7e-6 | 1,615 | 1,615 | 2 / 0 | 1 / 0 | 3 / 0 | 67.14 | 72.34 | 61.28 |
+| L9 | 1e-5 | 2,307 | 2,307 | 2 / 0 | 1 / 0 | 2 / 0 | 61.23 | 70.36 | 53.25 |
+
+The "bits / trial" columns apply to the modes that inject that memory:
+DRAM-only has DRAM bits only, SRAM-only has SRAM bits only, and DRAM +
+SRAM has both.
+
+**Additivity.** The DRAM + SRAM loss equals the DRAM-only loss plus the
+SRAM-only loss:
+
+| Level | Loss: DRAM | SRAM | Sum | DRAM + SRAM | Per-trial interaction, pp [95 % CI] |
+| --- | --- | --- | --- | --- | --- |
+| L3 | 0.08 | 0.39 | 0.47 | 0.51 | +0.03 [+0.02, +0.05] |
+| L4 | 1.29 | 1.12 | 2.41 | 2.44 | +0.04 [+0.01, +0.06] |
+| L5 | 1.74 | 1.68 | 3.43 | 3.49 | +0.06 [+0.03, +0.10] |
+| L6 | 5.34 | 3.09 | 8.43 | 8.58 | +0.18 [−0.04, +0.39] |
+| L7 | 11.80 | 4.08 | 15.88 | 16.33 | +0.33 [−0.74, +1.41] |
+| L8 | 11.28 | 6.08 | 17.36 | 17.14 | −0.46 [−1.64, +0.72] |
+| L9 | 17.19 | 8.06 | 25.25 | 25.17 | −0.16 [−1.35, +1.03] |
+
+The interaction is (loss D+S − loss D − loss S) per trial, over trials
+that are not DUE in any of the three modes. It is at most a few
+hundredths of a point at L3–L5 (statistically resolvable but
+negligible) and indistinguishable from 0 at L6–L9.
+
+**Pairing.** DRAM sites are identical between DRAM-only and DRAM + SRAM.
+The SRAM-only cache sites are drawn in their own process: most land on
+the same (allocation, byte, bit) as in DRAM + SRAM (L3/L5/L9 ≥ 96 %;
+L6 92 %, L7 51 %, L8 60 %), with start images a few images apart. That
+is because the start draw uses each process's own per-image times.
+
+**DUE trial 43.**
+- SRAM-only trial 43 is DUE at image 6,028 at every level L6–L9, so
+  the cache flips alone cause it. It is also DUE in DRAM + SRAM at
+  L6–L8, at image 4,312 at L6 and image 6,028 at L7–L8.
+- 198 cache flips are active at that image in every one of those DUE
+  runs, so the culprit is not identifiable from the logs. A targeted
+  replay with bisection would pin it down.
+
+**Reading.**
+- At equal flip counts, SRAM costs about half as much accuracy as DRAM
+  at the high levels: 8.1 vs 17.2 pp at 1e-5. This is consistent with a
+  cache flip covering about 50 % of a trial on average (§15.1).
+- At L3–L5 the two are of similar size, within trial-to-trial noise.
+
+Outputs: `artifacts/g8/t4/analysis/resnet50_{sram_only,threeway}.txt`.
