@@ -803,7 +803,9 @@ ResNet-50 v2 (`scripts/run_g8_t4.sh resnet50`, run directories under
 | L4 (5e-7) | 115 | VERIFIED |
 | L5 (1e-6) | 231 | VERIFIED |
 | L6 (3e-6) | 692 | VERIFIED |
-| L7–L9 | 1,153 / 1,615 / 2,307 | re-run after the fix below |
+| L7 (5e-6) | 1,153 | VERIFIED (after the fix below) |
+| L8 (7e-6) | 1,615 | VERIFIED |
+| L9 (1e-5) | 2,307 | VERIFIED — ResNet-50 complete 2026-10-03 |
 
 **L7 fail-closed and fix (2026-10-03).**
 - **What happened.** Trial 18 drew two read-only cache flips on
@@ -831,3 +833,57 @@ ResNet-50 v2 (`scripts/run_g8_t4.sh resnet50`, run directories under
 - **Bookkeeping.** The failed L7 run was moved to `artifacts/g8/t4/failed/`.
   L7–L9 run with the rebuilt runner, so their summaries carry a different
   `runner_sha256` from L3–L6.
+
+### 15.1 ResNet-50 v2 results (DRAM + L2 vs DRAM-only)
+
+The conventions are the same as G7-v2 (`analyze_campaign.py`):
+- accuracy is the mean over normally completed trials only;
+- DUE trials (first invalid output aborts the trial) and crash trials
+  (PROCESS_FATAL) are counted separately, out of 100.
+
+**This is a paired comparison.** Every level's DRAM fault set is
+identical, site for site, to the G7-v2 DRAM-only run (seed 7). Trial t
+here is that run's trial t plus the cache flips, so the paired
+difference is the cache contribution. Clean accuracy is 78.42 %.
+
+| Level | BER | DRAM bits / trial | L2 bits / trial | L2 flips applied (100 trials) | DUE | Crash | Top-1, DRAM + L2 | Top-1, DRAM-only (G7-v2) | Paired Δ, pp [95 % CI] |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| L3 | 1e-7 | 23 | 23 | 2,300 | 0 | 0 | 77.91 | 78.34 | −0.43 [−1.07, +0.21] |
+| L4 | 5e-7 | 115 | 115 | 11,500 | 0 | 0 | 75.98 | 77.13 | −1.15 [−2.13, −0.18] |
+| L5 | 1e-6 | 231 | 231 | 23,100 | 0 | 0 | 74.93 | 76.68 | −1.75 [−2.88, −0.61] |
+| L6 | 3e-6 | 692 | 692 | 68,811 | 1 | 0 | 69.84 | 73.08 | −3.26 [−4.91, −1.62] |
+| L7 | 5e-6 | 1,153 | 1,153 | 114,866 | 1 | 0 | 62.09 | 66.62 | −4.42 [−6.25, −2.58] |
+| L8 | 7e-6 | 1,615 | 1,615 | 158,649 | 3 | 0 | 61.28 | 67.14 | −5.74 [−8.05, −3.43] |
+| L9 | 1e-5 | 2,307 | 2,307 | 227,581 | 2 | 0 | 53.25 | 61.23 | −7.98 [−10.53, −5.44] |
+
+- **Flip counts.**
+  - DRAM bits follow the G5 event mix (60 % SBU / 40 % 2–3-bit MCU), and
+    all 100 × B sites were applied.
+  - L2 flips are all SBU. n_cache equals B because, on the idle GPU,
+    R_eff = R (28.832 MB, stride 1, every level).
+  - "Applied" is below 100 × n_cache from L6 on. Flips whose start image
+    came after a DUE abort were never applied (389 / 434 / 2,851 / 3,119
+    at L6–L9).
+- **Crashes.** None at any level (every level ran in one segment), as in
+  DRAM-only.
+- **DUE.** DRAM-only had 0 / 0 / 0 / 0 / 0 / 2 / 2 (trials 1, 21 at L8;
+  21, 30 at L9). With L2 these persist, and trial 43 becomes DUE at L6,
+  L7 and L8, at images 4,312, 6,028 and 6,028; at L9 it completes. Its
+  cache sets overlap only partly across levels, and no single culprit
+  flip was pinned down.
+- **Accuracy.**
+  - The cache contribution is significant from 5e-7 on and grows
+    monotonically, to −8.0 pp at 1e-5.
+  - Each read-only cache flip is active for 50 % of a trial on average
+    (start uniform, resident to the end). Engine-written flips last one
+    image.
+  - The extra loss grows within a trial, so cache damage accumulates as
+    flips start. Paired Δ by quarter of the 10K images:
+
+    | Level | Q1 | Q2 | Q3 | Q4 |
+    | --- | --- | --- | --- | --- |
+    | L5 | −0.5 | −0.9 | −1.6 | −4.0 |
+    | L7 | −1.5 | −4.0 | −5.0 | −7.6 |
+    | L9 | −2.2 | −6.9 | −9.2 | −13.8 |
+- **Outputs.** `artifacts/g8/t4/analysis/resnet50_{t4,g7_dram_only,paired}.txt`.
+
