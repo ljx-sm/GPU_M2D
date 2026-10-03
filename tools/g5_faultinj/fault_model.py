@@ -388,6 +388,20 @@ LEVELS = WORKLOADS[DEFAULT_WORKLOAD]["levels"]
 
 EVENT_SHARE_TARGET = (0.60, 0.20, 0.20)  # SBU / 2-bit MCU / 3-bit MCU
 
+# G8-T3 (user decision 2026-10-03): the L2 cache upset rate per bit equals
+# the DRAM one, rho = lambda_SRAM / lambda_DRAM = 1 -- the space-computing
+# context (heavy-ion measurements put rho at ~0.1-2; REMU's memory-agnostic
+# rate is rho = 1; literature survey: reports/GPU SRAM vs DRAM error
+# rates.md). The cache BER of a level is rho x that level's DRAM BER, and
+# each trial is treated as one equal-fluence window for DRAM and L2
+# (docs/G8_CACHE_FAULT_PLAN.md section 3.3).
+CACHE_RHO = 1.0
+
+
+def cache_ber_for(level: dict) -> float:
+    """Frozen G8 cache BER of a DRAM level (BER_cache = rho x BER)."""
+    return CACHE_RHO * level["ber"]
+
 # Composition solving: exhaustive below EXHAUSTIVE_BITS_LIMIT, windowed
 # above it (the O(B^2) exhaustive grid costs ~41 s at B=21143 and runs at
 # every campaign start through assert_frozen_levels). The window centers
@@ -993,6 +1007,11 @@ def self_test() -> int:
     for workload_name in WORKLOADS:
         assert surface_rows_for(workload_name, [probe_row, data_row]) == \
             [data_row], workload_name
+    # G8-T3: the frozen cache BER of a level is rho x its DRAM BER
+    assert CACHE_RHO == 1.0
+    for workload_name, entry in WORKLOADS.items():
+        for row in entry["levels"]:
+            assert cache_ber_for(row) == row["ber"], (workload_name, row)
     # G8 cache classes: disjoint, TRT-internal only, never an excluded
     # allocation
     for workload_name, entry in WORKLOADS.items():

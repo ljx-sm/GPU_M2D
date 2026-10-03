@@ -1010,6 +1010,10 @@ def parse_args() -> argparse.Namespace:
                              "preprocessing of every evaluation image) "
                              "before the pre-allocation gate; the G7 10K "
                              "ImageNet pass needs more than the G5 default")
+    parser.add_argument("--cache-faults", action="store_true",
+                        help="G8 L2 cache faults with the FROZEN model "
+                             "(G8-T3): BER_cache = rho x the level's DRAM "
+                             "BER, rho = fault_model.CACHE_RHO (1.0)")
     parser.add_argument("--cache-ber", type=float, default=None,
                         help="G8 L2 cache faults: BER_cache per trial "
                              "(n_cache = round(BER_cache x R_eff_bits) from "
@@ -1048,6 +1052,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path,
                         default=PROJECT / "artifacts/g5/campaign")
     args = parser.parse_args()
+    # G8 cache mode: --cache-faults (frozen, BER_cache = rho x level BER)
+    # or --cache-ber X (explicit override, recorded as unfrozen).
+    args.cache_ber_frozen = False
+    if args.cache_faults:
+        if args.cache_ber is not None:
+            parser.error("--cache-faults and --cache-ber are mutually "
+                         "exclusive")
+        if args.bootstrap or args.level is None:
+            parser.error("--cache-faults needs a --level (not --bootstrap)")
+        try:
+            level = fault_model.level_by_name(args.level, args.workload)
+        except fault_model.ModelError as exc:
+            parser.error(str(exc))
+        args.cache_ber = fault_model.cache_ber_for(level)
+        args.cache_ber_frozen = True
     if args.cache_ber is not None:
         if args.bootstrap:
             parser.error("--cache-ber cannot be combined with --bootstrap")
@@ -1526,12 +1545,25 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             cache_model.write_cache_work(cache_work_output, cache_campaign)
             os.chmod(cache_work_output, 0o644)
             print(f"[{run_id}] G8 cache sampler: BER_cache {args.cache_ber:g} "
+                  f"({'frozen rho=' + str(fault_model.CACHE_RHO) if args.cache_ber_frozen else 'explicit'}) "
                   f"x R_eff_bits {rmap.r_eff:.0f} -> n_cache {n_cache} per "
                   f"trial, {n_cache * trials} cache sites")
+            n_expected = args.cache_ber * rmap.r_eff
+            if n_cache == 0:
+                # round() keeps the cache count fixed per process like the
+                # DRAM B (user decision 2026-10-03); a zero is legitimate
+                # (e.g. the 1e-8 rung under a heavy co-tenant) but must be
+                # visible, never silent.
+                print(f"[{run_id}] WARNING G8 n_cache = 0: expected "
+                      f"{n_expected:.3f} cache flips per trial rounds to 0 "
+                      "(this process runs DRAM faults only)")
             extra["g8_cache"] = {
                 "cache_ber": args.cache_ber,
-                "cache_ber_frozen": False,
+                "cache_ber_frozen": args.cache_ber_frozen,
+                "cache_rho": (fault_model.CACHE_RHO
+                              if args.cache_ber_frozen else None),
                 "n_cache": n_cache,
+                "n_cache_expected": n_expected,
                 "r_eff_bits": rmap.r_eff,
                 "surface_bits": rmap.meta["surface_bits"],
                 "residency_map_json": str(residency_prefix) + "_residency.json",
@@ -1983,8 +2015,10 @@ def run_once(args: argparse.Namespace) -> int:
         "surface_excludes": first.get("surface_excludes", []),
         # G8 cache mode summary (per-segment detail in segment_details)
         "g8_cache_ber": getattr(args, "cache_ber", None),
-        "g8_cache_ber_frozen": False if getattr(args, "cache_ber", None)
-        is not None else None,
+        "g8_cache_ber_frozen": getattr(args, "cache_ber_frozen", False)
+        if getattr(args, "cache_ber", None) is not None else None,
+        "g8_cache_rho": fault_model.CACHE_RHO
+        if getattr(args, "cache_ber_frozen", False) else None,
         "g8_n_cache_per_segment": [
             (seg["extra"].get("g8_cache") or {}).get("n_cache")
             for seg in segments] if getattr(args, "cache_ber", None)

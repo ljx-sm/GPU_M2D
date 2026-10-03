@@ -6,11 +6,12 @@ Status: **DESIGN CONFIRMED by the user, 2026-10-01. G8-T0 complete
 G7-v2 models built, independently verified, and reproducible, V9 PASS
 (§12). G8-T2 complete 2026-10-02 (GPU 0): the cache-fault chain runs
 end to end, with smoke campaigns VERIFIED on all six models and a
-controlled shared-GPU test (§13). Open: BER_cache (T3), and the user's
-confirmation of the provisional self-check limits (§9).** This
-file has been revised in place through the 2026-09-29 … 10-01 discussion
-(earlier versions are in git history; §10 records what changed and why).
-One parameter is still open: the cache upset rate BER_cache (§3.3).
+controlled shared-GPU test (§13). G8-T3 complete 2026-10-03: the cache
+upset rate is frozen at BER_cache = ρ × the level's DRAM BER with ρ = 1
+(§3.3, §14). Open: the user's confirmation of the provisional self-check
+limits (§9).** This file has been revised in place through the
+2026-09-29 … 10-03 discussion (earlier versions are in git history; §10
+records what changed and why).
 
 Scope:
 
@@ -139,13 +140,38 @@ T_total = the total inference time of the 10K images (§4)
 - The injection surface is the same as the DRAM sampler's
   (`fault_model.surface_rows_for`), so Σ_ℓ bits_ℓ = R_bits.
 
-### 3.3 Cache upset rate BER_cache — open (user, later)
+### 3.3 Cache upset rate BER_cache — frozen (user decision 2026-10-03)
 
-BER_cache is a separate parameter from the DRAM BER. SRAM and GDDR cells
-have different per-bit upset rates, and the relation will be derived
-later from prior work (a literature step, like the G5-T0 survey). Every
-other part of this design is independent of its value. The cache level
-table is frozen only after that derivation (phase T3).
+```text
+BER_cache = ρ × BER_DRAM(level),   ρ = λ_SRAM,per-bit / λ_DRAM,per-bit = 1
+```
+
+- **ρ = 1, a single value, no sweep.** The fault-tolerance analysis is
+  set in a space-computing context. There, the measured per-bit ratio of
+  SRAM cache to DRAM under heavy ions is about 0.1–2, and REMU's
+  memory-agnostic rate is equivalent to ρ = 1. The literature survey
+  (G8-T3, [reports/GPU SRAM vs DRAM error
+  rates.md](../reports/GPU%20SRAM%20vs%20DRAM%20error%20rates.md)) found
+  no measurement of L2 and GDDR on the same GPU, and none at all for
+  Ada/4N/GDDR6X. Terrestrial-neutron evidence would instead put ρ near
+  10³, which is outside this campaign's scope.
+- **Equal-fluence trial (modelling assumption).** One trial is treated as
+  one exposure window shared by GDDR and L2, so the DRAM flips of the
+  level and the cache flips of the trial come from the same per-bit rate.
+  The survey's time-window factor (DRAM flips accumulate and persist,
+  while a cache flip lives only while its line stays resident) is
+  deliberately not modelled (user decision 2026-10-03).
+- **Fixed count, `round()`.** n_cache stays `round(BER_cache ×
+  R_eff_bits)`, fixed per process like the DRAM `B = round(BER × R)`.
+  Only placement varies between trials; Poisson sampling was considered
+  and rejected. A process whose expected count rounds to 0 runs
+  DRAM-only. The orchestrator prints a `WARNING G8 n_cache = 0` line and
+  records `n_cache_expected` in `summary.json`. On an idle GPU this never
+  happens. Under a heavy co-tenant it happens only at ResNet-50's L1
+  (1e-8, expected 0.33–0.36).
+- **Code.** `fault_model.CACHE_RHO = 1.0` and `cache_ber_for(level)`.
+  The orchestrator's `--cache-faults` mode uses the frozen value.
+  `--cache-ber X` remains as an explicit override, recorded as unfrozen.
 
 ### 3.4 Placement and timing of each flip
 
@@ -382,7 +408,7 @@ Reported metrics:
 | **G8-T0** Feasibility (GPU 0) — **DONE 2026-10-01** | Calibrate the L2-hit vs GDDR-fetch latency of the probe kernel (thresholds, separation, stability); measure probe throughput for full-surface sweeps and choose k per model; runner hook for probe/apply/remove kernels at image boundaries. Done: probe calibration + runner probe pass (`--l2-probe-*`); apply/remove hooks are T2 work. | Gate: clean hit/miss separation; a hooked pass with no flips is bit-identical to the clean pass. **Both PASS** (§11). |
 | **G8-T1** Residency pass — **DONE 2026-10-02** | Implement the in-process measurement pass (§4) and the residency-map format. Validation runs per model: two passes in one process (same-process stability) and runs in separate processes (how much the per-line pattern changes, reported as allocation-level statistics). Start with ResNet-50 v2 (default; the user may pick another first model). | Residency maps; stability report. |
 | **G8-T2** Implementation — **DONE 2026-10-02** | Cache sampler (§3.2, §3.4) in `tools/g8_cache/cache_model.py` (classes in `fault_model.py`); runner per-image apply/remove; orchestrator flow (clean pass → residency pass → plan → trials, re-measure per restart segment) and independent re-verification; self-tests (apply/remove exactness, overlap with DRAM flips, engine-written skip, input re-staging, start-inside-residency check). | Self-tests PASS; a smoke campaign VERIFIED. |
-| **G8-T3** Cache rate | The user derives BER_cache from the DRAM BER via prior work; the cache level table is frozen alongside the DRAM levels. | The frozen table, documented as for G5-T1. |
+| **G8-T3** Cache rate — **DONE 2026-10-03** | The user derives BER_cache from the DRAM BER via prior work; the cache level table is frozen alongside the DRAM levels. Done: literature survey; ρ = 1 frozen in `fault_model`; `--cache-faults` mode; confirmation smoke (§14). | The frozen table, documented as for G5-T1 (§14). |
 | **G8-T4** Campaigns (GPU 0) | DRAM + L2 per model at the frozen levels, 100 trials × 10K images, compared against the existing DRAM-only runs. | Accuracy curves (DRAM-only vs DRAM + L2) + the conditional cache-hit error rate. |
 
 ## 7. Validation additions
@@ -426,12 +452,16 @@ Reported metrics:
   process's trials. Co-tenant load can drift.
 - No L2 physical coordinates (slice/set/way/bit) and no cache MCU.
 - No L2 tag/state-bit faults; no ECC; no L1/shared/register faults.
-- BER_cache is a parameter derived from the literature, not measured on
-  this hardware.
+- BER_cache = ρ × BER_DRAM with ρ = 1 is a literature-based modelling
+  choice for the space context, not measured on this hardware (§3.3).
+- Equal-fluence trial: DRAM and L2 share one exposure window per trial,
+  with no time-window factor between persistent DRAM flips and
+  residency-limited cache flips (§3.3).
 
 ## 9. Open items
 
-1. BER_cache derivation (§3.3), done by the user from prior work.
+1. ~~BER_cache derivation~~: **resolved 2026-10-03**, ρ = 1 (§3.3,
+   §14).
 2. First model for T1/T4: ResNet-50 v2 by default.
 3. ~~Probe unit~~: **resolved 2026-10-02**, 32-B sector.
 4. ~~k and stride per model~~: **resolved 2026-10-02**. k = 1 with the
@@ -460,6 +490,7 @@ Reported metrics:
 | Residency measured in separate runs (1K, then 10K paired probes) | Per-line residency depends on the process's physical addresses and on co-tenant load, so it does not transfer between processes. Replaced by an in-process 10K-image timeline before each campaign segment's trials (§4). |
 | `n = BER × L2_bits × occupancy`, then `n = BER × min(R_bits, L2_bits)`, then `n = BER_cache × R_bits` | R_bits assumes the whole model is present all the time, which is true for DRAM but not for the cache. Replaced by `n = BER_cache × R_eff_bits` with `R_eff_bits = Σ bits_ℓ × T_ℓ / T_total`, the time-averaged resident bits (user decision 2026-10-01, §3.2). A denominator of Σ T_ℓ was rejected because it always reduces to ~1,024 bits (one line); the denominator is the total inference time of the 10K images. |
 | Mid-inference injection via CUDA-graph capture; L1/shared via NVBit; three cards | More complex than needed. Scope set to L2 only, image-boundary resolution, GPU 0 only (user decision 2026-09-30). |
+| A ρ sweep {1, 10, 100, 1000}; a time-window factor `T_win / T_acc`; Poisson-sampled n_cache (all proposed by the T3 survey) | A sweep multiplies the T4 campaign cost without changing the space-context conclusion; the time-window factor complicates the model; Poisson makes the cache count vary per trial while the DRAM count is fixed. Kept: ρ = 1, an equal-fluence trial, fixed `round()` with a visible n_cache = 0 warning (user decision 2026-10-03, §3.3). |
 
 ## 11. G8-T0 results (2026-10-01, GPU 0 idle)
 
@@ -692,4 +723,60 @@ low-intensity smoke trials did not crash; the death analysis and merge
 paths are covered by the orchestrator self-test.
 
 **Next (T3):** BER_cache from prior work, and freezing the cache level
-table.
+table. Done (§14).
+
+## 14. G8-T3 results (2026-10-03)
+
+**Literature survey.** [reports/GPU SRAM vs DRAM error
+rates.md](../reports/GPU%20SRAM%20vs%20DRAM%20error%20rates.md), with
+notes in `research_notes/GPU SRAM vs DRAM error rates/`. No prior work
+measured per-bit upset rates of a GPU's L2 and its GDDR on the same
+device, and none covers Ada, TSMC 4N or GDDR6X. The evidence for
+ρ = λ_SRAM/λ_DRAM depends on the radiation environment:
+
+| Environment | ρ | Basis |
+| --- | --- | --- |
+| Heavy ions (space) | ≈ 0.1–2 | 10 nm phone-chip L2 vs COTS DDR4 saturation cross sections |
+| Titan K20X field (28 nm, ECC on, healthy cards) | ≈ 40–260 | same-device L2 vs GDDR5 SBE shares |
+| Terrestrial neutrons | ≈ 10³ (10²–10⁴) | FinFET SRAM 2–20 FIT/Mb vs modern DRAM 0.001–0.0125 FIT/Mb |
+| Protons | no number | no per-bit DRAM data |
+
+**Decision (user, 2026-10-03).** ρ = 1 for the space-computing context,
+no sweep. An equal-fluence trial, with no time-window factor. Fixed
+`round()` (§3.3).
+
+**Frozen cache level table.** BER_cache = the level's DRAM BER, for every
+G7-v2 level. n_cache is computed per process from that process's R_eff
+(§3.2). The values below use the idle-GPU T1/T2 R_eff, so they are
+expectations, not frozen counts:
+
+| Model | Levels → BER_cache (ρ = 1) → expected idle-GPU n_cache per trial |
+| --- | --- |
+| ResNet-50 v2 | L1 1e-8 → 2 · L2 5e-8 → 12 · L3 1e-7 → 23 · L4 5e-7 → 115 · L5 1e-6 → 231 · L6 3e-6 → 692 · L7 5e-6 → 1,153 · L8 7e-6 → 1,615 · L9 1e-5 → 2,307 |
+| MobileNetV3-L | L1 1e-7 → 7 · L2 5e-7 → 36 · L3 1e-6 → 73 · L4 3e-6 → 218 · L5 5e-6 → 364 · L6 7e-6 → 509 · L7 1e-5 → 727 |
+| EfficientNet-B0 | L1 1e-7 → 14 · L2 5e-7 → 69 · L3 1e-6 → 137 · L4 3e-6 → 411 · L5 5e-6 → 686 · L6 7e-6 → 960 · L7 1e-5 → 1,372 |
+| DeiT-S | L1 1e-7 → 21 · L2 5e-7 → 104 · L3 1e-6 → 208 · L4 3e-6 → 624 · L5 5e-6 → 1,040 · L6 7e-6 → 1,457 · L7 1e-5 → 2,081 |
+| Swin-T | L1 1e-7 → 35 · L2 5e-7 → 175 · L3 1e-6 → 350 · L4 3e-6 → 1,051 · L5 5e-6 → 1,752 · L6 7e-6 → 2,453 · L7 1e-5 → 3,504 |
+| ViT-B | L1 1e-7 → 59 · L2 5e-7 → 297 · L3 1e-6 → 594 · L4 3e-6 → 1,781 · L5 5e-6 → 2,969 · L6 7e-6 → 4,156 · L7 1e-5 → 5,937 |
+
+The only zero case observed: under the heavy `g8_l2_thrash` co-tenant
+(§13), ResNet-50's R_eff drops to about 4.1–4.5 MB. At L1 (1e-8) the
+expected count is then 0.33–0.36, which rounds to 0. That process runs
+DRAM-only and prints `WARNING G8 n_cache = 0`.
+
+**Confirmation smoke** (`--cache-faults`, 2 trials, GPU 0 idle, run
+directories under `artifacts/g8/t3/campaign/`):
+
+| Model | Level (BER) | Status | R_eff (stride) | n_cache (expected) | Cache sites | Removals: re-XOR / overwritten |
+| --- | --- | --- | --- | --- | --- | --- |
+| ResNet-50 v2 | L1 (1e-8) | VERIFIED | 28.832 MB (1) | 2 (2.307) | 4 | 3 / 1 |
+| ViT-B | L1 (1e-7) | VERIFIED | 74.214 MB of 93.868 MB (64) | 59 (59.371) | 118 | 111 / 7 |
+
+Both runs record `g8_cache_ber_frozen = true` and `g8_cache_rho = 1.0` in
+`summary.json`, with `n_cache_expected` per segment. Every read-only flip
+returned to its pre-cache value, and every trial's sanity inference
+reproduced the clean output.
+
+**Next (T4):** DRAM + L2 campaigns per model at the frozen levels (100
+trials × 10K images, `--cache-faults`), compared against the existing
+DRAM-only runs.

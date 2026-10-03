@@ -477,3 +477,28 @@ The runs used ResNet-50 v2 and ViT-B, with the co-tenant either heavy
 
 The **gate (|Δ| ≤ 3 pp) and the 3-tier stride thresholds are provisional
 until the user confirms them**.
+
+## T3 — frozen cache rate (`--cache-faults`, 2026-10-03)
+
+The cache upset rate is frozen at **BER_cache = ρ × the level's DRAM BER,
+ρ = 1** (`fault_model.CACHE_RHO`, `fault_model.cache_ber_for`). This is
+the user's decision for the space-computing context, informed by the
+literature survey in [reports/GPU SRAM vs DRAM error
+rates.md](../../reports/GPU%20SRAM%20vs%20DRAM%20error%20rates.md).
+Rationale, the equal-fluence assumption and the frozen table are in the
+[G8 plan](../../docs/G8_CACHE_FAULT_PLAN.md) §3.3 and §14.
+
+- `--cache-faults` (orchestrator and wrapper) derives BER_cache from
+  `--level`. `--cache-ber X` remains as an explicit, unfrozen override.
+- n_cache = `round(BER_cache × R_eff_bits)` per process, as before. A
+  zero count is legal and visible (`WARNING G8 n_cache = 0`), and
+  `n_cache_expected` is recorded in `summary.json`.
+
+### Confirmation smoke (GPU 0 idle, 2 trials)
+
+| Model | Level (BER) | Status | R_eff (stride) | n_cache (expected) | Cache sites | Removals: re-XOR / overwritten |
+| --- | --- | --- | --- | --- | --- | --- |
+| ResNet-50 v2 | L1 (1e-8) | VERIFIED | 28.832 MB (1) | 2 (2.307) | 4 | 3 / 1 |
+| ViT-B | L1 (1e-7) | VERIFIED | 74.214 MB of 93.868 MB (64) | 59 (59.371) | 118 | 111 / 7 |
+
+Run directories are under `artifacts/g8/t3/campaign/`.
