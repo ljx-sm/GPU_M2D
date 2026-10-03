@@ -8,8 +8,8 @@ G7-v2 models built, independently verified, and reproducible, V9 PASS
 end to end, with smoke campaigns VERIFIED on all six models and a
 controlled shared-GPU test (§13). G8-T3 complete 2026-10-03: the cache
 upset rate is frozen at BER_cache = ρ × the level's DRAM BER with ρ = 1
-(§3.3, §14). Open: the user's confirmation of the provisional self-check
-limits (§9).** This file has been revised in place through the
+(§3.3, §14). Self-check limits confirmed by the user 2026-10-03 (§9).
+G8-T4 in progress: ResNet-50 v2 first (§6).** This file has been revised in place through the
 2026-09-29 … 10-03 discussion (earlier versions are in git history; §10
 records what changed and why).
 
@@ -409,7 +409,7 @@ Reported metrics:
 | **G8-T1** Residency pass — **DONE 2026-10-02** | Implement the in-process measurement pass (§4) and the residency-map format. Validation runs per model: two passes in one process (same-process stability) and runs in separate processes (how much the per-line pattern changes, reported as allocation-level statistics). Start with ResNet-50 v2 (default; the user may pick another first model). | Residency maps; stability report. |
 | **G8-T2** Implementation — **DONE 2026-10-02** | Cache sampler (§3.2, §3.4) in `tools/g8_cache/cache_model.py` (classes in `fault_model.py`); runner per-image apply/remove; orchestrator flow (clean pass → residency pass → plan → trials, re-measure per restart segment) and independent re-verification; self-tests (apply/remove exactness, overlap with DRAM flips, engine-written skip, input re-staging, start-inside-residency check). | Self-tests PASS; a smoke campaign VERIFIED. |
 | **G8-T3** Cache rate — **DONE 2026-10-03** | The user derives BER_cache from the DRAM BER via prior work; the cache level table is frozen alongside the DRAM levels. Done: literature survey; ρ = 1 frozen in `fault_model`; `--cache-faults` mode; confirmation smoke (§14). | The frozen table, documented as for G5-T1 (§14). |
-| **G8-T4** Campaigns (GPU 0) | DRAM + L2 per model at the frozen levels, 100 trials × 10K images, compared against the existing DRAM-only runs. | Accuracy curves (DRAM-only vs DRAM + L2) + the conditional cache-hit error rate. |
+| **G8-T4** Campaigns (GPU 0) — **in progress from 2026-10-03** | DRAM + L2 per model at the frozen levels, 100 trials × 10K images, compared against the existing DRAM-only runs. Levels: the seven BERs 1e-7 … 1e-5 of each model (ResNet-50 L3–L9, the others L1–L7), BER_cache = the same BER (ρ = 1), seed 7, the same engines, 10K split and preprocessing as G7-v2. One model at a time, ResNet-50 v2 first; the user reviews each model's results before the next. Driver: `scripts/run_g8_t4.sh`. | Accuracy curves (DRAM-only vs DRAM + L2) + the conditional cache-hit error rate. |
 
 ## 7. Validation additions
 
@@ -471,7 +471,8 @@ Reported metrics:
 5. Whether to report a "dedicated GPU" condition in addition to the
    shared one, if an idle window on GPU 0 becomes available. All T0
    measurements ran on an idle GPU 0.
-6. **Provisional T2 self-check limits (user to confirm):**
+6. ~~Provisional T2 self-check limits~~: **confirmed by the user
+   2026-10-03**, unchanged:
    - in-gap share ≤ 0.5 %;
    - order effect |Δ| ≤ 3 pp;
    - auto-stride tiers: pre-sweep miss ≤ 1 % → stride 1, ≤ 50 % → 64,

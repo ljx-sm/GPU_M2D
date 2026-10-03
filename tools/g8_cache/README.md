@@ -475,8 +475,8 @@ The runs used ResNet-50 v2 and ViT-B, with the co-tenant either heavy
    at stride 64 and −0.12 pp at stride 256. This is why the auto stride
    has a third tier.
 
-The **gate (|Δ| ≤ 3 pp) and the 3-tier stride thresholds are provisional
-until the user confirms them**.
+The gate (|Δ| ≤ 3 pp), the in-gap limit (≤ 0.5 %) and the 3-tier stride
+thresholds were **confirmed by the user on 2026-10-03**, unchanged.
 
 ## T3 — frozen cache rate (`--cache-faults`, 2026-10-03)
 
