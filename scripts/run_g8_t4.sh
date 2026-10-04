@@ -6,17 +6,22 @@
 # Two modes complete the three-way comparison with the G7-v2 DRAM-only runs:
 #   --mode dram_sram (default)  DRAM + L2  -> artifacts/g8/t4/campaign/
 #   --mode sram_only            L2 only    -> artifacts/g8/t4/sram_only/campaign/
+#   --mode all                  dram_sram, then sram_only (stops on failure)
 #
 # Usage (from the repo root, in tmux; needs passwordless sudo like the
 # other campaign entry points):
-#   scripts/run_g8_t4.sh resnet50 [--mode dram_sram|sram_only]
+#   scripts/run_g8_t4.sh resnet50 [--mode dram_sram|sram_only|all]
 #                        [--levels "L3 L4"] [--trials 100] [--dry-run]
 #
 # --dry-run prints the resolved levels and campaign commands only.
 #
-# Resumable: a level that already has a G5_CAMPAIGN_VERIFIED frozen-cache
-# run with all trials under the output root is skipped. Stops at the first
-# level that does not verify, so it can be inspected before going on.
+# Resumable: a level that already has a complete G5_CAMPAIGN_VERIFIED
+# frozen-cache run under the output root is skipped -- complete = all
+# requested trials either completed or PROCESS_FATAL (restart protocol).
+# Stops (exit 1) at the first level that does not verify, so it can be
+# inspected before going on. The driver logs itself (append) to
+# artifacts/g8/t4/drivers/<model>.log, so no "| tee" is needed (a pipe
+# would hide the exit status from a following "&&").
 # Per-level console logs: <mode root>/logs/<model>_<level>.log
 set -u -o pipefail
 
@@ -40,6 +45,21 @@ while (($#)); do
 done
 WORKLOAD="g7v2_imagenet1k_${MODEL#g7v2_imagenet1k_}"
 
+if ((!DRY_RUN)) && [[ -z "${G8_T4_LOGGING:-}" ]]; then
+    export G8_T4_LOGGING=1
+    DRIVER_LOG="$PROJECT/artifacts/g8/t4/drivers/${MODEL#g7v2_imagenet1k_}.log"
+    mkdir -p "$(dirname "$DRIVER_LOG")"
+    exec > >(tee -a "$DRIVER_LOG") 2>&1
+fi
+if [[ "$MODE" == all ]]; then
+    FORWARD=(--trials "$TRIALS")
+    [[ -n "$LEVELS" ]] && FORWARD+=(--levels "$LEVELS")
+    ((DRY_RUN)) && FORWARD+=(--dry-run)
+    "$0" "$MODEL" --mode dram_sram "${FORWARD[@]}" || exit 1
+    "$0" "$MODEL" --mode sram_only "${FORWARD[@]}" || exit 1
+    exit 0
+fi
+
 SEED=7
 DEVICE=0
 SAMPLE_CSV=/data1/luojx/datasets/imagenet1k/splits/g7_eval_10000_perclass10.csv
@@ -47,7 +67,7 @@ case "$MODE" in
     dram_sram) MODE_ROOT="$PROJECT/artifacts/g8/t4"; MODE_ARGS=(--cache-faults) ;;
     sram_only) MODE_ROOT="$PROJECT/artifacts/g8/t4/sram_only"
                MODE_ARGS=(--cache-faults --no-dram-faults) ;;
-    *) echo "unknown --mode $MODE (dram_sram|sram_only)" >&2; exit 2 ;;
+    *) echo "unknown --mode $MODE (dram_sram|sram_only|all)" >&2; exit 2 ;;
 esac
 OUTPUT_ROOT="$MODE_ROOT/campaign"
 IMAGE_CACHE="$PROJECT/artifacts/g8/image_cache"
@@ -94,7 +114,9 @@ for p in glob.glob(f"{root}/run_{level}_gpu*/summary.json"):
             and s.get("status") == "G5_CAMPAIGN_VERIFIED"
             and s.get("g8_cache_ber_frozen") is True
             and s.get("fault_mode", "dram_sram") == mode
-            and s.get("trials_completed") == trials):
+            and s.get("trials_requested") == trials
+            and s.get("trials_completed", 0)
+            + s.get("process_fatal_count", 0) == trials):
         print(p.rsplit("/", 2)[-2]); sys.exit(0)
 sys.exit(1)
 EOF

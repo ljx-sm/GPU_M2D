@@ -979,3 +979,35 @@ is because the start draw uses each process's own per-image times.
 - At L3–L5 the two are of similar size, within trial-to-trial noise.
 
 Outputs: `artifacts/g8/t4/analysis/resnet50_{sram_only,threeway}.txt`.
+
+### 15.4 DeiT-S: first live restart in cache mode, and two driver fixes (2026-10-03)
+
+- **The restart protocol works live in cache mode.** DeiT-S DRAM + SRAM
+  L5 had a PROCESS_FATAL at trial 13: an illegal memory access at the
+  first injected inference, before any cache flip had started. The 13
+  completed trials were verified. A fresh segment re-measured the
+  residency map (R_eff 26.011 MB, n_cache 1,040) and ran the remaining
+  86 slots. Level result: G5_CAMPAIGN_VERIFIED, 99 completed + 1 crash.
+- **Driver fix 1.** `run_g8_t4.sh` treated "complete" as 100 *completed*
+  trials, so it reported that verified L5 as failed and stopped. Complete
+  now means `trials_requested == 100` and `completed + process_fatal ==
+  100`.
+- **Driver fix 2.** The chained `driver | tee log && driver --mode
+  sram_only` started SRAM-only anyway, because a pipe's status is tee's.
+  The driver now logs itself to `artifacts/g8/t4/drivers/<model>.log`,
+  and `--mode all` runs dram_sram then sram_only, stopping on failure.
+  The SRAM-only run that started by mistake was stopped during L1 and
+  set aside.
+- **DRAM pairing is model-specific.** The DRAM sampler draws sites from
+  the process's own physical page layout (G4/G5 design). ResNet-50 got
+  the same 20 physical pages in G7-v2 and T4, so its DRAM sites matched
+  site for site (§15.1). DeiT-S got different physical pages this time
+  (0 of 19 equal; e.g. 0x2a7e00000 in G7-v2 vs 0x1ee00000 now), so its
+  DRAM sites are an independent draw from the same frozen fault model.
+  - The DeiT-S comparison is therefore unpaired: level means with their
+    own CIs. It is still valid, but the per-trial interaction test of
+    §15.3 does not apply.
+  - The DRAM-only crash at trial 53 and the DRAM + SRAM crash at trial
+    13 are different draws, not a discrepancy.
+  - Exact pairing for a model would need DRAM-only and DRAM + SRAM to
+    get the same physical pages, which the driver does not control.
