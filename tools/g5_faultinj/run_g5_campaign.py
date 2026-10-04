@@ -1168,10 +1168,21 @@ IDLE_R_EFF_FRACTION = 0.999
 IDLE_POLL_SECONDS = 30
 
 
-def other_gpu_apps(snapshot: dict, device_uuid: str) -> list[str]:
-    """Compute apps on THIS GPU (apps on other GPUs are irrelevant)."""
-    return [app for app in snapshot.get("compute_apps_all_gpus") or []
-            if device_uuid and app.startswith(device_uuid)]
+def other_gpu_apps(snapshot: dict, device_uuid: str,
+                   own_pids: frozenset[int] = frozenset()) -> list[str]:
+    """Compute apps on THIS GPU (apps on other GPUs are irrelevant),
+    excluding this campaign's own runner (own_pids) -- after the runner
+    starts it is itself a compute app on the GPU."""
+    others = []
+    for app in snapshot.get("compute_apps_all_gpus") or []:
+        if not (device_uuid and app.startswith(device_uuid)):
+            continue
+        fields = [field.strip() for field in app.split(",")]
+        if len(fields) > 1 and fields[1].isdigit() and \
+                int(fields[1]) in own_pids:
+            continue
+        others.append(app)
+    return others
 
 
 def residency_idle_failures(others: list[str], r_eff_bits: float,
@@ -1692,7 +1703,8 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             if getattr(args, "require_idle_gpu", False):
                 idle_failures = residency_idle_failures(
                     other_gpu_apps(cotenancy_snapshot(args.device),
-                                   device_uuid),
+                                   device_uuid,
+                                   own_pids=frozenset({process.pid})),
                     rmap.r_eff, r_nominal * 8, checks["values"]["stride"])
                 if idle_failures:
                     raise RuntimeError("G8 idle rule: residency pass not on "
@@ -2853,6 +2865,17 @@ def self_test() -> int:
                                       "GPU-bbb, 2, python, 10 MiB"]}
     assert other_gpu_apps(snap, "GPU-bbb") == ["GPU-bbb, 2, python, 10 MiB"]
     assert other_gpu_apps(snap, "GPU-ccc") == []
+    # the campaign's own runner is a compute app on the GPU after launch
+    # (the 2026-10-04 false positive): excluded by PID, others still seen
+    own = {"compute_apps_all_gpus": [
+        "GPU-bbb, 3934661, /x/gpu_m2d_resnet50_int8_g1_5, 418 MiB"]}
+    assert other_gpu_apps(own, "GPU-bbb",
+                          own_pids=frozenset({3934661})) == []
+    assert other_gpu_apps(own, "GPU-bbb", own_pids=frozenset({1})) != []
+    both = {"compute_apps_all_gpus": own["compute_apps_all_gpus"]
+            + ["GPU-bbb, 2394261, .venv/bin/python, 1260 MiB"]}
+    assert other_gpu_apps(both, "GPU-bbb", own_pids=frozenset({3934661})) \
+        == ["GPU-bbb, 2394261, .venv/bin/python, 1260 MiB"]
     full = 208086656
     assert residency_idle_failures([], full * 0.9999, full, 1) == []
     assert len(residency_idle_failures([], full * 0.866, full, 256)) == 2

@@ -1064,3 +1064,11 @@ Timing notes, with no effect on results:
 - Right after the residency pass, it fails closed if another app is on
   the GPU, or if a surface under 64 MiB has R_eff < 99.9 % or auto
   stride ≠ 1. ViT-B, whose surface exceeds L2, gets only the app check.
+- **Fix (2026-10-04).** The first resumed run, DeiT-S SRAM-only L5,
+  failed closed on a false positive: the post-pass check counted the
+  campaign's own runner as a co-tenant (it is itself a compute app on
+  the GPU by then). The check now excludes the runner's PID, with
+  regression self-tests. A live 2-trial smoke run at DeiT-S L5
+  SRAM-only (`artifacts/g8/t4_idletest/`) passed with n_cache 1,040,
+  the idle value. The failed attempt was set aside under
+  `artifacts/g8/t4/superseded/`.
