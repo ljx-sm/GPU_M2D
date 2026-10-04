@@ -1072,3 +1072,67 @@ Timing notes, with no effect on results:
   SRAM-only (`artifacts/g8/t4_idletest/`) passed with n_cache 1,040,
   the idle value. The failed attempt was set aside under
   `artifacts/g8/t4/superseded/`.
+
+### 15.6 DeiT-S: three-way results (2026-10-04)
+
+All 14 cache-mode runs pass the idle audit (§15.5); SRAM-only L5 is the
+idle rerun. The table comes from `tools/g8_cache/threeway_table.py
+deit_small_patch16_224`. That tool takes runs with 100 *requested*
+trials. `analyze_campaign.py --min-trials 100` filters on *completed*
+trials, so it silently drops levels that had a crash and must not be
+used for these tables. Clean accuracy is 78.73 %. Accuracy is over
+normally completed trials; DUE / crash are counted out of 100.
+
+| Level | BER | DRAM bits / trial | SRAM bits / trial | DUE / crash: DRAM-only | SRAM-only | DRAM + SRAM | Top-1: DRAM-only | SRAM-only | DRAM + SRAM |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| L1 | 1e-7 | 21 | 21 | 0 / 0 | 0 / 0 | 0 / 0 | 78.51 | 78.62 | 78.46 |
+| L2 | 5e-7 | 104 | 104 | 0 / 0 | 0 / 0 | 1 / 0 | 78.47 | 78.51 | 77.51 |
+| L3 | 1e-6 | 208 | 208 | 0 / 0 | 0 / 0 | 0 / 0 | 78.35 | 78.06 | 77.90 |
+| L4 | 3e-6 | 624 | 624 | 0 / 0 | 1 / 0 | 2 / 0 | 75.54 | 77.56 | 74.66 |
+| L5 | 5e-6 | 1,040 | 1,040 | 0 / 1 | 1 / 0 | 1 / 1 | 68.48 | 74.82 | 68.09 |
+| L6 | 7e-6 | 1,457 | 1,457 | 0 / 0 | 2 / 0 | 1 / 1 | 64.63 | 73.66 | 61.16 |
+| L7 | 1e-5 | 2,081 | 2,081 | 0 / 0 | 2 / 0 | 1 / 1 | 61.11 | 70.58 | 56.17 |
+
+- **Bimodal trials.** From 3e-6 on, a DeiT-S trial is either nearly
+  intact (median trial accuracy 74–78 %) or collapses. Per-trial SD is
+  24–29 pp at L5–L7 (ResNet-50: far lower). Each level mean is
+  therefore uncertain by about ±2.5–2.9 pp (1 SE) for DRAM-only and
+  DRAM + SRAM, and ±1.2–1.7 pp for SRAM-only.
+
+  | Mode | Collapsed trials (< 40 % top-1) at L4 / L5 / L6 / L7 |
+  | --- | --- |
+  | DRAM-only | 3 / 12 / 18 / 20 |
+  | SRAM-only | 0 / 4 / 5 / 10 |
+  | DRAM + SRAM | 3 / 11 / 19 / 28 |
+
+- **Pairing.** None. DeiT-S got different physical pages than in
+  G7-v2 (§15.4), so DRAM-only and DRAM + SRAM are independent DRAM
+  draws, and the additivity check compares level means:
+
+  | Level | Loss: DRAM + SRAM − DRAM − SRAM, pp [95 % CI] |
+  | --- | --- |
+  | L1 | −0.07 [−0.35, +0.22] |
+  | L2 | +0.74 [−0.85, +2.33] |
+  | L3 | −0.22 [−1.24, +0.79] |
+  | L4 | −0.29 [−3.96, +3.39] |
+  | L5 | −3.52 [−10.6, +3.5] |
+  | L6 | −1.59 [−9.7, +6.6] |
+  | L7 | −3.22 [−11.9, +5.4] |
+
+  Every CI includes 0: consistent with additivity, as in ResNet-50, but
+  much less sharply determined.
+- **SRAM vs DRAM at equal flip counts.** At 1e-5 the SRAM-only loss is
+  8.15 pp against 17.62 pp for DRAM-only, a ratio of 0.46. ResNet-50's
+  ratio was 0.47; both match a cache flip being present for about 50 %
+  of a trial. At L1–L3 every mode is within 1 pp of clean.
+- **DUE and crash.**
+  - Crashes, one each: DRAM-only L5 (trial 53) and DRAM + SRAM L5–L7
+    (trials 13, 70, 10). All were absorbed by the restart protocol. All
+    are DRAM-fault crashes at a trial's first inference; SRAM-only had
+    none.
+  - SRAM-only DUEs recur on the same trials across levels: trial 88 at
+    image ≈ 5,600 at L4–L7, and trial 75 at L6–L7. This is the same
+    pattern as ResNet-50's trial 43.
+
+Outputs: `artifacts/g8/t4/analysis/deit_threeway.txt` and
+`artifacts/g8/t4/fig/deit_small_patch16_224_threeway.{png,pdf}`.
