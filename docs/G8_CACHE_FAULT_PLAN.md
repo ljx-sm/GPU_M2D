@@ -1019,3 +1019,48 @@ Outputs: `artifacts/g8/t4/analysis/resnet50_{sram_only,threeway}.txt`.
     13 are different draws, not a discrepancy.
   - Exact pairing for a model would need DRAM-only and DRAM + SRAM to
     get the same physical pages, which the driver does not control.
+
+### 15.5 Idle-GPU rule and audit (user rule 2026-10-04)
+
+**Rule.** Every cache-mode level must run on an otherwise idle GPU 0. A
+co-tenant during the residency pass shrinks R_eff and therefore
+n_cache: a higher BER could then get fewer flips than a lower one.
+
+**What a co-tenant can affect.** A run's numbers depend on its
+residency pass alone. The pass fixes R_eff, n_cache and every cache
+flip's start and last image. The runner then applies and removes flips
+by XOR on that precomputed schedule, and inference is deterministic. A
+co-tenant that arrives mid-trial changes trial durations, not outputs.
+
+**Audit** (`tools/g8_cache/audit_idle.py <model>`). Per run and segment:
+1. no other compute app on the GPU at start, and GPU memory at the idle
+   floor;
+2. residency: R_eff = surface (0.1 % tolerance), auto stride 1, and
+   n_cache = the idle value;
+3. a timing note: sustained blocks of slow trials, after correcting for
+   the ~150 ms per input-binding DRAM site that each trial re-applies
+   after every image. This check cannot tell GPU from CPU contention and
+   does not decide the verdict.
+
+**Result for ResNet-50 and DeiT-S (28 runs).** One run fails: DeiT-S
+SRAM-only L5.
+- At its start another user's process (`.venv/bin/python`, 1,260 MiB)
+  was on GPU 0.
+- R_eff was 0.866 of the surface, the auto stride was 256, and n_cache
+  was 901 instead of 1,040.
+- The run was moved to `artifacts/g8/t4/superseded/` for a rerun.
+
+Timing notes, with no effect on results:
+- SRAM-only L4: the same co-tenant arrived during its last 4 trials; its
+  residency pass was idle.
+- Slow blocks of several minutes: DeiT-S DRAM + SRAM L4, and ResNet-50
+  DRAM + SRAM L5, L8 and L9 and SRAM-only L9 (found by inspection).
+
+**Guard** (`--require-idle-gpu`, always passed by `run_g8_t4.sh`):
+- Before every segment, restart segments included, the orchestrator
+  waits until no other compute app is on the GPU, polling every 30 s,
+  and records a fresh snapshot for that segment. Previously one snapshot
+  per level was recorded and never enforced.
+- Right after the residency pass, it fails closed if another app is on
+  the GPU, or if a surface under 64 MiB has R_eff < 99.9 % or auto
+  stride ≠ 1. ViT-B, whose surface exceeds L2, gets only the app check.

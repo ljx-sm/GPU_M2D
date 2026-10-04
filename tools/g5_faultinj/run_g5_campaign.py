@@ -1083,6 +1083,12 @@ def parse_args() -> argparse.Namespace:
                              "preprocessing of every evaluation image) "
                              "before the pre-allocation gate; the G7 10K "
                              "ImageNet pass needs more than the G5 default")
+    parser.add_argument("--require-idle-gpu", action="store_true",
+                        help="G8-T4 idle rule: before every segment wait "
+                             "until no other compute process is on the "
+                             "GPU; after the residency pass fail closed if "
+                             "one appeared or (surface < 64 MiB) R_eff < "
+                             "99.9 %% of the surface / auto stride != 1")
     parser.add_argument("--no-dram-faults", action="store_true",
                         help="G8 SRAM-only campaign: no DRAM faults, only "
                              "the level's L2 cache faults (needs "
@@ -1155,6 +1161,53 @@ def parse_args() -> argparse.Namespace:
         parser.error("--no-dram-faults needs --cache-faults or --cache-ber "
                      "(an SRAM-only campaign)")
     return args
+
+
+IDLE_SURFACE_LIMIT_BITS = 64 * 2**20 * 8   # surfaces that fit L2 when idle
+IDLE_R_EFF_FRACTION = 0.999
+IDLE_POLL_SECONDS = 30
+
+
+def other_gpu_apps(snapshot: dict, device_uuid: str) -> list[str]:
+    """Compute apps on THIS GPU (apps on other GPUs are irrelevant)."""
+    return [app for app in snapshot.get("compute_apps_all_gpus") or []
+            if device_uuid and app.startswith(device_uuid)]
+
+
+def residency_idle_failures(others: list[str], r_eff_bits: float,
+                            surface_bits: int, stride: int) -> list[str]:
+    """G8-T4 idle rule at the gate (user rule 2026-10-04): a co-tenant
+    during the residency pass shrinks R_eff and so n_cache."""
+    failures = []
+    if others:
+        failures.append(f"other compute app(s) on the GPU: {others}")
+    if surface_bits <= IDLE_SURFACE_LIMIT_BITS:
+        if r_eff_bits < IDLE_R_EFF_FRACTION * surface_bits:
+            failures.append(f"R_eff {r_eff_bits / surface_bits:.4f} of a "
+                            "surface that is fully resident when idle")
+        if stride != 1:
+            failures.append(f"auto stride {stride} (idle is 1)")
+    return failures
+
+
+def wait_for_idle_gpu(device: int, device_uuid: str, label: str) -> dict:
+    """Block until no other compute process is on the GPU; returns the
+    idle co-tenancy snapshot recorded for the segment."""
+    waited = 0
+    while True:
+        snapshot = cotenancy_snapshot(device)
+        others = other_gpu_apps(snapshot, device_uuid)
+        if not others:
+            if waited:
+                print(f"{label}: GPU idle after waiting {waited} s")
+            snapshot["policy"] = "idle_required"
+            snapshot["idle_wait_seconds"] = waited
+            return snapshot
+        if waited % 300 == 0:
+            print(f"{label}: waiting for an idle GPU (other compute "
+                  f"app(s): {others})", flush=True)
+        time.sleep(IDLE_POLL_SECONDS)
+        waited += IDLE_POLL_SECONDS
 
 
 def fault_mode(args: argparse.Namespace) -> str:
@@ -1636,6 +1689,15 @@ def execute_segment(args: argparse.Namespace, contract: dict,
                 raise RuntimeError("G8 residency-map self-check failed "
                                    "(fail-closed): "
                                    + "; ".join(checks["failures"]))
+            if getattr(args, "require_idle_gpu", False):
+                idle_failures = residency_idle_failures(
+                    other_gpu_apps(cotenancy_snapshot(args.device),
+                                   device_uuid),
+                    rmap.r_eff, r_nominal * 8, checks["values"]["stride"])
+                if idle_failures:
+                    raise RuntimeError("G8 idle rule: residency pass not on "
+                                       "an idle GPU (fail-closed): "
+                                       + "; ".join(idle_failures))
             try:
                 n_cache, cache_campaign = cache_model.sample_cache_campaign(
                     rmap, classes, args.cache_ber, trials, seed, live_bases)
@@ -2044,6 +2106,10 @@ def run_once(args: argparse.Namespace) -> int:
                 {"segments": len(segments),
                  "segment_details": _segment_details(segments)},
                 uid, gid)
+        if getattr(args, "require_idle_gpu", False):
+            cotenancy = wait_for_idle_gpu(args.device, device_uuid,
+                                          f"{level_dir.name} segment "
+                                          f"{segment_index}")
         seg = execute_segment(args, contract, contract_hash, level,
                               level_dir, segment_index,
                               args.trials - completed - crashes,
@@ -2782,6 +2848,17 @@ def self_test() -> int:
                                    "TRIAL_END"] * 2
     assert seq[5][1] == {"trial_index": "1"}
     assert verify_event_structure(death, [[]], [], partial_trial=[]) == []
+    # G8-T4 idle rule
+    snap = {"compute_apps_all_gpus": ["GPU-aaa, 1, python, 10 MiB",
+                                      "GPU-bbb, 2, python, 10 MiB"]}
+    assert other_gpu_apps(snap, "GPU-bbb") == ["GPU-bbb, 2, python, 10 MiB"]
+    assert other_gpu_apps(snap, "GPU-ccc") == []
+    full = 208086656
+    assert residency_idle_failures([], full * 0.9999, full, 1) == []
+    assert len(residency_idle_failures([], full * 0.866, full, 256)) == 2
+    assert residency_idle_failures(["x"], full, full, 1)
+    big = 93867728 * 8      # ViT-B: never fully resident, no R_eff rule
+    assert residency_idle_failures([], big * 0.79, big, 64) == []
     assert fault_mode(argparse.Namespace(cache_ber=None)) == "dram_only"
     assert fault_mode(argparse.Namespace(cache_ber=1e-7,
                                          no_dram_faults=True)) == "sram_only"

@@ -22,6 +22,9 @@
 # inspected before going on. The driver logs itself (append) to
 # artifacts/g8/t4/drivers/<model>.log, so no "| tee" is needed (a pipe
 # would hide the exit status from a following "&&").
+# Idle rule (user, 2026-10-04): every level runs with --require-idle-gpu --
+# each segment waits for an idle GPU 0 and fails closed if its residency
+# pass was not idle (tools/g8_cache/audit_idle.py audits finished runs).
 # Per-level console logs: <mode root>/logs/<model>_<level>.log
 set -u -o pipefail
 
@@ -64,9 +67,10 @@ SEED=7
 DEVICE=0
 SAMPLE_CSV=/data1/luojx/datasets/imagenet1k/splits/g7_eval_10000_perclass10.csv
 case "$MODE" in
-    dram_sram) MODE_ROOT="$PROJECT/artifacts/g8/t4"; MODE_ARGS=(--cache-faults) ;;
+    dram_sram) MODE_ROOT="$PROJECT/artifacts/g8/t4"
+               MODE_ARGS=(--cache-faults --require-idle-gpu) ;;
     sram_only) MODE_ROOT="$PROJECT/artifacts/g8/t4/sram_only"
-               MODE_ARGS=(--cache-faults --no-dram-faults) ;;
+               MODE_ARGS=(--cache-faults --no-dram-faults --require-idle-gpu) ;;
     *) echo "unknown --mode $MODE (dram_sram|sram_only|all)" >&2; exit 2 ;;
 esac
 OUTPUT_ROOT="$MODE_ROOT/campaign"

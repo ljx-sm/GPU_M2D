@@ -81,6 +81,8 @@
 #   [--bootstrap]       measure-only R run; no --level (see above)
 #   [--cache-faults]    G8 L2 cache faults with the FROZEN model (G8-T3):
 #                       BER_cache = rho x the level's DRAM BER, rho = 1
+#   [--require-idle-gpu] G8-T4 idle rule: wait for an idle GPU before every
+#                       segment; fail closed if the residency pass was not idle
 #   [--no-dram-faults]  G8 SRAM-only: the level's cache faults, no DRAM faults
 #                       (with --cache-faults or --cache-ber)
 #   [--cache-ber X]     G8 L2 cache faults on top of the level's DRAM faults:
@@ -135,7 +137,7 @@ while [[ $# -gt 0 ]]; do
         --prelude-seconds|--image-cache-dir) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --output-root) CUSTOM_OUTPUT_ROOT="$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
-        --bootstrap|--cache-faults|--no-dram-faults) EXTRA_ARGS+=("$1"); shift 1 ;;
+        --bootstrap|--cache-faults|--no-dram-faults|--require-idle-gpu) EXTRA_ARGS+=("$1"); shift 1 ;;
         --device) G3_DEVICE="$2"; shift 2 ;;
         --runner) RUNNER="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
