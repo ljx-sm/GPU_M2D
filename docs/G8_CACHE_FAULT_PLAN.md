@@ -991,13 +991,21 @@ Outputs: `artifacts/g8/t4/analysis/resnet50_{sram_only,threeway}.txt`.
 - **Driver fix 1.** `run_g8_t4.sh` treated "complete" as 100 *completed*
   trials, so it reported that verified L5 as failed and stopped. Complete
   now means `trials_requested == 100` and `completed + process_fatal ==
-  100`.
+  100`. Here "completed" counts every trial that wrote its result row,
+  including DUE trials (DUE aborts the image pass, not the process). So
+  the rule is normally completed + DUE + crash = 100.
 - **Driver fix 2.** The chained `driver | tee log && driver --mode
   sram_only` started SRAM-only anyway, because a pipe's status is tee's.
   The driver now logs itself to `artifacts/g8/t4/drivers/<model>.log`,
   and `--mode all` runs dram_sram then sram_only, stopping on failure.
-  The SRAM-only run that started by mistake was stopped during L1 and
-  set aside.
+  The SRAM-only run that started by mistake was not killed: its driver
+  was stopped, and the campaign process it had already launched (root,
+  under the sudo wrapper) ran L1 to completion. SRAM-only L1:
+  G5_CAMPAIGN_VERIFIED, 100/100 trials, same code. It is kept and is
+  skipped on resume. To stop a run, press Ctrl-C in its own tmux pane:
+  the terminal delivers SIGINT to the whole foreground job, root
+  processes included. Do not kill the driver alone; that orphans the
+  running level.
 - **DRAM pairing is model-specific.** The DRAM sampler draws sites from
   the process's own physical page layout (G4/G5 design). ResNet-50 got
   the same 20 physical pages in G7-v2 and T4, so its DRAM sites matched
