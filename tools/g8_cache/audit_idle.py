@@ -108,6 +108,8 @@ def timing_check(segments: list[list[tuple[float, int]]]) -> tuple[bool, str]:
                  / sum((n - mean_n) ** 2 for n in sites))
     residuals = []
     for rows in segments:            # per-segment baseline (fresh process)
+        if not rows:                 # died on its first trial: no full pass
+            continue
         res = [s - slope * n for s, n in rows]
         base = statistics.median(res)
         residuals += [r - base for r in res]

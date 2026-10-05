@@ -1136,3 +1136,58 @@ normally completed trials; DUE / crash are counted out of 100.
 
 Outputs: `artifacts/g8/t4/analysis/deit_threeway.txt` and
 `artifacts/g8/t4/fig/deit_small_patch16_224_threeway.{png,pdf}`.
+
+### 15.7 Swin-T: three-way results (2026-10-05)
+
+All 14 runs pass the idle audit, with every one of up to 29 restart
+segments per level idle. One SRAM-only L7 attempt was refused by
+`--require-idle-gpu`: another user's process appeared during a restart
+segment's residency pass, giving R_eff 0.9951. It was set aside under
+`artifacts/g8/t4/superseded/` and L7 was rerun. Clean accuracy is
+81.30 %. Accuracy is over normally completed trials; DUE / crash are
+counted out of 100.
+
+| Level | BER | DRAM bits / trial | SRAM bits / trial | DUE / crash: DRAM-only | SRAM-only | DRAM + SRAM | Top-1: DRAM-only | SRAM-only | DRAM + SRAM |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| L1 | 1e-7 | 35 | 35 | 0 / 0 | 0 / 0 | 0 / 0 | 81.25 | 81.31 | 81.24 |
+| L2 | 5e-7 | 175 | 175 | 0 / 0 | 0 / 1 | 0 / 1 | 79.62 | 80.90 | 79.74 |
+| L3 | 1e-6 | 350 | 350 | 0 / 1 | 0 / 5 | 0 / 8 | 77.92 | 79.16 | 74.68 |
+| L4 | 3e-6 | 1,051 | 1,051 | 1 / 3 | 1 / 9 | 1 / 10 | 74.20 | 77.96 | 69.11 |
+| L5 | 5e-6 | 1,752 | 1,752 | 0 / 5 | 1 / 13 | 0 / 18 | 74.82 | 74.29 | 65.93 |
+| L6 | 7e-6 | 2,453 | 2,453 | 1 / 7 | 1 / 14 | 0 / 21 | 62.25 | 75.31 | 63.92 |
+| L7 | 1e-5 | 3,504 | 3,504 | 1 / 17 | 1 / 21 | 3 / 29 | 58.84 | 68.02 | 51.30 |
+
+**Crashes are the main Swin-T effect, and cache faults cause them too.**
+Swin-T's context-phase pool is 28 % of R.
+- SRAM-only crashes: 1 / 5 / 9 / 13 / 14 / 21 at L2–L7, more than
+  DRAM-only's 0 / 1 / 3 / 5 / 7 / 17.
+- At 1e-5, all 21 SRAM-only crashes happen mid-trial (images 1,326 to
+  9,464), at the image where a cache flip is applied.
+- DRAM + SRAM at 1e-5 has 29 crashes: 13 at image 0 (DRAM faults, first
+  inference) and 16 mid-trial (cache faults). That is consistent with
+  two independent crash sources: 1 − (1 − 0.17)(1 − 0.21) ≈ 34 % expected
+  vs 29 % observed.
+- SRAM-only can out-crash DRAM-only at equal bit counts because its
+  flips are all independent single-bit upsets. DRAM bits come in 1–3-bit
+  events (about 1.6 bits per event), so the same bit count hits about
+  1.6× more distinct locations in SRAM-only.
+
+**Accuracy.**
+- Per-level standard errors are 1.1–3.8 pp. The bumps (DRAM-only L5 >
+  L4, SRAM-only L6 > L5, DRAM + SRAM L6 > DRAM-only L6) are each within
+  about 1 SE.
+- Collapsed trials (< 40 %) at 1e-5: DRAM-only 21 / 82, SRAM-only
+  9 / 78, DRAM + SRAM 22 / 68.
+- Additivity: the level-mean interaction is within its 95 % CI of 0 at
+  every level. The widest is L6 at −7.7 pp [−17.0, +1.7]. The design is
+  unpaired, as for DeiT-S.
+- SRAM / DRAM loss ratio at 1e-5: 13.28 / 22.46 = 0.59 (ResNet-50 0.47,
+  DeiT-S 0.46).
+- Survivorship: at 1e-5, 17–29 % of trials crash and are excluded from
+  the accuracy, as in G7-v2. The crash rate is a separate reliability
+  number, not part of the accuracy.
+
+The y-axis top of `plot_threeway.py` is raised to 85 % only when the
+clean accuracy exceeds 80 %. Outputs:
+`artifacts/g8/t4/analysis/swin_threeway.txt` and
+`artifacts/g8/t4/fig/swin_tiny_patch4_window7_224_threeway.{png,pdf}`.

@@ -125,8 +125,11 @@ def main() -> int:
 
     ax.set_xscale("log")
     ax.set_xlim(bers[0] / 1.25, bers[-1] * 1.25)
-    ax.set_ylim(50, 80)
-    ax.set_yticks(range(50, 81, 5))
+    # 50-80 % (user spec); raised to the next multiple of 5 only when the
+    # clean baseline itself is above 80 % (Swin-T 81.30 %)
+    top = max(80, 5 * math.ceil((clean + 0.5) / 5))
+    ax.set_ylim(50, top)
+    ax.set_yticks(range(50, top + 1, 5))
     ax.grid(axis="y", color=GRID, linewidth=0.8, zorder=0)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
