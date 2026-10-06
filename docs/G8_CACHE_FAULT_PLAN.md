@@ -1191,3 +1191,54 @@ The y-axis top of `plot_threeway.py` is raised to 85 % only when the
 clean accuracy exceeds 80 %. Outputs:
 `artifacts/g8/t4/analysis/swin_threeway.txt` and
 `artifacts/g8/t4/fig/swin_tiny_patch4_window7_224_threeway.{png,pdf}`.
+
+### 15.8 ViT-B: three-way results, and a zero-fault determinism check (2026-10-05)
+
+All 14 runs pass the idle audit. ViT-B is larger than L2, so only the
+co-tenant check applies. Every one of its 21 processes measured R_eff
+74.214–74.215 MB, stride 64, pre-sweep miss 0.21 and order effect
+−0.35 pp, identical to the T1/T2 idle reference. Its n_cache values
+(59 / 297 / 594 / 1,781 / 2,969 / 4,156 / 5,937) are therefore the idle
+values: about 79 % of the DRAM bit counts, because only that share of
+ViT-B is L2-resident. Clean accuracy is 78.21 %.
+
+| Level | BER | DRAM bits / trial | SRAM bits / trial | DUE / crash: DRAM-only | SRAM-only | DRAM + SRAM | Top-1: DRAM-only | SRAM-only | DRAM + SRAM |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| L1 | 1e-7 | 75 | 59 | 0 / 0 | 0 / 0 | 0 / 0 | 76.80 | 78.38 | 78.20 |
+| L2 | 5e-7 | 375 | 297 | 0 / 0 | 0 / 0 | 0 / 0 | 77.72 | 78.38 | 78.36 |
+| L3 | 1e-6 | 751 | 594 | 0 / 0 | 0 / 0 | 0 / 0 | 77.54 | 78.36 | 78.37 |
+| L4 | 3e-6 | 2,253 | 1,781 | 0 / 0 | 0 / 0 | 0 / 1 | 77.08 | 77.80 | 74.68 |
+| L5 | 5e-6 | 3,755 | 2,969 | 1 / 2 | 0 / 0 | 0 / 1 | 73.85 | 77.83 | 74.48 |
+| L6 | 7e-6 | 5,257 | 4,156 | 0 / 0 | 0 / 0 | 1 / 1 | 70.86 | 77.39 | 70.52 |
+| L7 | 1e-5 | 7,509 | 5,937 | 2 / 1 | 0 / 0 | 3 / 1 | 71.73 | 76.13 | 66.73 |
+
+- **The most cache-robust model.** SRAM-only has no DUE, no crash and
+  no collapsed trial at any level, and loses only 2.08 pp at 1e-5. The
+  SRAM / DRAM loss ratio at 1e-5 is 2.08 / 6.48 = 0.32; per flip it is
+  0.40 after correcting for the 0.79 bit-count ratio. That is lower than
+  ResNet-50 (0.47), DeiT-S (0.46) and Swin-T (0.59).
+- **Additivity.** The level-mean interaction is within its 95 % CI of
+  0 at every level.
+- **DRAM-only L1 (76.80) sits below L2 (77.72).** This is the original
+  G7-v2 point; it contains 2 collapsed trials and has an SE of 1.0 pp.
+
+**SRAM-only above clean at L1–L3 (78.36–78.38 vs 78.21) is a real
+fault effect, not an offset.**
+- A zero-fault campaign (`--cache-ber 0 --no-dram-faults`, ViT-B, 3
+  trials, `artifacts/g8/t4_zerofault/`) reproduced the clean pass
+  exactly: the same top-1 on 10,000 / 10,000 images, max |ΔP| = 0,
+  78.21 %. The trial pipeline is deterministic and unbiased.
+- The above-clean values come from borderline images: 156 (ViT-B) and
+  118 (DeiT-S) change top-1 in at least 90 % of SRAM-only L1 trials,
+  against only 5 for ResNet-50 and 11 for Swin-T.
+- Their median clean top-1 probability is 0.19 (ViT-B) and 0.24
+  (DeiT-S), against 0.99 and 0.83 for images that never change, so
+  almost any perturbation flips them. Most were wrong in the clean pass,
+  and about 35 % of the flips land on the true label, which gives a
+  small net gain at very low fault counts.
+- The same mechanism explains the G7-v2 observation that DeiT-S and
+  ViT-B have a high SDC-top1 rate already at 1e-7 (9–12 %): those
+  low-confidence images change under almost any fault.
+
+Outputs: `artifacts/g8/t4/analysis/vit_threeway.txt` and
+`artifacts/g8/t4/fig/vit_base_patch16_224_threeway.{png,pdf}`.
