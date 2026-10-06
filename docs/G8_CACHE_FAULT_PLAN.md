@@ -1242,3 +1242,43 @@ fault effect, not an offset.**
 
 Outputs: `artifacts/g8/t4/analysis/vit_threeway.txt` and
 `artifacts/g8/t4/fig/vit_base_patch16_224_threeway.{png,pdf}`.
+
+### 15.9 MobileNetV3-L: three-way results (2026-10-06)
+
+All 14 runs pass the idle audit, each in a single segment: no crash in
+any mode. The surface excludes `trt-internal-5/6` for both the faults
+and the residency probe. Clean accuracy is 75.04 %.
+
+| Level | BER | DRAM bits / trial | SRAM bits / trial | DUE / crash: DRAM-only | SRAM-only | DRAM + SRAM | Top-1: DRAM-only | SRAM-only | DRAM + SRAM |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| L1 | 1e-7 | 7 | 7 | 0 / 0 | 0 / 0 | 0 / 0 | 74.58 | 75.02 | 74.80 |
+| L2 | 5e-7 | 36 | 36 | 0 / 0 | 1 / 0 | 1 / 0 | 74.34 | 74.37 | 72.71 |
+| L3 | 1e-6 | 73 | 73 | 0 / 0 | 1 / 0 | 2 / 0 | 71.60 | 73.92 | 73.21 |
+| L4 | 3e-6 | 218 | 218 | 2 / 0 | 2 / 0 | 3 / 0 | 67.13 | 69.76 | 55.95 |
+| L5 | 5e-6 | 364 | 364 | 5 / 0 | 5 / 0 | 5 / 0 | 53.38 | 65.41 | 45.80 |
+| L6 | 7e-6 | 509 | 509 | 3 / 0 | 7 / 0 | 9 / 0 | 51.58 | 63.01 | 41.89 |
+| L7 | 1e-5 | 727 | 727 | 6 / 0 | 8 / 0 | 10 / 0 | 47.27 | 58.33 | 30.02 |
+
+- **The most fragile model.** At 1e-5: DRAM-only −27.8 pp, SRAM-only
+  −16.7 pp, DRAM + SRAM −45.0 pp. Collapsed trials (< 40 %) at 1e-5:
+  34 / 94 (DRAM-only), 13 / 92 (SRAM-only), 59 / 90 (DRAM + SRAM). The
+  SRAM / DRAM loss ratio at 1e-5 is 0.60.
+- **DUE is MobileNetV3's main reliability effect, and cache faults cause
+  it too.**
+  - SRAM-only has 1 / 1 / 2 / 5 / 7 / 8 DUE trials at L2–L7, on
+    recurring trials (85 and 89 from L4; 36, 63 and 70 from L5).
+  - DRAM + SRAM's DUE trials are almost exactly the SRAM-only set: both
+    modes draw cache sites from the same idle map with the same seed,
+    so cache-caused DUEs reproduce.
+  - DRAM-only's DUE trials (17, 88, …) do not recur in DRAM + SRAM,
+    because the physical pages differ from G7-v2 (0 / 14 equal), so the
+    DRAM draws are independent (as for DeiT-S).
+- **Additivity.** No consistent deviation from additivity. Two levels
+  sit at the edge of their 95 % CI, with opposite signs: L3 −2.73
+  [−5.37, −0.09] and L4 +5.91 [−0.00, +11.82]. That is consistent with
+  chance across 7 levels × 5 models.
+- **Plot.** `plot_threeway.py` lowers the y-axis bottom below 50 % only
+  when a point falls below it (here to 25 %).
+
+Outputs: `artifacts/g8/t4/analysis/mobilenetv3_threeway.txt` and
+`artifacts/g8/t4/fig/mobilenetv3_large_100_threeway.{png,pdf}`.
