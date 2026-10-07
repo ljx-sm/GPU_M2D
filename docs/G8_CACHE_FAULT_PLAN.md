@@ -1282,3 +1282,69 @@ and the residency probe. Clean accuracy is 75.04 %.
 
 Outputs: `artifacts/g8/t4/analysis/mobilenetv3_threeway.txt` and
 `artifacts/g8/t4/fig/mobilenetv3_large_100_threeway.{png,pdf}`.
+
+### 15.10 EfficientNet-B0: three-way results (2026-10-06)
+
+All 14 runs pass the idle audit across 168 restart segments, and the
+guard never had to refuse a level. Clean accuracy is 77.36 %.
+
+| Level | BER | DRAM bits / trial | SRAM bits / trial | DUE / crash: DRAM-only | SRAM-only | DRAM + SRAM | Top-1: DRAM-only | SRAM-only | DRAM + SRAM |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| L1 | 1e-7 | 14 | 14 | 0 / 0 | 0 / 0 | 0 / 0 | 77.24 | 77.37 | 77.27 |
+| L2 | 5e-7 | 69 | 69 | 0 / 1 | 0 / 1 | 0 / 2 | 76.50 | 76.75 | 75.95 |
+| L3 | 1e-6 | 137 | 137 | 0 / 1 | 0 / 1 | 0 / 3 | 75.21 | 76.58 | 75.98 |
+| L4 | 3e-6 | 411 | 411 | 0 / 6 | 0 / 10 | 1 / 11 | 73.63 | 73.19 | 67.95 |
+| L5 | 5e-6 | 686 | 686 | 2 / 7 | 0 / 15 | 0 / 22 | 71.08 | 71.92 | 63.83 |
+| L6 | 7e-6 | 960 | 960 | 3 / 6 | 0 / 18 | 1 / 24 | 66.20 | 71.39 | 58.04 |
+| L7 | 1e-5 | 1,372 | 1,372 | 4 / 3 | 1 / 25 | 3 / 27 | 61.34 | 69.79 | 53.84 |
+
+- **Cache faults are EfficientNet-B0's main crash source.** Its
+  context-phase pool is 58 % of R, the largest of the six models.
+  - SRAM-only crashes: 1 / 1 / 10 / 15 / 18 / 25 at L2–L7.
+  - At 1e-5, all 25 SRAM-only crashes happen mid-trial. DRAM + SRAM has
+    27: 5 at image 0 (DRAM faults) and 22 mid-trial (cache faults).
+  - DRAM-only crashes fall at high BER (7 / 6 / 3 at L5–L7), as already
+    seen in G7-v2.
+- **Accuracy.**
+  - At 1e-5: DRAM-only −16.0 pp, SRAM-only −7.6 pp, DRAM + SRAM −23.5 pp.
+  - SRAM / DRAM loss ratio 0.47.
+  - Standard errors are 1.1–2.3 pp.
+  - Collapsed trials at 1e-5: 9 / 93 (DRAM-only), 1 / 74 (SRAM-only),
+    15 / 70 (DRAM + SRAM).
+- **Additivity.** Within its 95 % CI of 0 at every level. L3 −1.55
+  [−3.11, +0.01] is at the edge.
+
+Outputs: `artifacts/g8/t4/analysis/efficientnet_threeway.txt` and
+`artifacts/g8/t4/fig/efficientnet_b0_threeway.{png,pdf}`.
+
+### 15.11 G8-T4 complete: six-model summary at 1e-5 (2026-10-06)
+
+All 84 cache-mode levels (6 models × 7 levels × 2 modes) are VERIFIED
+and pass the idle audit. DRAM-only is the G7-v2 run.
+
+| Model | Clean | Top-1: DRAM-only | SRAM-only | DRAM + SRAM | SRAM / DRAM loss ratio | Crash: D / S / D+S | DUE: D / S / D+S |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ResNet-50 | 78.42 | 61.23 | 70.36 | 53.25 | 0.47 | 0 / 0 / 0 | 2 / 1 / 2 |
+| MobileNetV3-L | 75.04 | 47.27 | 58.33 | 30.02 | 0.60 | 0 / 0 / 0 | 6 / 8 / 10 |
+| EfficientNet-B0 | 77.36 | 61.34 | 69.79 | 53.84 | 0.47 | 3 / 25 / 27 | 4 / 1 / 3 |
+| DeiT-S | 78.73 | 61.11 | 70.58 | 56.17 | 0.46 | 0 / 0 / 1 | 0 / 2 / 1 |
+| Swin-T | 81.30 | 58.84 | 68.02 | 51.30 | 0.59 | 17 / 21 / 29 | 1 / 1 / 3 |
+| ViT-B | 78.21 | 71.73 | 76.13 | 66.73 | 0.32 (0.40 per flip) | 1 / 0 / 1 | 2 / 0 / 3 |
+
+Findings across all six models:
+1. **Effects add up.** The DRAM + SRAM loss equals the DRAM-only loss
+   plus the SRAM-only loss. ResNet-50, the one exactly paired model,
+   shows this to within ±0.06 pp per trial at L3–L5. The other models
+   are within level-mean CIs; no consistent sign appears.
+2. **Cache faults cost less than DRAM faults per flip, 0.32–0.60×.**
+   This is consistent with a cache flip being present for about half a
+   trial on average, versus a whole trial for a DRAM flip.
+3. **Cache faults also cause crashes and DUEs.** Crashes happen in the
+   middle of a trial when a flip lands in TensorRT runtime state; they
+   are dominant for EfficientNet-B0 and Swin-T, whose context-phase
+   pools are the largest. DUEs dominate for MobileNetV3-L, and
+   cache-caused DUEs recur on the same trials across levels.
+4. **Low-BER behaviour.** At 1e-7 every mode is within about 0.5 pp of
+   clean, except ViT-B DRAM-only (−1.4 pp: two collapsed G7-v2 trials,
+   within noise). DeiT-S and ViT-B have borderline images that flip
+   under almost any fault (§15.8).
