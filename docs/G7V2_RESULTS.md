@@ -68,7 +68,7 @@ compounding, so accuracy barely degrades.
 | MobileNetV3-L | 0/0 | 0/0 | 0/0 | 2/0 | 5/0 | 3/0 | 6/0 | 0 |
 | EfficientNet-B0 | 0/0 | 0/1 | 0/1 | 0/6 | 2/7 | 3/6 | 4/3 | 24 |
 | DeiT-S | 0/0 | 0/0 | 0/0 | 0/0 | 0/1 | 0/0 | 0/0 | 1 |
-| Swin-T | 0/0 | 0/0 | 0/1 | 0/3 | 0/5 | 0/7 | 1/17 | 33 |
+| Swin-T | 0/0 | 0/0 | 0/1 | 1/3 | 0/5 | 1/7 | 1/17 | 33 |
 | ViT-B | 0/0 | 0/0 | 0/0 | 0/0 | 1/2 | 0/0 | 2/1 | 3 |
 
 (each cell: DUE trials / PROCESS_FATAL crashes; the ResNet-50 row is

@@ -155,13 +155,12 @@ def write_markdown(rows: list[dict]) -> None:
         f"{TOLERANCE_PP} pp. Every cache-mode run passes the idle-GPU "
         "audit (`tools/g8_cache/audit_idle.py`, G8 plan §15.5).",
         "- **DRAM-only vs `G7V2_RESULTS.md` §3.** The DRAM-only DUE / "
-        "crash counts here are recomputed from the runs. They match that "
-        "table in 40 of 42 cells. The two exceptions are Swin-T L4 and "
-        "L6: that table shows 0 DUE, but the runs record 1 DUE trial "
-        "each (trial 41 at L4, trial 0 at L6) in their summary, trial "
-        "results and image rows. The accuracies there (74.20, 62.25) are "
-        "identical in both documents, because those DUE trials were "
-        "already excluded.",
+        "crash counts here are recomputed from the runs and match that "
+        "table in all 42 cells. Two cells there (Swin-T L4 and L6) "
+        "originally showed 0 DUE and were corrected on 2026-10-08 to 1 "
+        "DUE each (trial 41 at L4, trial 0 at L6), as the runs record. "
+        "The accuracies (74.20, 62.25) were unaffected, because those DUE "
+        "trials had already been excluded.",
         "",
     ]
     order = ["dram_only", "sram_only", "dram_sram"]
