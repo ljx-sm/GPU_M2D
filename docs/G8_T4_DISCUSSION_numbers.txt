@@ -1,0 +1,92 @@
+== Q1  accuracy rises between adjacent BER levels
+  ResNet-50       dram_only L7->L8: mean 66.62->67.14 (+0.51, z=0.16); collapsed 13->13; median 78.18->77.53
+  MobileNetV3-L   dram_sram L2->L3: mean 72.71->73.21 (+0.50, z=0.50); collapsed 3->0; median 75.00->74.97
+  EfficientNet-B0 dram_sram L2->L3: mean 75.95->75.98 (+0.03, z=0.05); collapsed 1->0; median 77.29->77.13
+  DeiT-S          dram_sram L2->L3: mean 77.51->77.90 (+0.38, z=0.44); collapsed 1->0; median 78.51->78.49
+  Swin-T          dram_only L4->L5: mean 74.20->74.82 (+0.62, z=0.21); collapsed 8->7; median 81.22->81.06
+  Swin-T          sram_only L5->L6: mean 74.29->75.31 (+1.02, z=0.44); collapsed 6->3; median 81.05->80.97
+  ViT-B           dram_only L1->L2: mean 76.80->77.72 (+0.92, z=0.82); collapsed 2->1; median 78.36->78.41
+  ViT-B           dram_only L6->L7: mean 70.86->71.73 (+0.86, z=0.32); collapsed 9->5; median 77.97->77.77
+  ViT-B           sram_only L1->L2: mean 78.38->78.38 (+0.00, z=0.18); collapsed 0->0; median 78.40->78.37
+  ViT-B           sram_only L4->L5: mean 77.80->77.83 (+0.04, z=0.07); collapsed 1->0; median 78.38->78.27
+  ViT-B           dram_sram L1->L2: mean 78.20->78.36 (+0.16, z=0.75); collapsed 0->0; median 78.40->78.35
+  ViT-B           dram_sram L2->L3: mean 78.36->78.37 (+0.01, z=0.18); collapsed 0->0; median 78.35->78.40
+  12 rises in 108 steps; significant at 95 %: 0; median rises > 0.05 pp: 1
+
+== Q2  crashes
+  crashes in cache modes by kind:
+    ('DeiT-S', 'dram_sram', 'first inference (DRAM)'): 3
+    ('EfficientNet-B0', 'dram_sram', 'first inference (DRAM)'): 19
+    ('EfficientNet-B0', 'dram_sram', 'mid-trial (cache)'): 70
+    ('EfficientNet-B0', 'sram_only', 'mid-trial (cache)'): 70
+    ('Swin-T', 'dram_sram', 'first inference (DRAM)'): 22
+    ('Swin-T', 'dram_sram', 'mid-trial (cache)'): 65
+    ('Swin-T', 'sram_only', 'mid-trial (cache)'): 63
+    ('ViT-B', 'dram_sram', 'first inference (DRAM)'): 4
+  flips starting at the crash image, by allocation (candidates):
+    ('EfficientNet-B0', 'trt-internal-0', 'read_only'): 4
+    ('EfficientNet-B0', 'trt-internal-2', 'read_only'): 137
+    ('EfficientNet-B0', 'trt-internal-4', 'engine_written'): 6
+    ('Swin-T', 'trt-binding-data-gpu-0', 'engine_written'): 4
+    ('Swin-T', 'trt-internal-0', 'read_only'): 21
+    ('Swin-T', 'trt-internal-2', 'read_only'): 122
+    ('Swin-T', 'trt-internal-4', 'engine_written'): 7
+  EfficientNet-B0: mid-trial crashes whose crash-image flips include trt-internal-2: 137 of 140
+  Swin-T: mid-trial crashes whose crash-image flips include trt-internal-2: 122 of 128
+
+  EfficientNet-B0: trt-internal-2 = 18944 B = 0.110 % of R; bits/event 1.60; expected hits/trial: DRAM events 0.36, SRAM flips 0.58
+    DRAM-only trials 700, crashes 24 (without a trt-internal-2 hit: 0), mean hits/trial 0.26, fatality per hit q = 0.137
+    SRAM-only trials 700, crashes 70 (without a trt-internal-2 hit: 0), mean hits/trial 0.52, fatality per hit q = 0.197
+    DRAM+SRAM trials 700, crashes 89 (without a trt-internal-2 hit: 0), mean hits/trial 0.74, fatality per hit q = 0.183
+  Swin-T: trt-internal-2 = 18944 B = 0.043 % of R; bits/event 1.60; expected hits/trial: DRAM events 0.36, SRAM flips 0.58
+    DRAM-only trials 700, crashes 33 (without a trt-internal-2 hit: 0), mean hits/trial 0.26, fatality per hit q = 0.191
+    SRAM-only trials 700, crashes 63 (without a trt-internal-2 hit: 0), mean hits/trial 0.49, fatality per hit q = 0.189
+    DRAM+SRAM trials 700, crashes 87 (without a trt-internal-2 hit: 0), mean hits/trial 0.73, fatality per hit q = 0.180
+  EfficientNet-B0 DRAM-only per level (trt-internal-2 DRAM events):
+    L1: trials with >=1 hit 1, events 1, crashes 0 (with a hit: 0)
+    L2: trials with >=1 hit 1, events 1, crashes 1 (with a hit: 1)
+    L3: trials with >=1 hit 5, events 6, crashes 1 (with a hit: 1)
+    L4: trials with >=1 hit 20, events 25, crashes 6 (with a hit: 6)
+    L5: trials with >=1 hit 30, events 36, crashes 7 (with a hit: 7)
+    L6: trials with >=1 hit 44, events 67, crashes 6 (with a hit: 6)
+    L7: trials with >=1 hit 34, events 46, crashes 3 (with a hit: 3)
+
+== Q3  ViT-B: mean / median / collapsed / non-collapsed mean
+  L1: DRAM-only 76.80/78.36/2/78.20 | SRAM-only 78.38/78.40/0/78.38 | DRAM+SRAM 78.20/78.40/0/78.20
+  L2: DRAM-only 77.72/78.41/1/78.16 | SRAM-only 78.38/78.37/0/78.38 | DRAM+SRAM 78.36/78.35/0/78.36
+  L3: DRAM-only 77.54/78.40/1/78.32 | SRAM-only 78.36/78.35/0/78.36 | DRAM+SRAM 78.37/78.40/0/78.37
+  L4: DRAM-only 77.08/78.30/1/77.86 | SRAM-only 77.80/78.38/1/78.26 | DRAM+SRAM 74.68/78.27/4/77.62
+  L5: DRAM-only 73.85/78.18/6/77.77 | SRAM-only 77.83/78.27/0/77.83 | DRAM+SRAM 74.48/78.09/5/77.54
+  L6: DRAM-only 70.86/77.97/9/77.04 | SRAM-only 77.39/78.28/0/77.39 | DRAM+SRAM 70.52/77.95/10/76.87
+  L7: DRAM-only 71.73/77.77/5/75.60 | SRAM-only 76.13/78.16/0/76.13 | DRAM+SRAM 66.73/76.85/11/74.10
+  ViT-B DRAM+SRAM: applied cache flips 1545310; on a DRAM-flipped bit 10; on a DRAM-flipped byte 94
+  zero-fault run run_L1_gpu0_1791259741904425972: images identical to the clean pass (class and probability) per trial: {'0': '10000/10000', '1': '10000/10000', '2': '10000/10000'}
+
+== Q4  at 1e-5: top-1 over completed trials -> per attempted trial (DUE / crash counted as 0)
+  ResNet-50       DRAM-only 61.23 -> 60.01 | SRAM-only 70.36 -> 69.65 | DRAM+SRAM 53.25 -> 52.19
+  MobileNetV3-L   DRAM-only 47.27 -> 44.44 | SRAM-only 58.33 -> 53.66 | DRAM+SRAM 30.02 -> 27.02
+  EfficientNet-B0 DRAM-only 61.34 -> 57.05 | SRAM-only 69.79 -> 51.64 | DRAM+SRAM 53.84 -> 37.69
+  DeiT-S          DRAM-only 61.11 -> 61.11 | SRAM-only 70.58 -> 69.16 | DRAM+SRAM 56.17 -> 55.05
+  Swin-T          DRAM-only 58.84 -> 48.25 | SRAM-only 68.02 -> 53.06 | DRAM+SRAM 51.30 -> 34.89
+  ViT-B           DRAM-only 71.73 -> 69.58 | SRAM-only 76.13 -> 76.13 | DRAM+SRAM 66.73 -> 64.06
+  engine-written share of applied SRAM-only cache flips at 1e-5 (segments that finished):
+    ResNet-50       9.9 % (read-only 207169, engine-written 22654)
+    MobileNetV3-L   26.7 % (read-only 51727, engine-written 18850)
+    EfficientNet-B0 60.6 % (read-only 5820, engine-written 8934)
+    DeiT-S          12.6 % (read-only 180479, engine-written 25907)
+    Swin-T          28.5 % (read-only 2506, engine-written 998)
+    ViT-B           5.4 % (read-only 561759, engine-written 31941)
+  borderline images (SRAM-only, lowest BER): changed in >= 90 % of trials; median clean top-1 probability changed vs never changed
+    ResNet-50       L3:   5 images (clean-wrong 4); median prob 0.109 vs 1.000
+    MobileNetV3-L   L1:   0 images (clean-wrong 0); median prob nan vs 0.813
+    EfficientNet-B0 L1:   0 images (clean-wrong 0); median prob nan vs 0.802
+    DeiT-S          L1: 118 images (clean-wrong 94); median prob 0.235 vs 0.832
+    Swin-T          L1:  11 images (clean-wrong 6); median prob 0.223 vs 0.857
+    ViT-B           L1: 156 images (clean-wrong 134); median prob 0.185 vs 0.988
+  DRAM fault pairing: physical pages equal, DRAM-only vs DRAM+SRAM (lowest BER level)
+    ResNet-50       20 of 20
+    MobileNetV3-L   0 of 14
+    EfficientNet-B0 0 of 15
+    DeiT-S          0 of 19
+    Swin-T          0 of 27
+    ViT-B           0 of 51
