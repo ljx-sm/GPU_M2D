@@ -1333,6 +1333,16 @@ BER, SRAM-only out-crashing DRAM-only, ViT-B above clean, and topics for
 further analysis): [G8_T4_DISCUSSION.md](G8_T4_DISCUSSION.md). Its
 numbers are recomputed by `tools/g8_cache/t4_discussion_numbers.py`.
 
+Per-mode figures, one per mode with the six models as curves:
+`artifacts/g8/t4/fig/fig_mode_{dram_only,sram_only,dram_sram}.{png,pdf}`,
+made by `tools/g8_cache/plot_mode_figures.py`.
+- They plot the same points as the six per-model figures, cross-checked
+  against `G8_T4_RESULTS.csv` and, for DRAM-only, the G7-v2 six-model
+  figure.
+- Model colours and markers are imported from the G7-v2 six-model
+  figure, and the y-axis (25–85 %) is shared so the three modes compare
+  directly.
+
 | Model | Clean | Top-1: DRAM-only | SRAM-only | DRAM + SRAM | SRAM / DRAM loss ratio | Crash: D / S / D+S | DUE: D / S / D+S |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | ResNet-50 | 78.42 | 61.23 | 70.36 | 53.25 | 0.47 | 0 / 0 / 0 | 2 / 1 / 2 |
