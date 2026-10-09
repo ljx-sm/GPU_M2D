@@ -65,7 +65,6 @@ def run_stats(run: Path) -> dict:
                 correct[t] += 1
     images = len(label)
     accs = [100 * correct[t] / images for t in correct if t not in due]
-    clean = 100 * sum(1 for r in label.values()) and None
     with (run / "g1_5_g5_clean_pass.csv").open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     clean = 100 * sum(int(r["clean_class"]) == int(r["label"])
