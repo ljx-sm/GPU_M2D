@@ -382,6 +382,72 @@ WORKLOADS = {
 DEFAULT_WORKLOAD = "g5_resisc45_resnet50"
 
 # Back-compat aliases: offline analysis imports these module attributes.
+# G8 rho = 5000 ladder (user decision 2026-10-13): lambda_SRAM ~ 3e-9 and
+# lambda_DRAM ~ 1.2e-12 /bit/day (docs/G8_T3_SRAM_BER_DERIVATION.md, rho
+# ~2.5e3, taken as 5e3). DRAM levels R1..R7 = 1e-10, 2e-10, 1e-9, 2e-9,
+# 1e-8, 2e-8, 1e-7; the cache BER is 5000 x the level (5e-7 ... 5e-4).
+# Same derivation rule as every other level (B = round(BER x R), the
+# 60/20/20 composition); B = 0 is legal here (no DRAM flips, the trial
+# still runs). A separate table so the G7-v2/T4 tools that read
+# WORKLOADS[w]["levels"] are unchanged; level_by_name and
+# assert_frozen_levels cover both.
+R_LEVELS = {
+    "g7v2_imagenet1k_resnet50": [
+        {"level": "R1", "ber": 1e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R2", "ber": 2e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R3", "ber": 1e-09, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R4", "ber": 2e-09, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R5", "ber": 1e-08, "bits": 2, "s": 2, "d": 0, "t": 0},
+        {"level": "R6", "ber": 2e-08, "bits": 5, "s": 2, "d": 0, "t": 1},
+        {"level": "R7", "ber": 1e-07, "bits": 23, "s": 8, "d": 3, "t": 3},
+    ],
+    "g7v2_imagenet1k_mobilenetv3_large_100": [
+        {"level": "R1", "ber": 1e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R2", "ber": 2e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R3", "ber": 1e-09, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R4", "ber": 2e-09, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R5", "ber": 1e-08, "bits": 1, "s": 1, "d": 0, "t": 0},
+        {"level": "R6", "ber": 2e-08, "bits": 1, "s": 1, "d": 0, "t": 0},
+        {"level": "R7", "ber": 1e-07, "bits": 7, "s": 2, "d": 1, "t": 1},
+    ],
+    "g7v2_imagenet1k_efficientnet_b0": [
+        {"level": "R1", "ber": 1e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R2", "ber": 2e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R3", "ber": 1e-09, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R4", "ber": 2e-09, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R5", "ber": 1e-08, "bits": 1, "s": 1, "d": 0, "t": 0},
+        {"level": "R6", "ber": 2e-08, "bits": 3, "s": 1, "d": 1, "t": 0},
+        {"level": "R7", "ber": 1e-07, "bits": 14, "s": 6, "d": 1, "t": 2},
+    ],
+    "g7v2_imagenet1k_vit_base_patch16_224": [
+        {"level": "R1", "ber": 1e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R2", "ber": 2e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R3", "ber": 1e-09, "bits": 1, "s": 1, "d": 0, "t": 0},
+        {"level": "R4", "ber": 2e-09, "bits": 2, "s": 2, "d": 0, "t": 0},
+        {"level": "R5", "ber": 1e-08, "bits": 8, "s": 3, "d": 1, "t": 1},
+        {"level": "R6", "ber": 2e-08, "bits": 15, "s": 5, "d": 2, "t": 2},
+        {"level": "R7", "ber": 1e-07, "bits": 75, "s": 28, "d": 10, "t": 9},
+    ],
+    "g7v2_imagenet1k_deit_small_patch16_224": [
+        {"level": "R1", "ber": 1e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R2", "ber": 2e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R3", "ber": 1e-09, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R4", "ber": 2e-09, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R5", "ber": 1e-08, "bits": 2, "s": 2, "d": 0, "t": 0},
+        {"level": "R6", "ber": 2e-08, "bits": 4, "s": 2, "d": 1, "t": 0},
+        {"level": "R7", "ber": 1e-07, "bits": 21, "s": 8, "d": 2, "t": 3},
+    ],
+    "g7v2_imagenet1k_swin_tiny_patch4_window7_224": [
+        {"level": "R1", "ber": 1e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R2", "ber": 2e-10, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R3", "ber": 1e-09, "bits": 0, "s": 0, "d": 0, "t": 0},
+        {"level": "R4", "ber": 2e-09, "bits": 1, "s": 1, "d": 0, "t": 0},
+        {"level": "R5", "ber": 1e-08, "bits": 4, "s": 2, "d": 1, "t": 0},
+        {"level": "R6", "ber": 2e-08, "bits": 7, "s": 2, "d": 1, "t": 1},
+        {"level": "R7", "ber": 1e-07, "bits": 35, "s": 13, "d": 5, "t": 4},
+    ],
+}
+
 RESIDENT_BYTES_NOMINAL = WORKLOADS[DEFAULT_WORKLOAD]["resident_bytes_nominal"]
 R_BITS = RESIDENT_BYTES_NOMINAL * 8  # 211,427,424 bits
 LEVELS = WORKLOADS[DEFAULT_WORKLOAD]["levels"]
@@ -401,7 +467,9 @@ CACHE_RHO = 1.0
 # first-principles derivation (docs/G8_T3_SRAM_BER_DERIVATION.md: best
 # estimate ~2.5e3, plausible 1e2..1e4): the DRAM levels are unchanged and
 # only the cache BER becomes 300 x the level's BER.
-CACHE_RHO_CHOICES = (1.0, 300.0)
+# 5000.0 = the rho of the R1..R7 ladder (R_LEVELS, user decision
+# 2026-10-13, superseding the 300 trial: cache BER 5e-7 ... 5e-4).
+CACHE_RHO_CHOICES = (1.0, 300.0, 5000.0)
 
 
 def cache_ber_for(level: dict, rho: float = CACHE_RHO) -> float:
@@ -451,6 +519,8 @@ def resolve_composition(bits: int,
     (same objective and tie rule; equivalence cross-checked in self_test,
     and the frozen literals pin the real levels -- see the comment at
     EXHAUSTIVE_BITS_LIMIT)."""
+    if bits == 0:
+        return (0, 0, 0)  # an empty level (G8 rho = 5000 ladder)
     if bits <= exhaustive_limit:
         s_lo, s_hi = 0, bits
         d_lo, d_hi = 0, bits // 2
@@ -494,7 +564,7 @@ def assert_frozen_levels(workload: str = DEFAULT_WORKLOAD) -> None:
     """Re-derive the workload's table from its BERs and R; refuse on drift."""
     entry = workload_by_name(workload)
     r_bits = entry["resident_bytes_nominal"] * 8
-    for row in entry["levels"]:
+    for row in list(entry["levels"]) + R_LEVELS.get(workload, []):
         bits = round(row["ber"] * r_bits)
         composition = resolve_composition(bits)
         if bits != row["bits"] or composition != (row["s"], row["d"],
@@ -507,7 +577,8 @@ def assert_frozen_levels(workload: str = DEFAULT_WORKLOAD) -> None:
 
 
 def level_by_name(name: str, workload: str = DEFAULT_WORKLOAD) -> dict:
-    levels = workload_by_name(workload)["levels"]
+    levels = list(workload_by_name(workload)["levels"]) + \
+        R_LEVELS.get(workload, [])
     for entry in levels:
         if entry["level"] == name:
             return entry
@@ -911,6 +982,15 @@ def self_test() -> int:
         assert_frozen_levels(workload_name)
     assert resolve_composition(8) == (3, 1, 1)  # exact 60/20/20 block
     assert resolve_composition(2) == (2, 0, 0)
+    assert resolve_composition(0) == (0, 0, 0)
+    # the rho = 5000 ladder: seven R levels per G7-v2 workload, BERs
+    # 1e-10 .. 1e-7, cache BER 5e-7 .. 5e-4
+    for workload_name, rows in R_LEVELS.items():
+        assert [r["level"] for r in rows] == [f"R{i}" for i in range(1, 8)]
+        assert [r["ber"] for r in rows] == [1e-10, 2e-10, 1e-9, 2e-9, 1e-8,
+                                            2e-8, 1e-7]
+        assert level_by_name("R7", workload_name)["ber"] == 1e-7
+        assert abs(cache_ber_for(rows[-1], 5000.0) - 5e-4) < 1e-18
     # windowed large-B path == exhaustive (forced via a low limit)
     for bits in (173, 347, 1057, 1444, 2114):
         assert resolve_composition(bits, exhaustive_limit=100) == \

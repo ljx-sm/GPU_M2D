@@ -12,11 +12,19 @@
 # written to separate roots so the rho = 1 runs stay untouched:
 #   dram_sram -> artifacts/g8/rho300/campaign/
 #   sram_only -> artifacts/g8/rho300/sram_only/campaign/
+# --rho 5000 (user, 2026-10-13, supersedes 300): the R1..R7 ladder
+# (fault_model.R_LEVELS: DRAM BER 1e-10, 2e-10, 1e-9, 2e-9, 1e-8, 2e-8,
+# 1e-7; cache BER 5000 x that = 5e-7 ... 5e-4) in all three modes, the
+# G7-v2 DRAM-only runs no longer apply:
+#   --mode dram_only -> artifacts/g8/rho5000/dram_only/campaign/
+#   --mode dram_sram -> artifacts/g8/rho5000/campaign/
+#   --mode sram_only -> artifacts/g8/rho5000/sram_only/campaign/
+#   --mode all       -> dram_only, dram_sram, sram_only (stops on failure)
 #
 # Usage (from the repo root, in tmux; needs passwordless sudo like the
 # other campaign entry points):
 #   scripts/run_g8_t4.sh resnet50 [--mode dram_sram|sram_only|all]
-#                        [--levels "L3 L4"] [--trials 100] [--rho 1|300]
+#                        [--levels "L3 L4"] [--trials 100] [--rho 1|300|5000]
 #                        [--dry-run]
 #
 # --dry-run prints the resolved levels and campaign commands only.
@@ -59,7 +67,9 @@ case "$RHO" in
     1) BASE_ROOT="$PROJECT/artifacts/g8/t4"; RHO_ARGS=(); RHO_PY=1.0 ;;
     300) BASE_ROOT="$PROJECT/artifacts/g8/rho300"; RHO_ARGS=(--cache-rho 300)
          RHO_PY=300.0 ;;
-    *) echo "unknown --rho $RHO (1|300)" >&2; exit 2 ;;
+    5000) BASE_ROOT="$PROJECT/artifacts/g8/rho5000"; RHO_ARGS=(--cache-rho 5000)
+          RHO_PY=5000.0 ;;
+    *) echo "unknown --rho $RHO (1|300|5000)" >&2; exit 2 ;;
 esac
 
 if ((!DRY_RUN)) && [[ -z "${G8_T4_LOGGING:-}" ]]; then
@@ -72,6 +82,9 @@ if [[ "$MODE" == all ]]; then
     FORWARD=(--trials "$TRIALS" --rho "$RHO")
     [[ -n "$LEVELS" ]] && FORWARD+=(--levels "$LEVELS")
     ((DRY_RUN)) && FORWARD+=(--dry-run)
+    if [[ "$RHO" == 5000 ]]; then
+        "$0" "$MODEL" --mode dram_only "${FORWARD[@]}" || exit 1
+    fi
     "$0" "$MODEL" --mode dram_sram "${FORWARD[@]}" || exit 1
     "$0" "$MODEL" --mode sram_only "${FORWARD[@]}" || exit 1
     exit 0
@@ -81,12 +94,17 @@ SEED=7
 DEVICE=0
 SAMPLE_CSV=/data1/luojx/datasets/imagenet1k/splits/g7_eval_10000_perclass10.csv
 case "$MODE" in
+    dram_only) [[ "$RHO" == 5000 ]] || {
+                   echo "--mode dram_only is for --rho 5000 (rho 1 DRAM-only = the G7-v2 runs)" >&2
+                   exit 2; }
+               MODE_ROOT="$BASE_ROOT/dram_only"
+               MODE_ARGS=(--require-idle-gpu) ;;
     dram_sram) MODE_ROOT="$BASE_ROOT"
                MODE_ARGS=(--cache-faults "${RHO_ARGS[@]}" --require-idle-gpu) ;;
     sram_only) MODE_ROOT="$BASE_ROOT/sram_only"
                MODE_ARGS=(--cache-faults "${RHO_ARGS[@]}" --no-dram-faults
                           --require-idle-gpu) ;;
-    *) echo "unknown --mode $MODE (dram_sram|sram_only|all)" >&2; exit 2 ;;
+    *) echo "unknown --mode $MODE (dram_only|dram_sram|sram_only|all)" >&2; exit 2 ;;
 esac
 OUTPUT_ROOT="$MODE_ROOT/campaign"
 IMAGE_CACHE="$PROJECT/artifacts/g8/image_cache"
@@ -94,12 +112,13 @@ LOG_DIR="$MODE_ROOT/logs"
 mkdir -p "$OUTPUT_ROOT" "$LOG_DIR"
 
 # Engine + preprocessing from the workload's newest G7 bootstrap; default
-# levels = every frozen level with 1e-7 <= BER <= 1e-5.
+# levels = every frozen level with 1e-7 <= BER <= 1e-5 (rho 1, 300), or
+# the R1..R7 ladder (rho 5000).
 read -r -d '' PY <<'EOF'
 import glob, json, sys
 sys.path.insert(0, "tools/g5_faultinj")
 import fault_model
-workload, want = sys.argv[1], sys.argv[2].split()
+workload, want, rho = sys.argv[1], sys.argv[2].split(), sys.argv[3]
 boots = [json.load(open(p)) for p in sorted(glob.glob(
     "artifacts/g7/campaign/run_bootstrap_*/bootstrap.json"))]
 boots = [b for b in boots if b["workload"] == workload]
@@ -108,17 +127,20 @@ if not boots:
 pt = list(boots[-1]["runner_passthrough"])
 if "--image-cache-dir" in pt:
     i = pt.index("--image-cache-dir"); del pt[i:i + 2]
-levels = [r["level"] for r in fault_model.WORKLOADS[workload]["levels"]
-          if 1e-7 * (1 - 1e-9) <= r["ber"] <= 1e-5 * (1 + 1e-9)]
+if rho == "5000":
+    levels = [r["level"] for r in fault_model.R_LEVELS[workload]]
+else:
+    levels = [r["level"] for r in fault_model.WORKLOADS[workload]["levels"]
+              if 1e-7 * (1 - 1e-9) <= r["ber"] <= 1e-5 * (1 + 1e-9)]
 if want:
     bad = [lv for lv in want if lv not in levels]
     if bad:
-        sys.exit(f"levels {bad} not in {workload}'s 1e-7..1e-5 set {levels}")
+        sys.exit(f"levels {bad} not in {workload}'s set {levels}")
     levels = want
 print(" ".join(levels))
 print(" ".join(["--engine", boots[-1]["engine_path"]] + pt))
 EOF
-mapfile -t CFG < <(python3 -c "$PY" "$WORKLOAD" "$LEVELS") || exit 2
+mapfile -t CFG < <(python3 -c "$PY" "$WORKLOAD" "$LEVELS" "$RHO") || exit 2
 [[ ${#CFG[@]} -eq 2 ]] || { echo "config lookup failed for $WORKLOAD" >&2; exit 2; }
 read -r -a RUN_LEVELS <<<"${CFG[0]}"
 read -r -a PASSTHROUGH <<<"${CFG[1]}"
@@ -132,8 +154,9 @@ for p in glob.glob(f"{root}/run_{level}_gpu*/summary.json"):
     s = json.load(open(p))
     if (s.get("workload") == workload and s.get("level") == level
             and s.get("status") == "G5_CAMPAIGN_VERIFIED"
-            and s.get("g8_cache_ber_frozen") is True
-            and float(s.get("g8_cache_rho") or 0) == rho
+            and (mode == "dram_only" or (
+                s.get("g8_cache_ber_frozen") is True
+                and float(s.get("g8_cache_rho") or 0) == rho))
             and s.get("fault_mode", "dram_sram") == mode
             and s.get("trials_requested") == trials
             and s.get("trials_completed", 0)

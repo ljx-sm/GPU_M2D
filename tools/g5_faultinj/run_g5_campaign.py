@@ -236,8 +236,9 @@ def verify_work_model(level: dict, campaign: list[list[dict]]) -> list[str]:
     would cancel."""
     failures: list[str] = []
     expected = (level["s"], level["d"], level["t"])
-    for sites in campaign:
-        trial = sites[0]["trial_index"]
+    for position, sites in enumerate(campaign):
+        # the trial index is the position (a B = 0 level has empty trials)
+        trial = sites[0]["trial_index"] if sites else position
         sizes: dict[int, int] = {}
         for site in sites:
             sizes[site["event_index"]] = \
@@ -1407,10 +1408,12 @@ def execute_segment(args: argparse.Namespace, contract: dict,
         excludes_g8 = workload_entry.get("surface_excludes", ())
         if excludes_g8:
             g8_runner_args += ["--l2-probe-exclude", ",".join(excludes_g8)]
-        if getattr(args, "no_dram_faults", False):
-            # SRAM-only: every trial has zero DRAM sites, so the trial
-            # count is declared instead of implied by the work rows
-            g8_runner_args += ["--campaign-trials", str(trials)]
+    if getattr(args, "no_dram_faults", False) or \
+            (level is not None and level["bits"] == 0):
+        # SRAM-only, or a B = 0 level (G8 rho = 5000 ladder): every trial
+        # has zero DRAM sites, so the trial count is declared instead of
+        # implied by the work rows
+        g8_runner_args += ["--campaign-trials", str(trials)]
 
     observer: G2Observer | None = None
     process: subprocess.Popen[bytes] | None = None
@@ -2487,6 +2490,9 @@ def self_test() -> int:
                                            resident_bytes_expected=None)
         assert [len(sites) for sites in tiny] == [2, 2]
         assert verify_work_model(fault_model.level_by_name("L1"), tiny) == []
+    # a B = 0 level (rho = 5000 ladder): empty trials verify
+    assert verify_work_model(fault_model.level_by_name(
+        "R1", "g7v2_imagenet1k_resnet50"), [[], []]) == []
 
     # --- restart protocol: process-death classification
     def trial_event_lines(sites) -> str:
