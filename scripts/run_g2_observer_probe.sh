@@ -81,6 +81,7 @@
 #   [--bootstrap]       measure-only R run; no --level (see above)
 #   [--cache-faults]    G8 L2 cache faults with the FROZEN model (G8-T3):
 #                       BER_cache = rho x the level's DRAM BER, rho = 1
+#   [--cache-rho R]     with --cache-faults: frozen rho choice (1 or 300)
 #   [--require-idle-gpu] G8-T4 idle rule: wait for an idle GPU before every
 #                       segment; fail closed if the residency pass was not idle
 #   [--no-dram-faults]  G8 SRAM-only: the level's cache faults, no DRAM faults
@@ -130,7 +131,7 @@ while [[ $# -gt 0 ]]; do
         --rep-uniform|--rep-seed) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --table|--binding-bit|--internal-bit|--sample-index|\
-        --level|--trials|--seed|--cache-ber) \
+        --level|--trials|--seed|--cache-ber|--cache-rho) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --engine|--sample-csv|--workload|--class-count|\
         --preprocess|--resize-scale|--interp|--mean|--std|\

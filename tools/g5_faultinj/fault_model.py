@@ -396,11 +396,20 @@ EVENT_SHARE_TARGET = (0.60, 0.20, 0.20)  # SBU / 2-bit MCU / 3-bit MCU
 # each trial is treated as one equal-fluence window for DRAM and L2
 # (docs/G8_CACHE_FAULT_PLAN.md section 3.3).
 CACHE_RHO = 1.0
+# Frozen rho values a campaign may select (--cache-rho). 1.0 = the G8-T4
+# campaign. 300.0 = the user's tentative rho of 2026-10-13, after the
+# first-principles derivation (docs/G8_T3_SRAM_BER_DERIVATION.md: best
+# estimate ~2.5e3, plausible 1e2..1e4): the DRAM levels are unchanged and
+# only the cache BER becomes 300 x the level's BER.
+CACHE_RHO_CHOICES = (1.0, 300.0)
 
 
-def cache_ber_for(level: dict) -> float:
+def cache_ber_for(level: dict, rho: float = CACHE_RHO) -> float:
     """Frozen G8 cache BER of a DRAM level (BER_cache = rho x BER)."""
-    return CACHE_RHO * level["ber"]
+    if rho not in CACHE_RHO_CHOICES:
+        raise ModelError(f"rho {rho:g} is not a frozen choice "
+                         f"{CACHE_RHO_CHOICES}")
+    return rho * level["ber"]
 
 # Composition solving: exhaustive below EXHAUSTIVE_BITS_LIMIT, windowed
 # above it (the O(B^2) exhaustive grid costs ~41 s at B=21143 and runs at
@@ -1008,10 +1017,16 @@ def self_test() -> int:
         assert surface_rows_for(workload_name, [probe_row, data_row]) == \
             [data_row], workload_name
     # G8-T3: the frozen cache BER of a level is rho x its DRAM BER
-    assert CACHE_RHO == 1.0
+    assert CACHE_RHO == 1.0 and CACHE_RHO in CACHE_RHO_CHOICES
     for workload_name, entry in WORKLOADS.items():
         for row in entry["levels"]:
             assert cache_ber_for(row) == row["ber"], (workload_name, row)
+            assert cache_ber_for(row, 300.0) == 300.0 * row["ber"]
+    try:
+        cache_ber_for(LEVELS[0], 2.0)
+        raise AssertionError("unfrozen rho accepted")
+    except ModelError:
+        pass
     # G8 cache classes: disjoint, TRT-internal only, never an excluded
     # allocation
     for workload_name, entry in WORKLOADS.items():

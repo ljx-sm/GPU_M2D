@@ -7,11 +7,17 @@
 #   --mode dram_sram (default)  DRAM + L2  -> artifacts/g8/t4/campaign/
 #   --mode sram_only            L2 only    -> artifacts/g8/t4/sram_only/campaign/
 #   --mode all                  dram_sram, then sram_only (stops on failure)
+# --rho 300 (user, 2026-10-13): the same campaigns with the frozen cache
+# rho = 300 -- DRAM levels unchanged, BER_cache = 300 x the level's BER --
+# written to separate roots so the rho = 1 runs stay untouched:
+#   dram_sram -> artifacts/g8/rho300/campaign/
+#   sram_only -> artifacts/g8/rho300/sram_only/campaign/
 #
 # Usage (from the repo root, in tmux; needs passwordless sudo like the
 # other campaign entry points):
 #   scripts/run_g8_t4.sh resnet50 [--mode dram_sram|sram_only|all]
-#                        [--levels "L3 L4"] [--trials 100] [--dry-run]
+#                        [--levels "L3 L4"] [--trials 100] [--rho 1|300]
+#                        [--dry-run]
 #
 # --dry-run prints the resolved levels and campaign commands only.
 #
@@ -37,25 +43,33 @@ LEVELS=""
 TRIALS=100
 DRY_RUN=0
 MODE=dram_sram
+RHO=1
 while (($#)); do
     case "$1" in
         --levels) LEVELS="$2"; shift 2 ;;
         --trials) TRIALS="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift 1 ;;
         --mode) MODE="$2"; shift 2 ;;
+        --rho) RHO="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 WORKLOAD="g7v2_imagenet1k_${MODEL#g7v2_imagenet1k_}"
+case "$RHO" in
+    1) BASE_ROOT="$PROJECT/artifacts/g8/t4"; RHO_ARGS=(); RHO_PY=1.0 ;;
+    300) BASE_ROOT="$PROJECT/artifacts/g8/rho300"; RHO_ARGS=(--cache-rho 300)
+         RHO_PY=300.0 ;;
+    *) echo "unknown --rho $RHO (1|300)" >&2; exit 2 ;;
+esac
 
 if ((!DRY_RUN)) && [[ -z "${G8_T4_LOGGING:-}" ]]; then
     export G8_T4_LOGGING=1
-    DRIVER_LOG="$PROJECT/artifacts/g8/t4/drivers/${MODEL#g7v2_imagenet1k_}.log"
+    DRIVER_LOG="$BASE_ROOT/drivers/${MODEL#g7v2_imagenet1k_}.log"
     mkdir -p "$(dirname "$DRIVER_LOG")"
     exec > >(tee -a "$DRIVER_LOG") 2>&1
 fi
 if [[ "$MODE" == all ]]; then
-    FORWARD=(--trials "$TRIALS")
+    FORWARD=(--trials "$TRIALS" --rho "$RHO")
     [[ -n "$LEVELS" ]] && FORWARD+=(--levels "$LEVELS")
     ((DRY_RUN)) && FORWARD+=(--dry-run)
     "$0" "$MODEL" --mode dram_sram "${FORWARD[@]}" || exit 1
@@ -67,10 +81,11 @@ SEED=7
 DEVICE=0
 SAMPLE_CSV=/data1/luojx/datasets/imagenet1k/splits/g7_eval_10000_perclass10.csv
 case "$MODE" in
-    dram_sram) MODE_ROOT="$PROJECT/artifacts/g8/t4"
-               MODE_ARGS=(--cache-faults --require-idle-gpu) ;;
-    sram_only) MODE_ROOT="$PROJECT/artifacts/g8/t4/sram_only"
-               MODE_ARGS=(--cache-faults --no-dram-faults --require-idle-gpu) ;;
+    dram_sram) MODE_ROOT="$BASE_ROOT"
+               MODE_ARGS=(--cache-faults "${RHO_ARGS[@]}" --require-idle-gpu) ;;
+    sram_only) MODE_ROOT="$BASE_ROOT/sram_only"
+               MODE_ARGS=(--cache-faults "${RHO_ARGS[@]}" --no-dram-faults
+                          --require-idle-gpu) ;;
     *) echo "unknown --mode $MODE (dram_sram|sram_only|all)" >&2; exit 2 ;;
 esac
 OUTPUT_ROOT="$MODE_ROOT/campaign"
@@ -109,14 +124,16 @@ read -r -a RUN_LEVELS <<<"${CFG[0]}"
 read -r -a PASSTHROUGH <<<"${CFG[1]}"
 
 verified() {  # $1 = level -> exit 0 if a complete frozen-cache run exists
-    python3 - "$OUTPUT_ROOT" "$WORKLOAD" "$1" "$TRIALS" "$MODE" <<'EOF'
+    python3 - "$OUTPUT_ROOT" "$WORKLOAD" "$1" "$TRIALS" "$MODE" "$RHO_PY" <<'EOF'
 import glob, json, sys
 root, workload, level, trials, mode = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+rho = float(sys.argv[6])
 for p in glob.glob(f"{root}/run_{level}_gpu*/summary.json"):
     s = json.load(open(p))
     if (s.get("workload") == workload and s.get("level") == level
             and s.get("status") == "G5_CAMPAIGN_VERIFIED"
             and s.get("g8_cache_ber_frozen") is True
+            and float(s.get("g8_cache_rho") or 0) == rho
             and s.get("fault_mode", "dram_sram") == mode
             and s.get("trials_requested") == trials
             and s.get("trials_completed", 0)
@@ -126,7 +143,7 @@ sys.exit(1)
 EOF
 }
 
-echo "== G8-T4 [$MODE] $WORKLOAD levels: ${RUN_LEVELS[*]} trials=$TRIALS seed=$SEED $(date '+%F %T')"
+echo "== G8-T4 [$MODE] rho=$RHO $WORKLOAD levels: ${RUN_LEVELS[*]} trials=$TRIALS seed=$SEED $(date '+%F %T')"
 for LEVEL in "${RUN_LEVELS[@]}"; do
     if RUN=$(verified "$LEVEL"); then
         echo "== $LEVEL already VERIFIED ($RUN), skipped"
@@ -152,4 +169,4 @@ for LEVEL in "${RUN_LEVELS[@]}"; do
         exit 1
     fi
 done
-echo "== G8-T4 [$MODE] $WORKLOAD done $(date '+%F %T')"
+echo "== G8-T4 [$MODE] rho=$RHO $WORKLOAD done $(date '+%F %T')"

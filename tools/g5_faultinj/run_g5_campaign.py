@@ -1098,7 +1098,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-faults", action="store_true",
                         help="G8 L2 cache faults with the FROZEN model "
                              "(G8-T3): BER_cache = rho x the level's DRAM "
-                             "BER, rho = fault_model.CACHE_RHO (1.0)")
+                             "BER, rho = --cache-rho (default "
+                             "fault_model.CACHE_RHO = 1.0)")
+    parser.add_argument("--cache-rho", type=float, default=None,
+                        help="with --cache-faults: the frozen rho to use, "
+                             "one of fault_model.CACHE_RHO_CHOICES (1, 300); "
+                             "recorded as g8_cache_rho")
     parser.add_argument("--cache-ber", type=float, default=None,
                         help="G8 L2 cache faults: BER_cache per trial "
                              "(n_cache = round(BER_cache x R_eff_bits) from "
@@ -1150,8 +1155,15 @@ def parse_args() -> argparse.Namespace:
             level = fault_model.level_by_name(args.level, args.workload)
         except fault_model.ModelError as exc:
             parser.error(str(exc))
-        args.cache_ber = fault_model.cache_ber_for(level)
+        if args.cache_rho is None:
+            args.cache_rho = fault_model.CACHE_RHO
+        try:
+            args.cache_ber = fault_model.cache_ber_for(level, args.cache_rho)
+        except fault_model.ModelError as exc:
+            parser.error(f"--cache-rho: {exc}")
         args.cache_ber_frozen = True
+    elif args.cache_rho is not None:
+        parser.error("--cache-rho needs --cache-faults")
     if args.cache_ber is not None:
         if args.bootstrap:
             parser.error("--cache-ber cannot be combined with --bootstrap")
@@ -1723,7 +1735,7 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             cache_model.write_cache_work(cache_work_output, cache_campaign)
             os.chmod(cache_work_output, 0o644)
             print(f"[{run_id}] G8 cache sampler: BER_cache {args.cache_ber:g} "
-                  f"({'frozen rho=' + str(fault_model.CACHE_RHO) if args.cache_ber_frozen else 'explicit'}) "
+                  f"({'frozen rho=' + str(args.cache_rho) if args.cache_ber_frozen else 'explicit'}) "
                   f"x R_eff_bits {rmap.r_eff:.0f} -> n_cache {n_cache} per "
                   f"trial, {n_cache * trials} cache sites")
             n_expected = args.cache_ber * rmap.r_eff
@@ -1738,7 +1750,7 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             extra["g8_cache"] = {
                 "cache_ber": args.cache_ber,
                 "cache_ber_frozen": args.cache_ber_frozen,
-                "cache_rho": (fault_model.CACHE_RHO
+                "cache_rho": (args.cache_rho
                               if args.cache_ber_frozen else None),
                 "n_cache": n_cache,
                 "n_cache_expected": n_expected,
@@ -2201,7 +2213,7 @@ def run_once(args: argparse.Namespace) -> int:
         "g8_cache_ber": getattr(args, "cache_ber", None),
         "g8_cache_ber_frozen": getattr(args, "cache_ber_frozen", False)
         if getattr(args, "cache_ber", None) is not None else None,
-        "g8_cache_rho": fault_model.CACHE_RHO
+        "g8_cache_rho": getattr(args, "cache_rho", None)
         if getattr(args, "cache_ber_frozen", False) else None,
         "g8_n_cache_per_segment": [
             (seg["extra"].get("g8_cache") or {}).get("n_cache")
