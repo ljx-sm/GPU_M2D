@@ -155,6 +155,12 @@ BER_cache = ρ × BER_DRAM(level),   ρ = λ_SRAM,per-bit / λ_DRAM,per-bit = 1
   no measurement of L2 and GDDR on the same GPU, and none at all for
   Ada/4N/GDDR6X. Terrestrial-neutron evidence would instead put ρ near
   10³, which is outside this campaign's scope.
+- **Re-examined 2026-10-12** in
+  [G8_T3_SRAM_BER_DERIVATION.md](G8_T3_SRAM_BER_DERIVATION.md). The
+  heavy-ion "0.1–2" above compared saturation cross sections. Integrated
+  over the GCR LET spectrum and the LEO trapped-proton environment, the
+  best estimate is ρ ≈ 2.5 × 10³ (10²–10⁴). The T4 campaign keeps the
+  frozen ρ = 1. How to read its curves is in §8 of that document.
 - **Equal-fluence trial (modelling assumption).** One trial is treated as
   one exposure window shared by GDDR and L2, so the DRAM flips of the
   level and the cache flips of the trial come from the same per-bit rate.
