@@ -81,7 +81,7 @@
 #   [--bootstrap]       measure-only R run; no --level (see above)
 #   [--cache-faults]    G8 L2 cache faults with the FROZEN model (G8-T3):
 #                       BER_cache = rho x the level's DRAM BER, rho = 1
-#   [--cache-rho R]     with --cache-faults: frozen rho choice (1 or 300)
+#   [--cache-rho R]     with --cache-faults: frozen rho choice (1, 10, 300, 5000)
 #   [--require-idle-gpu] G8-T4 idle rule: wait for an idle GPU before every
 #                       segment; fail closed if the residency pass was not idle
 #   [--no-dram-faults]  G8 SRAM-only: the level's cache faults, no DRAM faults

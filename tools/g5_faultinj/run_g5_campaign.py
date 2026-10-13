@@ -1103,7 +1103,7 @@ def parse_args() -> argparse.Namespace:
                              "fault_model.CACHE_RHO = 1.0)")
     parser.add_argument("--cache-rho", type=float, default=None,
                         help="with --cache-faults: the frozen rho to use, "
-                             "one of fault_model.CACHE_RHO_CHOICES (1, 300); "
+                             "one of fault_model.CACHE_RHO_CHOICES (1, 10, 300, 5000); "
                              "recorded as g8_cache_rho")
     parser.add_argument("--cache-ber", type=float, default=None,
                         help="G8 L2 cache faults: BER_cache per trial "

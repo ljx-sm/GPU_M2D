@@ -20,11 +20,16 @@
 #   --mode dram_sram -> artifacts/g8/rho5000/campaign/
 #   --mode sram_only -> artifacts/g8/rho5000/sram_only/campaign/
 #   --mode all       -> dram_only, dram_sram, sram_only (stops on failure)
+# --rho 10 (user, 2026-10-13, supersedes 300 and 5000): the G7-v2 DRAM
+# levels 1e-7 ... 1e-5 unchanged (the G7-v2 DRAM-only runs stand), cache
+# BER 10 x the level = 1e-6 ... 1e-4:
+#   dram_sram -> artifacts/g8/rho10/campaign/
+#   sram_only -> artifacts/g8/rho10/sram_only/campaign/
 #
 # Usage (from the repo root, in tmux; needs passwordless sudo like the
 # other campaign entry points):
 #   scripts/run_g8_t4.sh resnet50 [--mode dram_sram|sram_only|all]
-#                        [--levels "L3 L4"] [--trials 100] [--rho 1|300|5000]
+#                        [--levels "L3 L4"] [--trials 100] [--rho 1|10|300|5000]
 #                        [--dry-run]
 #
 # --dry-run prints the resolved levels and campaign commands only.
@@ -65,11 +70,13 @@ done
 WORKLOAD="g7v2_imagenet1k_${MODEL#g7v2_imagenet1k_}"
 case "$RHO" in
     1) BASE_ROOT="$PROJECT/artifacts/g8/t4"; RHO_ARGS=(); RHO_PY=1.0 ;;
+    10) BASE_ROOT="$PROJECT/artifacts/g8/rho10"; RHO_ARGS=(--cache-rho 10)
+        RHO_PY=10.0 ;;
     300) BASE_ROOT="$PROJECT/artifacts/g8/rho300"; RHO_ARGS=(--cache-rho 300)
          RHO_PY=300.0 ;;
     5000) BASE_ROOT="$PROJECT/artifacts/g8/rho5000"; RHO_ARGS=(--cache-rho 5000)
           RHO_PY=5000.0 ;;
-    *) echo "unknown --rho $RHO (1|300|5000)" >&2; exit 2 ;;
+    *) echo "unknown --rho $RHO (1|10|300|5000)" >&2; exit 2 ;;
 esac
 
 if ((!DRY_RUN)) && [[ -z "${G8_T4_LOGGING:-}" ]]; then
@@ -95,7 +102,7 @@ DEVICE=0
 SAMPLE_CSV=/data1/luojx/datasets/imagenet1k/splits/g7_eval_10000_perclass10.csv
 case "$MODE" in
     dram_only) [[ "$RHO" == 5000 ]] || {
-                   echo "--mode dram_only is for --rho 5000 (rho 1 DRAM-only = the G7-v2 runs)" >&2
+                   echo "--mode dram_only is for --rho 5000 (rho 1/10/300 DRAM-only = the G7-v2 runs)" >&2
                    exit 2; }
                MODE_ROOT="$BASE_ROOT/dram_only"
                MODE_ARGS=(--require-idle-gpu) ;;

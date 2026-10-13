@@ -469,7 +469,10 @@ CACHE_RHO = 1.0
 # only the cache BER becomes 300 x the level's BER.
 # 5000.0 = the rho of the R1..R7 ladder (R_LEVELS, user decision
 # 2026-10-13, superseding the 300 trial: cache BER 5e-7 ... 5e-4).
-CACHE_RHO_CHOICES = (1.0, 300.0, 5000.0)
+# 10.0 = user decision 2026-10-13 (supersedes 300 and 5000): the G7-v2
+# DRAM levels unchanged (1e-7 ... 1e-5, so the G7-v2 DRAM-only runs
+# stand), cache BER 10 x the level (1e-6 ... 1e-4).
+CACHE_RHO_CHOICES = (1.0, 10.0, 300.0, 5000.0)
 
 
 def cache_ber_for(level: dict, rho: float = CACHE_RHO) -> float:
@@ -1102,6 +1105,7 @@ def self_test() -> int:
         for row in entry["levels"]:
             assert cache_ber_for(row) == row["ber"], (workload_name, row)
             assert cache_ber_for(row, 300.0) == 300.0 * row["ber"]
+            assert cache_ber_for(row, 10.0) == 10.0 * row["ber"]
     try:
         cache_ber_for(LEVELS[0], 2.0)
         raise AssertionError("unfrozen rho accepted")
