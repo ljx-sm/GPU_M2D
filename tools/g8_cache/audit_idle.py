@@ -46,6 +46,12 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parents[2]
 ROOTS = [("dram_sram", PROJECT / "artifacts/g8/t4/campaign"),
          ("sram_only", PROJECT / "artifacts/g8/t4/sram_only/campaign")]
+# cache-mode roots per frozen rho (scripts/run_g8_t4.sh --rho)
+ROOTS_BY_RHO = {
+    "1": ROOTS,
+    "10": [("dram_sram", PROJECT / "artifacts/g8/rho10/campaign"),
+           ("sram_only", PROJECT / "artifacts/g8/rho10/sram_only/campaign")],
+}
 IDLE_MEMORY_MIB = 64
 EVENT = re.compile(r"GPU_M2D_EVENT,event=(TRIAL_BEGIN|TRIAL_INJECTED_END),"
                    r"trial_index=(\d+),.*?wall_time_ns=(\d+)")
@@ -165,10 +171,12 @@ def audit_run(mode: str, summary_path: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("model")
+    parser.add_argument("--rho", default="1", choices=sorted(ROOTS_BY_RHO),
+                        help="audit the cache-mode runs of this frozen rho")
     args = parser.parse_args()
     workload = "g7v2_imagenet1k_" + args.model.removeprefix("g7v2_imagenet1k_")
     results = []
-    for mode, root in ROOTS:
+    for mode, root in ROOTS_BY_RHO[args.rho]:
         for path in sorted(root.glob("run_L*/summary.json")):
             s = json.loads(path.read_text())
             if s.get("workload") != workload or \

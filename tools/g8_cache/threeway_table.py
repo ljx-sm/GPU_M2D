@@ -33,6 +33,21 @@ import fault_model  # noqa: E402
 MODES = [("dram_only", "DRAM-only", PROJECT / "artifacts/g7/campaign"),
          ("sram_only", "SRAM-only", PROJECT / "artifacts/g8/t4/sram_only/campaign"),
          ("dram_sram", "DRAM+SRAM", PROJECT / "artifacts/g8/t4/campaign")]
+# Cache-mode roots per frozen rho (scripts/run_g8_t4.sh --rho); the
+# DRAM-only column is the G7-v2 runs for every rho that keeps the G7-v2
+# DRAM levels (1 and 10).
+CACHE_ROOTS = {
+    "1": MODES[1:],
+    "10": [("sram_only", "SRAM-only",
+            PROJECT / "artifacts/g8/rho10/sram_only/campaign"),
+           ("dram_sram", "DRAM+SRAM", PROJECT / "artifacts/g8/rho10/campaign")],
+}
+
+
+def modes_for(rho: str) -> list:
+    if rho not in CACHE_ROOTS:
+        raise SystemExit(f"--rho {rho}: expected one of {sorted(CACHE_ROOTS)}")
+    return MODES[:1] + CACHE_ROOTS[rho]
 
 
 def find_run(root: Path, workload: str, level: str) -> Path:
@@ -82,13 +97,15 @@ def run_stats(run: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("model")
+    parser.add_argument("--rho", default="1",
+                        help="cache-mode runs of this frozen rho (1, 10)")
     args = parser.parse_args()
     model = args.model.removeprefix("g7v2_imagenet1k_")
     workload = f"g7v2_imagenet1k_{model}"
     levels = [r for r in fault_model.WORKLOADS[workload]["levels"]
               if 1e-7 * (1 - 1e-9) <= r["ber"] <= 1e-5 * (1 + 1e-9)]
     table = {}
-    for key, _, root in MODES:
+    for key, _, root in modes_for(args.rho):
         for row in levels:
             st = run_stats(find_run(root, workload, row["level"]))
             if st["completed"] + st["crash"] != 100:
@@ -96,7 +113,8 @@ def main() -> int:
                                  f"{st['completed']} + crash {st['crash']} != 100")
             table[key, row["level"]] = st
     clean = table["dram_only", levels[0]["level"]]["clean"]
-    print(f"{workload}  clean top-1 {clean:.2f} %  (accuracy over normally "
+    print(f"{workload}  rho {args.rho}  clean top-1 {clean:.2f} %  "
+          "(accuracy over normally "
           "completed trials; DUE / crash out of 100)\n")
     print("level  BER   | DRAM bits SRAM bits | DUE/crash  D-only S-only D+S "
           "| top-1 %  D-only  S-only   D+S")
