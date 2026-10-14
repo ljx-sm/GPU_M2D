@@ -13,6 +13,10 @@ and --points-csv re-renders from it without re-reading the runs.
   /data1/luojx/miniforge3/envs/vit_fault/bin/python \\
       tools/g8_cache/plot_threeway.py resnet50 --label ResNet-50
 Writes artifacts/g8/t4/fig/<model>_threeway.{png,pdf} + _points.csv.
+
+--rho 10 plots the rho = 10 cache-mode runs (artifacts/g8/rho10; the
+DRAM-only curve stays the G7-v2 runs) into artifacts/g8/rho10/fig. The x
+axis stays the level's DRAM BER; the axis label states SRAM BER = 10 x.
 """
 
 from __future__ import annotations
@@ -52,10 +56,25 @@ def ladder(workload: str) -> list[dict]:
             if 1e-7 * (1 - 1e-9) <= row["ber"] <= 1e-5 * (1 + 1e-9)]
 
 
-def collect_rows(workload: str, min_trials: int) -> list[dict]:
+# cache-mode roots per frozen rho (scripts/run_g8_t4.sh --rho)
+RHO_ROOTS = {
+    "1": {"sram_only": PROJECT / "artifacts/g8/t4/sram_only/campaign",
+          "dram_sram": PROJECT / "artifacts/g8/t4/campaign"},
+    "10": {"sram_only": PROJECT / "artifacts/g8/rho10/sram_only/campaign",
+           "dram_sram": PROJECT / "artifacts/g8/rho10/campaign"},
+}
+
+
+def series_for(rho: str) -> list[tuple]:
+    roots = RHO_ROOTS[rho]
+    return [(mode, label, roots.get(mode, root), color, marker)
+            for mode, label, root, color, marker in SERIES]
+
+
+def collect_rows(workload: str, min_trials: int, rho: str = "1") -> list[dict]:
     levels = ladder(workload)
     rows = []
-    for mode, label, root, _, _ in SERIES:
+    for mode, label, root, _, _ in series_for(rho):
         data = collect(root, min_trials, workload,
                        levels=[row["level"] for row in levels])
         missing = [row["level"] for row in levels if row["level"] not in data]
@@ -86,9 +105,15 @@ def main() -> int:
     parser.add_argument("--min-trials", type=int, default=100)
     parser.add_argument("--points-csv", type=Path,
                         help="re-render from an earlier points CSV")
-    parser.add_argument("--outdir", type=Path,
-                        default=PROJECT / "artifacts/g8/t4/fig")
+    parser.add_argument("--rho", default="1", choices=sorted(RHO_ROOTS),
+                        help="cache-mode runs of this frozen rho")
+    parser.add_argument("--outdir", type=Path, default=None,
+                        help="default artifacts/g8/t4/fig (rho 1) or "
+                             "artifacts/g8/rho<rho>/fig")
     args = parser.parse_args()
+    if args.outdir is None:
+        args.outdir = PROJECT / ("artifacts/g8/t4/fig" if args.rho == "1"
+                                 else f"artifacts/g8/rho{args.rho}/fig")
     model = args.model.removeprefix("g7v2_imagenet1k_")
     workload = f"g7v2_imagenet1k_{model}"
     if workload not in fault_model.WORKLOADS:
@@ -101,7 +126,7 @@ def main() -> int:
                          clean_acc_pct=float(row["clean_acc_pct"]))
                     for row in csv.DictReader(source)]
     else:
-        rows = collect_rows(workload, args.min_trials)
+        rows = collect_rows(workload, args.min_trials, args.rho)
 
     import matplotlib
     matplotlib.use("Agg")
@@ -146,7 +171,9 @@ def main() -> int:
     # 5e-6 / 7e-6 / 1e-5 sit ~0.15 decades apart: rotate so they don't collide
     ax.set_xticklabels([tick_label(b) for b in bers], rotation=28,
                        rotation_mode="anchor", ha="right")
-    ax.set_xlabel("Bit error rate (BER)", fontsize=10.5, color=INK)
+    ax.set_xlabel("Bit error rate (BER)" if args.rho == "1" else
+                  f"DRAM BER (SRAM BER = {args.rho} × DRAM BER)",
+                  fontsize=10.5, color=INK)
     ax.set_ylabel("Top-1 accuracy (%)", fontsize=10.5, color=INK)
     ax.set_title(args.label or model, fontsize=11.5, color=INK, loc="left")
     ax.legend(frameon=False, fontsize=8.8, loc="lower left",
