@@ -9,9 +9,16 @@ build_t4_results.py --rho 10 derives from the VERIFIED runs
 (docs/G8_T4_RHO10_RESULTS.csv). DUE trials are not crashes and are not
 counted. The plotted rows are written to a points CSV next to the figure.
 
+--metric due (user spec 2026-10-23) draws the DUE rate the same way: DUE
+trials (the first invalid output -- NaN/Inf probability or an
+out-of-range class -- aborts the trial) / trials requested. A crashed
+trial cannot also be a DUE, so crash-heavy models' DUE rates are
+censored by their crashes.
+
   /data1/luojx/miniforge3/envs/vit_fault/bin/python \\
-      tools/g8_cache/plot_crash_rate.py
-Writes artifacts/g8/rho10/fig/crash_vs_ber_dram_sram.{png,pdf} + _points.csv.
+      tools/g8_cache/plot_crash_rate.py [--metric crash|due]
+Writes artifacts/g8/rho10/fig/{crash,due}_vs_ber_dram_sram.{png,pdf} +
+_points.csv.
 """
 
 from __future__ import annotations
@@ -38,18 +45,23 @@ MODELS = [
     ("ViT-B", "#008300", "P", "--"),
 ]
 MODE = "dram_sram"
+# metric -> (results-CSV count column, y label, y-axis top, tick step)
+METRICS = {
+    "crash": ("crash_trials", "Crash probability (%)", 100, 20),
+    "due": ("due_trials", "DUE rate (%)", 40, 10),
+}
 
 
-def load(path: Path) -> list[dict]:
+def load(path: Path, column: str) -> list[dict]:
     with path.open(newline="", encoding="utf-8") as source:
         rows = [r for r in csv.DictReader(source) if r["mode"] == MODE]
     out = []
     for r in rows:
         requested = int(r["trials_requested"])
         out.append({"model": r["model"], "level": r["level"],
-                    "ber": float(r["ber"]), "crash_trials": int(r["crash_trials"]),
+                    "ber": float(r["ber"]), "count": int(r[column]),
                     "trials_requested": requested,
-                    "crash_pct": 100.0 * int(r["crash_trials"]) / requested})
+                    "pct": 100.0 * int(r[column]) / requested})
     for model, *_ in MODELS:
         if len([r for r in out if r["model"] == model]) != 7:
             raise SystemExit(f"{model}: expected 7 {MODE} levels in {path}")
@@ -62,8 +74,10 @@ def main() -> int:
                         default=PROJECT / "docs/G8_T4_RHO10_RESULTS.csv")
     parser.add_argument("--outdir", type=Path,
                         default=PROJECT / "artifacts/g8/rho10/fig")
+    parser.add_argument("--metric", choices=sorted(METRICS), default="crash")
     args = parser.parse_args()
-    rows = load(args.results_csv)
+    column, ylabel, ytop, ystep = METRICS[args.metric]
+    rows = load(args.results_csv, column)
 
     import matplotlib
     matplotlib.use("Agg")
@@ -74,11 +88,12 @@ def main() -> int:
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
     for model, color, marker, style in MODELS:
-        pts = sorted((r["ber"], r["crash_pct"]) for r in rows
+        pts = sorted((r["ber"], r["pct"]) for r in rows
                      if r["model"] == model)
-        # ResNet-50 and MobileNetV3-L both sit at 0 %: MobileNetV3-L is
-        # drawn as a larger hollow marker so the filled one stays visible
-        hollow = model == "MobileNetV3-L"
+        # crash: ResNet-50 and MobileNetV3-L both sit at 0 %, so
+        # MobileNetV3-L is drawn as a larger hollow marker and the filled
+        # one stays visible
+        hollow = args.metric == "crash" and model == "MobileNetV3-L"
         ax.plot([p[0] for p in pts], [p[1] for p in pts], style,
                 marker=marker, color=color, linewidth=1.8,
                 markersize=8 if hollow else 5.5,
@@ -89,8 +104,8 @@ def main() -> int:
 
     ax.set_xscale("log")
     ax.set_xlim(bers[0] / 1.25, bers[-1] * 1.25)
-    ax.set_ylim(-3, 100)
-    ax.set_yticks(range(0, 101, 20))
+    ax.set_ylim(-0.03 * ytop, ytop)
+    ax.set_yticks(range(0, ytop + 1, ystep))
     ax.grid(axis="y", color=GRID, linewidth=0.8, zorder=0)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
@@ -104,28 +119,28 @@ def main() -> int:
                        rotation_mode="anchor", ha="right")
     ax.set_xlabel("DRAM BER (SRAM BER = 10 × DRAM BER)", fontsize=10.5,
                   color=INK)
-    ax.set_ylabel("Crash probability (%)", fontsize=10.5, color=INK)
+    ax.set_ylabel(ylabel, fontsize=10.5, color=INK)
     ax.legend(frameon=False, fontsize=8.8, loc="upper left", ncol=2,
               labelcolor="#52514e", handletextpad=0.4, borderaxespad=0.4,
               columnspacing=1.2)
 
     fig.tight_layout()
     args.outdir.mkdir(parents=True, exist_ok=True)
-    stem = args.outdir / "crash_vs_ber_dram_sram"
+    stem = args.outdir / f"{args.metric}_vs_ber_dram_sram"
     for ext in ("png", "pdf"):
         fig.savefig(f"{stem}.{ext}", dpi=300, facecolor="white",
                     bbox_inches="tight")
     with open(f"{stem}_points.csv", "w", encoding="utf-8",
               newline="") as sink:
         writer = csv.writer(sink)
-        writer.writerow(["model", "level", "ber", "crash_trials",
-                         "trials_requested", "crash_pct"])
+        writer.writerow(["model", "level", "ber", f"{args.metric}_trials",
+                         "trials_requested", f"{args.metric}_pct"])
         for model, *_ in MODELS:
             for r in sorted((r for r in rows if r["model"] == model),
                             key=lambda r: r["ber"]):
                 writer.writerow([model, r["level"], f"{r['ber']:g}",
-                                 r["crash_trials"], r["trials_requested"],
-                                 f"{r['crash_pct']:.1f}"])
+                                 r["count"], r["trials_requested"],
+                                 f"{r['pct']:.1f}"])
     print(f"wrote {stem}.png / .pdf / _points.csv")
     return 0
 
