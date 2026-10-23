@@ -396,23 +396,45 @@ WORKLOADS = {
             {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
         ],
     },
-    # G8 precision study (user decision 2026-10-22): resnet50 as a
-    # FP16 TensorRT engine (tools/g7_prep/build_g7_float_engine.py,
-    # /data1/luojx/g7_models/resnet50/fp16.engine), DRAM + SRAM at rho = 10
-    # on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0): accepts only
-    # --bootstrap until tools/g7_prep/freeze_g7v2_workload.py freezes R
-    # and the levels, then adds cache_alloc_classes from the DRAM-only
-    # evidence run (scripts/run_g8_precision.sh).
+    # G8 precision study (user decision 2026-10-22): ResNet-50
+    # as a FP16 TensorRT engine (build_g7_float_engine.py),
+    # DRAM + SRAM at rho = 10 on the G7-v2 seven-level ladder
+    # L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5.
+    # R was MEASURED by the bootstrap run
+    # artifacts/g8/precision/bootstrap/run_bootstrap_gpu0_1792723021840102789
+    # (engine /data1/luojx/g7_models/resnet50/fp16.engine,
+    # sha256 d130d5222e6c...,
+    # snapshot allocations=23, pa_pages=28, rows=48)
+    # and the seven levels derived from it; every literal is an
+    # EXHAUSTIVE-solver literal. Frozen in place by
+    # tools/g7_prep/freeze_g7v2_workload.py; cache_alloc_classes
+    # are added by its --alloc-classes-root mode.
     "g8p_imagenet1k_resnet50_fp16": {
-        "resident_bytes_nominal": 0,
+        # G8 cache-flip lifetime classes of the TRT-internal allocations
+        # (derive_alloc_classes.py rule over the VERIFIED DRAM-only
+        # evidence run(s) run_L7_gpu0_1792723093050291626 under
+        # artifacts/g8/precision/evidence/campaign:
+        # read-only = every restore_check `exact`); bindings (TENSOR:*)
+        # are engine-written by definition.
+        "cache_alloc_classes": {
+            "read_only": ('trt-internal-0', 'trt-internal-1', 'trt-internal-10', 'trt-internal-11', 'trt-internal-12', 'trt-internal-13', 'trt-internal-14', 'trt-internal-15', 'trt-internal-16', 'trt-internal-17', 'trt-internal-18', 'trt-internal-2', 'trt-internal-3', 'trt-internal-4', 'trt-internal-5', 'trt-internal-6', 'trt-internal-7', 'trt-internal-8', 'trt-internal-9'),
+            "engine_written": ('trt-internal-19',),
+        },
+        "resident_bytes_nominal": 55_780_312,
         "levels": [
-            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L1", "ber": 1e-07, "bits": 45, "s": 17, "d": 5, "t": 6},
+            {"level": "L2", "ber": 5e-07, "bits": 223, "s": 83, "d": 28,
+             "t": 28},
+            {"level": "L3", "ber": 1e-06, "bits": 446, "s": 166, "d": 56,
+             "t": 56},
+            {"level": "L4", "ber": 3e-06, "bits": 1339, "s": 502, "d": 168,
+             "t": 167},
+            {"level": "L5", "ber": 5e-06, "bits": 2231, "s": 836, "d": 279,
+             "t": 279},
+            {"level": "L6", "ber": 7e-06, "bits": 3124, "s": 1172, "d": 391,
+             "t": 390},
+            {"level": "L7", "ber": 1e-05, "bits": 4462, "s": 1672, "d": 558,
+             "t": 558},
         ],
     },
     # G8 precision study (user decision 2026-10-22): vit_base_patch16_224 as a
