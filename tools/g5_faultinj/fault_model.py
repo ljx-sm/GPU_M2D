@@ -377,6 +377,82 @@ WORKLOADS = {
              "t": 438},
         ],
     },
+    # G8 precision study (user decision 2026-10-22): resnet50 as a
+    # FP32 TensorRT engine (tools/g7_prep/build_g7_float_engine.py,
+    # /data1/luojx/g7_models/resnet50/fp32.engine), DRAM + SRAM at rho = 10
+    # on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0): accepts only
+    # --bootstrap until tools/g7_prep/freeze_g7v2_workload.py freezes R
+    # and the levels, then adds cache_alloc_classes from the DRAM-only
+    # evidence run (scripts/run_g8_precision.sh).
+    "g8p_imagenet1k_resnet50_fp32": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # G8 precision study (user decision 2026-10-22): resnet50 as a
+    # FP16 TensorRT engine (tools/g7_prep/build_g7_float_engine.py,
+    # /data1/luojx/g7_models/resnet50/fp16.engine), DRAM + SRAM at rho = 10
+    # on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0): accepts only
+    # --bootstrap until tools/g7_prep/freeze_g7v2_workload.py freezes R
+    # and the levels, then adds cache_alloc_classes from the DRAM-only
+    # evidence run (scripts/run_g8_precision.sh).
+    "g8p_imagenet1k_resnet50_fp16": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # G8 precision study (user decision 2026-10-22): vit_base_patch16_224 as a
+    # FP32 TensorRT engine (tools/g7_prep/build_g7_float_engine.py,
+    # /data1/luojx/g7_models/vit_base_patch16_224/fp32.engine), DRAM + SRAM at rho = 10
+    # on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0): accepts only
+    # --bootstrap until tools/g7_prep/freeze_g7v2_workload.py freezes R
+    # and the levels, then adds cache_alloc_classes from the DRAM-only
+    # evidence run (scripts/run_g8_precision.sh).
+    "g8p_imagenet1k_vit_base_patch16_224_fp32": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # G8 precision study (user decision 2026-10-22): vit_base_patch16_224 as a
+    # FP16 TensorRT engine (tools/g7_prep/build_g7_float_engine.py,
+    # /data1/luojx/g7_models/vit_base_patch16_224/fp16.engine), DRAM + SRAM at rho = 10
+    # on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0): accepts only
+    # --bootstrap until tools/g7_prep/freeze_g7v2_workload.py freezes R
+    # and the levels, then adds cache_alloc_classes from the DRAM-only
+    # evidence run (scripts/run_g8_precision.sh).
+    "g8p_imagenet1k_vit_base_patch16_224_fp16": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
 }
 
 DEFAULT_WORKLOAD = "g5_resisc45_resnet50"

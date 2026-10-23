@@ -25,12 +25,22 @@
 # BER 10 x the level = 1e-6 ... 1e-4:
 #   dram_sram -> artifacts/g8/rho10/campaign/
 #   sram_only -> artifacts/g8/rho10/sram_only/campaign/
+# --precision fp32|fp16 (user, 2026-10-22): the G8 precision study --
+# workload g8p_imagenet1k_<model>_<precision> (ResNet-50, ViT-B; FP32 /
+# FP16 engine, bootstrap under artifacts/g8/precision/bootstrap), rho 10
+# only, the same seven levels and protocol as the INT8 runs:
+#   --mode dram_sram -> artifacts/g8/rho10/precision/campaign/
+#   --mode dram_only -> artifacts/g8/precision/evidence/campaign/ (the
+#                       DRAM-only evidence run for cache_alloc_classes)
+# Precision runs pass --timeout-seconds 43200 (an FP32 ViT-B level runs
+# far past the 3600 s default inside one segment). Orchestrated end to end
+# by scripts/run_g8_precision.sh.
 #
 # Usage (from the repo root, in tmux; needs passwordless sudo like the
 # other campaign entry points):
 #   scripts/run_g8_t4.sh resnet50 [--mode dram_sram|sram_only|all]
 #                        [--levels "L3 L4"] [--trials 100] [--rho 1|10|300|5000]
-#                        [--dry-run]
+#                        [--precision fp32|fp16] [--dry-run]
 #
 # --dry-run prints the resolved levels and campaign commands only.
 #
@@ -57,6 +67,7 @@ TRIALS=100
 DRY_RUN=0
 MODE=dram_sram
 RHO=1
+PRECISION=""
 while (($#)); do
     case "$1" in
         --levels) LEVELS="$2"; shift 2 ;;
@@ -64,10 +75,29 @@ while (($#)); do
         --dry-run) DRY_RUN=1; shift 1 ;;
         --mode) MODE="$2"; shift 2 ;;
         --rho) RHO="$2"; shift 2 ;;
+        --precision) PRECISION="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 WORKLOAD="g7v2_imagenet1k_${MODEL#g7v2_imagenet1k_}"
+NAME="${MODEL#g7v2_imagenet1k_}"
+BOOT_ROOT="artifacts/g7/campaign"
+EXTRA_ARGS=()
+if [[ -n "$PRECISION" ]]; then
+    case "$PRECISION" in
+        fp32|fp16) ;;
+        *) echo "unknown --precision $PRECISION (fp32|fp16)" >&2; exit 2 ;;
+    esac
+    [[ "$RHO" == 10 ]] || { echo "--precision runs use --rho 10 only" >&2; exit 2; }
+    case "$MODE" in
+        dram_sram|dram_only) ;;
+        *) echo "--precision supports --mode dram_sram|dram_only" >&2; exit 2 ;;
+    esac
+    WORKLOAD="g8p_imagenet1k_${NAME}_${PRECISION}"
+    NAME="${NAME}_${PRECISION}"
+    BOOT_ROOT="artifacts/g8/precision/bootstrap"
+    EXTRA_ARGS=(--timeout-seconds 43200)
+fi
 case "$RHO" in
     1) BASE_ROOT="$PROJECT/artifacts/g8/t4"; RHO_ARGS=(); RHO_PY=1.0 ;;
     10) BASE_ROOT="$PROJECT/artifacts/g8/rho10"; RHO_ARGS=(--cache-rho 10)
@@ -78,10 +108,17 @@ case "$RHO" in
           RHO_PY=5000.0 ;;
     *) echo "unknown --rho $RHO (1|10|300|5000)" >&2; exit 2 ;;
 esac
+if [[ -n "$PRECISION" ]]; then
+    if [[ "$MODE" == dram_only ]]; then
+        BASE_ROOT="$PROJECT/artifacts/g8/precision/evidence"
+    else
+        BASE_ROOT="$PROJECT/artifacts/g8/rho10/precision"
+    fi
+fi
 
 if ((!DRY_RUN)) && [[ -z "${G8_T4_LOGGING:-}" ]]; then
     export G8_T4_LOGGING=1
-    DRIVER_LOG="$BASE_ROOT/drivers/${MODEL#g7v2_imagenet1k_}.log"
+    DRIVER_LOG="$BASE_ROOT/drivers/${NAME}.log"
     mkdir -p "$(dirname "$DRIVER_LOG")"
     exec > >(tee -a "$DRIVER_LOG") 2>&1
 fi
@@ -101,10 +138,11 @@ SEED=7
 DEVICE=0
 SAMPLE_CSV=/data1/luojx/datasets/imagenet1k/splits/g7_eval_10000_perclass10.csv
 case "$MODE" in
-    dram_only) [[ "$RHO" == 5000 ]] || {
-                   echo "--mode dram_only is for --rho 5000 (rho 1/10/300 DRAM-only = the G7-v2 runs)" >&2
+    dram_only) [[ "$RHO" == 5000 || -n "$PRECISION" ]] || {
+                   echo "--mode dram_only is for --rho 5000 or --precision (rho 1/10/300 DRAM-only = the G7-v2 runs)" >&2
                    exit 2; }
                MODE_ROOT="$BASE_ROOT/dram_only"
+               [[ -n "$PRECISION" ]] && MODE_ROOT="$BASE_ROOT"
                MODE_ARGS=(--require-idle-gpu) ;;
     dram_sram) MODE_ROOT="$BASE_ROOT"
                MODE_ARGS=(--cache-faults "${RHO_ARGS[@]}" --require-idle-gpu) ;;
@@ -125,12 +163,13 @@ read -r -d '' PY <<'EOF'
 import glob, json, sys
 sys.path.insert(0, "tools/g5_faultinj")
 import fault_model
-workload, want, rho = sys.argv[1], sys.argv[2].split(), sys.argv[3]
+workload, want, rho, boot_root = (sys.argv[1], sys.argv[2].split(),
+                                  sys.argv[3], sys.argv[4])
 boots = [json.load(open(p)) for p in sorted(glob.glob(
-    "artifacts/g7/campaign/run_bootstrap_*/bootstrap.json"))]
+    f"{boot_root}/run_bootstrap_*/bootstrap.json"))]
 boots = [b for b in boots if b["workload"] == workload]
 if not boots:
-    sys.exit(f"no G7 bootstrap for {workload}")
+    sys.exit(f"no bootstrap for {workload} under {boot_root}")
 pt = list(boots[-1]["runner_passthrough"])
 if "--image-cache-dir" in pt:
     i = pt.index("--image-cache-dir"); del pt[i:i + 2]
@@ -147,7 +186,7 @@ if want:
 print(" ".join(levels))
 print(" ".join(["--engine", boots[-1]["engine_path"]] + pt))
 EOF
-mapfile -t CFG < <(python3 -c "$PY" "$WORKLOAD" "$LEVELS" "$RHO") || exit 2
+mapfile -t CFG < <(python3 -c "$PY" "$WORKLOAD" "$LEVELS" "$RHO" "$BOOT_ROOT") || exit 2
 [[ ${#CFG[@]} -eq 2 ]] || { echo "config lookup failed for $WORKLOAD" >&2; exit 2; }
 read -r -a RUN_LEVELS <<<"${CFG[0]}"
 read -r -a PASSTHROUGH <<<"${CFG[1]}"
@@ -179,12 +218,13 @@ for LEVEL in "${RUN_LEVELS[@]}"; do
         echo "== $LEVEL already VERIFIED ($RUN), skipped"
         continue
     fi
-    LOG="$LOG_DIR/${MODEL#g7v2_imagenet1k_}_${LEVEL}.log"
+    LOG="$LOG_DIR/${NAME}_${LEVEL}.log"
     CMD=(sudo -n scripts/run_g2_observer_probe.sh --api g5campaign --device "$DEVICE"
         --workload "$WORKLOAD" "${PASSTHROUGH[@]}"
         --level "$LEVEL" --trials "$TRIALS" --seed "$SEED"
         --sample-csv "$SAMPLE_CSV" --output-root "$OUTPUT_ROOT"
-        --image-cache-dir "$IMAGE_CACHE" "${MODE_ARGS[@]}")
+        --image-cache-dir "$IMAGE_CACHE" "${MODE_ARGS[@]}"
+        "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}")
     if ((DRY_RUN)); then echo "== $LEVEL would run: ${CMD[*]} > $LOG"; continue; fi
     echo "== $LEVEL start $(date '+%F %T') (GPU $DEVICE other processes:" \
          "$(nvidia-smi -i "$DEVICE" --query-compute-apps=pid --format=csv,noheader | wc -l)) log: $LOG"

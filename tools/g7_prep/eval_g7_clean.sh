@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # GPU_M2D G7: clean FP32+INT8 evaluation wiring (same env as
 # build_g7_engines.sh).  usage: eval_g7_clean.sh PHYSICAL_GPU [MODEL ...]
+# G8 precision study: eval_g7_clean.sh PHYSICAL_GPU --float fp32|fp16 [MODEL ...]
+# evaluates <model>/<precision>.engine (eval_g7_float_clean.py).
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -28,6 +30,13 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 echo "physical_gpu=${physical_gpu}"
 nvidia-smi --id="${physical_gpu}" --query-gpu=index,uuid,name,memory.free,memory.total --format=csv,noheader,nounits
+
+if [[ "${1:-}" == "--float" ]]; then
+    precision="${2:?--float needs fp32 or fp16}"
+    shift 2
+    exec "${python}" "${root}/tools/g7_prep/eval_g7_float_clean.py" \
+        --device "${physical_gpu}" --precision "${precision}" ${1:+--models "$@"}
+fi
 
 if [[ $# -ge 1 ]]; then
     exec "${python}" "${root}/tools/g7_prep/eval_g7_clean.py" \

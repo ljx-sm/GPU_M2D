@@ -52,6 +52,21 @@ Idempotent: if the entry is already frozen with the SAME measured R the
 script verifies only and exits 0 (no rewrite). --check never writes.
 Refuses to re-freeze an entry frozen at a DIFFERENT R.
 
+G8 precision study (user decision 2026-10-22): the g8p_imagenet1k_*_fp32
+/ _fp16 workloads freeze the same way from their own engine
+(<model>/<precision>.engine) and their bootstraps under
+artifacts/g8/precision/bootstrap. Their cache-flip lifetime classes then
+come from a VERIFIED DRAM-only evidence run of the frozen workload:
+
+  freeze_g7v2_workload.py --workload g8p_... \
+      --alloc-classes-root artifacts/g8/precision/evidence/campaign
+
+derives the classes with tools/g8_cache/derive_alloc_classes.py's rule
+(read-only iff every restore_check `exact`; bindings engine-written),
+requires every TRT-internal allocation of the bootstrap registry to be
+classified (fail-closed), and inserts the cache_alloc_classes literal
+into the frozen entry (idempotent; refuses to change existing classes).
+
 stdlib-only (runs under /usr/bin/python3).
 """
 
@@ -86,6 +101,17 @@ MODELS = {
     "g7v2_imagenet1k_swin_tiny_patch4_window7_224":
         ("swin_tiny_patch4_window7_224", "Swin-Tiny"),
 }
+
+# G8 precision study (user decision 2026-10-22): FP32 / FP16 engines of
+# ResNet-50 and ViT-B, frozen from their own bootstraps
+PRECISION_MODELS = {
+    f"g8p_imagenet1k_{model}_{precision}": (model, display, precision)
+    for model, display in (("resnet50", "ResNet-50"),
+                           ("vit_base_patch16_224", "ViT-Base/16"))
+    for precision in ("fp32", "fp16")
+}
+MODELS.update({w: (m, d) for w, (m, d, _) in PRECISION_MODELS.items()})
+PRECISION_BOOTSTRAP_ROOT = PROJECT / "artifacts/g8/precision/bootstrap"
 
 REGRESSION_WORKLOAD = "g7v2_imagenet1k_resnet50"
 SCHEMA = "gpu-m2d.g5.bootstrap.v1"
@@ -158,10 +184,23 @@ def read_bootstrap(path: Path) -> dict:
         die(f"bootstrap json {path} is unreadable/truncated: {exc}")
 
 
+def bootstrap_root(workload: str) -> Path:
+    return PRECISION_BOOTSTRAP_ROOT if workload in PRECISION_MODELS \
+        else CAMPAIGN_ROOT
+
+
+def engine_for(workload: str) -> Path:
+    model_dir = MODELS[workload][0]
+    name = (f"{PRECISION_MODELS[workload][2]}.engine"
+            if workload in PRECISION_MODELS else "clean.engine")
+    return G7_MODELS_ROOT / model_dir / name
+
+
 def newest_bootstrap(workload: str) -> Path:
     matches: list[tuple[float, Path]] = []
     seen: dict[str, int] = {}
-    for path in sorted(CAMPAIGN_ROOT.glob("run_bootstrap_gpu0_*/bootstrap.json")):
+    root = bootstrap_root(workload)
+    for path in sorted(root.glob("run_bootstrap_gpu0_*/bootstrap.json")):
         doc = read_bootstrap(path)
         wl = doc.get("workload", "?")
         seen[wl] = seen.get(wl, 0) + 1
@@ -170,7 +209,7 @@ def newest_bootstrap(workload: str) -> Path:
     if not matches:
         others = ", ".join(f"{w} ({n})" for w, n in sorted(seen.items()))
         die(f"no bootstrap.json of workload {workload!r} under "
-            f"{CAMPAIGN_ROOT} (bootstrap runs present: {others or 'none'}) "
+            f"{root} (bootstrap runs present: {others or 'none'}) "
             "-- run that model's --bootstrap campaign first")
     return max(matches)[1]
 
@@ -275,10 +314,48 @@ def entry_block(source: str, workload: str) -> tuple[int, int]:
     die(f"unbalanced braces after entry key line {key + 1}")
 
 
+def level_lines(levels: list[dict]) -> list[str]:
+    out = []
+    for row in levels:
+        head = ('            {"level": "' + row["level"] + '", "ber": '
+                + format(row["ber"], "g") + ', "bits": ' + str(row["bits"])
+                + ', "s": ' + str(row["s"]) + ', "d": ' + str(row["d"]) + ",")
+        tail = ' "t": ' + str(row["t"]) + "},"
+        if len(head) + len(tail) <= 79:
+            out.append(head + tail)
+        else:
+            out.append(head)
+            out.append("             " + tail[1:])
+    return out
+
+
 def render_entry(workload: str, display: str, r_bytes: int, levels: list[dict],
                  run_id: str, engine_path: Path, engine_sha: str,
                  note_extra: str, excludes: tuple[str, ...] = (),
                  r_full: int = 0, excluded_bytes: int = 0) -> str:
+    if workload in PRECISION_MODELS:
+        precision = PRECISION_MODELS[workload][2].upper()
+        out = [
+            f'    # G8 precision study (user decision 2026-10-22): {display}',
+            f'    # as a {precision} TensorRT engine (build_g7_float_engine.py),',
+            f'    # DRAM + SRAM at rho = 10 on the G7-v2 seven-level ladder',
+            f'    # L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5.',
+            f'    # R was MEASURED by the bootstrap run',
+            f'    # artifacts/g8/precision/bootstrap/{run_id}',
+            f'    # (engine {engine_path},',
+            f'    # sha256 {engine_sha[:12]}...,',
+            f'    #{note_extra})',
+            f'    # and the seven levels derived from it; every literal is an',
+            f'    # EXHAUSTIVE-solver literal. Frozen in place by',
+            f'    # tools/g7_prep/freeze_g7v2_workload.py; cache_alloc_classes',
+            f'    # are added by its --alloc-classes-root mode.',
+            f'    "{workload}": {{',
+            f'        "resident_bytes_nominal": {r_bytes:,}'.replace(",", "_") + ",",
+            '        "levels": [',
+        ]
+        out += level_lines(levels)
+        out += ["        ],", "    },"]
+        return "\n".join(out) + "\n"
     out = [
         f'    # G7-v2 five-model extension (user decision 2026-09-27):',
         f'    # {display}/ImageNet-1K on the SAME head-quantized v2 INT8',
@@ -336,19 +413,99 @@ def render_entry(workload: str, display: str, r_bytes: int, levels: list[dict],
         out.append('        "surface_excludes": ('
                    + ", ".join(f'"{alloc}"' for alloc in excludes) + "),")
     out.append('        "levels": [')
-    for row in levels:
-        head = ('            {"level": "' + row["level"] + '", "ber": '
-                + format(row["ber"], "g") + ', "bits": ' + str(row["bits"])
-                + ', "s": ' + str(row["s"]) + ', "d": ' + str(row["d"]) + ",")
-        tail = ' "t": ' + str(row["t"]) + "},"
-        if len(head) + len(tail) <= 79:
-            out.append(head + tail)
-        else:
-            out.append(head)
-            out.append("             " + tail[1:])
+    out += level_lines(levels)
     out.append("        ],")
     out.append("    },")
     return "\n".join(out) + "\n"
+
+
+def add_alloc_classes(workload: str, root: Path, boot_json: Path | None,
+                      check: bool) -> int:
+    """Insert cache_alloc_classes into the frozen entry of a G8 precision
+    workload, derived from its VERIFIED DRAM-only evidence runs."""
+    if workload not in PRECISION_MODELS:
+        die("--alloc-classes-root is only for the g8p precision workloads")
+    fm = load_fault_model()
+    entry = fm.WORKLOADS[workload]
+    if entry["resident_bytes_nominal"] == 0:
+        die(f"{workload} is still a placeholder -- freeze R first")
+    sys.path.insert(0, str(PROJECT / "tools/g8_cache"))
+    import derive_alloc_classes as dac
+    data = dac.collect(root)
+    if workload not in data["evidence"]:
+        die(f"no VERIFIED run of {workload} under {root}")
+    try:
+        classes = dac.classify(data["evidence"][workload],
+                               data["labels"][workload])
+    except dac.ClassError as exc:
+        die(f"class derivation refused: {exc}")
+    classes = {
+        "read_only": tuple(a for a in classes["read_only"]
+                           if a.startswith("trt-internal-")),
+        "engine_written": tuple(a for a in classes["engine_written"]
+                                if a.startswith("trt-internal-")),
+    }
+    boot_path = boot_json or newest_bootstrap(workload)
+    registry = boot_path.parent / "g1_5_allocations.csv"
+    with open(registry, encoding="utf-8", newline="") as source:
+        internal = sorted(row["allocation_id"] for row in csv.DictReader(source)
+                          if not row["semantic_label"].startswith("TENSOR:"))
+    excludes = set(entry.get("surface_excludes", ()))
+    unclassified = [a for a in internal if a not in excludes
+                    and a not in classes["read_only"]
+                    and a not in classes["engine_written"]]
+    if unclassified:
+        die(f"TRT-internal allocation(s) {unclassified} received no restore "
+            f"evidence in {data['runs'][workload]} -- run more evidence "
+            "trials")
+    runs = data["runs"][workload]
+    print(f"{workload}: {len(runs)} verified evidence run(s) {runs}")
+    print(f"  read_only={classes['read_only']}")
+    print(f"  engine_written={classes['engine_written']}")
+    existing = entry.get("cache_alloc_classes")
+    if existing is not None:
+        if {k: tuple(v) for k, v in existing.items()} != classes:
+            die(f"entry already carries different cache_alloc_classes "
+                f"{existing} -- refusing to change them")
+        print("cache_alloc_classes already present and identical; no rewrite")
+        return 0
+    if check:
+        print("--check: would insert the classes above")
+        return 3
+    source = FAULT_MODEL_PY.read_text()
+    lines = source.splitlines(keepends=True)
+    start, _ = entry_block(source, workload)
+    key = next(i for i in range(start, len(lines))
+               if lines[i].startswith(f'    "{workload}": {{'))
+    try:
+        shown_root = root.resolve().relative_to(PROJECT)
+    except ValueError:
+        shown_root = root
+    block = [
+        "        # G8 cache-flip lifetime classes of the TRT-internal allocations\n",
+        "        # (derive_alloc_classes.py rule over the VERIFIED DRAM-only\n",
+        f"        # evidence run(s) {', '.join(runs)} under\n",
+        f"        # {shown_root}:\n",
+        "        # read-only = every restore_check `exact`); bindings (TENSOR:*)\n",
+        "        # are engine-written by definition.\n",
+        '        "cache_alloc_classes": {\n',
+        f'            "read_only": {classes["read_only"]!r},\n',
+        f'            "engine_written": {classes["engine_written"]!r},\n',
+        "        },\n",
+    ]
+    new_source = "".join(lines[:key + 1] + block + lines[key + 1:])
+    tmp = FAULT_MODEL_PY.with_suffix(".py.freeze_tmp")
+    tmp.write_text(new_source)
+    os.replace(tmp, FAULT_MODEL_PY)
+    fm2 = load_fault_model()
+    fm2.assert_frozen_levels(workload)
+    if fm2.self_test() != 0:
+        die("fault_model.self_test() failed after inserting the classes")
+    got = fm2.WORKLOADS[workload]["cache_alloc_classes"]
+    if {k: tuple(v) for k, v in got.items()} != classes:
+        die("inserted classes do not read back identically")
+    print(f"inserted cache_alloc_classes into {workload}")
+    return 0
 
 
 def main() -> int:
@@ -359,12 +516,19 @@ def main() -> int:
     parser.add_argument("--bootstrap-json", type=Path, default=None)
     parser.add_argument("--check", action="store_true",
                         help="verify only; never write")
+    parser.add_argument("--alloc-classes-root", type=Path, default=None,
+                        help="G8 precision workloads: add cache_alloc_classes "
+                             "from the VERIFIED DRAM-only evidence runs "
+                             "under this campaign root (entry must be frozen)")
     args = parser.parse_args()
     workload = args.workload
     model_dir, display = MODELS[workload]
-    engine = G7_MODELS_ROOT / model_dir / "clean.engine"
+    engine = engine_for(workload)
     if not engine.is_file():
         die(f"engine {engine} is missing")
+    if args.alloc_classes_root is not None:
+        return add_alloc_classes(workload, args.alloc_classes_root,
+                                 args.bootstrap_json, args.check)
 
     fm = load_fault_model()
     regression(fm)

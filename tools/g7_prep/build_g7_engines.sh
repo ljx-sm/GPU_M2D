@@ -2,16 +2,18 @@
 # GPU_M2D G7: environment wiring + INT8 engine build for the six
 # ImageNet-1k models (replicates REMU run_stage13_int8_build_one.sh).
 #
-# usage: build_g7_engines.sh PHYSICAL_GPU [--explicit] [MODEL ...]
+# usage: build_g7_engines.sh PHYSICAL_GPU [--explicit | --float fp32|fp16] [MODEL ...]
 #   PHYSICAL_GPU  0|1|2 (engine build is not a timing run; pick an idle card)
 #   --explicit    canonical v2 path: build from the ModelOpt Q/DQ ONNX
 #                 (model_qdq.onnx; STRONGLY_TYPED, per-channel weights).
 #                 Default (implicit): entropy-calibrated per-tensor path.
+#   --float P     G8 precision study: FP32 or FP16 engine (P = fp32|fp16)
+#                 from the unquantized model.onnx -> <model>/<P>.engine
 #   MODEL         optional subset, default all six
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "usage: $0 PHYSICAL_GPU [--explicit] [MODEL ...]" >&2
+    echo "usage: $0 PHYSICAL_GPU [--explicit | --float fp32|fp16] [MODEL ...]" >&2
     exit 2
 fi
 physical_gpu=$1
@@ -22,9 +24,15 @@ case "${physical_gpu}" in
 esac
 
 builder=build_g7_int8_engine.py
+builder_args=()
 if [[ "${1:-}" == "--explicit" ]]; then
     builder=build_g7_explicit_engine.py
     shift
+elif [[ "${1:-}" == "--float" ]]; then
+    # G8 precision study: --float fp32|fp16 -> <model>/<precision>.engine
+    builder=build_g7_float_engine.py
+    builder_args=(--precision "${2:?--float needs fp32 or fp16}")
+    shift 2
 fi
 
 root=/data1/luojx/GPU_M2D
@@ -46,8 +54,8 @@ nvidia-smi --id="${physical_gpu}" --query-gpu=index,uuid,name,memory.free,memory
 
 if [[ $# -ge 1 ]]; then
     exec "${python}" "${root}/tools/g7_prep/${builder}" \
-        --device "${physical_gpu}" "$@"
+        --device "${physical_gpu}" "${builder_args[@]}" "$@"
 else
     exec "${python}" "${root}/tools/g7_prep/${builder}" \
-        --device "${physical_gpu}"
+        --device "${physical_gpu}" "${builder_args[@]}"
 fi
