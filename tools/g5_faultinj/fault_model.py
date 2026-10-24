@@ -475,24 +475,46 @@ WORKLOADS = {
             {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
         ],
     },
-    # G9 integer-precision study (user decision 2026-10-23): resnet50
-    # W4A8 engine, INT4 weights (group 128, MSE clip, 23 sensitive layers INT8), packed by
-    # the M2DPackedWeight plugin (tools/g9_intprec/build_intprec_engine.py,
-    # /data1/luojx/g7_models/resnet50/w4a8.engine), DRAM + SRAM at
-    # rho = 10 on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0):
-    # accepts only --bootstrap until tools/g7_prep/freeze_g7v2_workload.py
-    # freezes R and the levels and adds cache_alloc_classes from the
-    # DRAM-only evidence run (scripts/run_g8_precision.sh).
+    # G9 integer-precision study (user decision 2026-10-23): ResNet-50
+    # W4A8 engine, weights packed by the M2DPackedWeight
+    # plugin (tools/g9_intprec/build_intprec_engine.py),
+    # DRAM + SRAM at rho = 10 on the G7-v2 seven-level ladder
+    # L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5.
+    # R was MEASURED by the bootstrap run
+    # artifacts/g9_intprec/bootstrap/run_bootstrap_gpu0_1792816540127562040
+    # (engine /data1/luojx/g7_models/resnet50/w4a8.engine,
+    # sha256 ec71322b25d6...,
+    # snapshot allocations=39, pa_pages=24, rows=54)
+    # and the seven levels derived from it; every literal is an
+    # EXHAUSTIVE-solver literal. Frozen in place by
+    # tools/g7_prep/freeze_g7v2_workload.py; cache_alloc_classes
+    # are added by its --alloc-classes-root mode.
     "g9i_imagenet1k_resnet50_w4a8": {
-        "resident_bytes_nominal": 0,
+        # G8 cache-flip lifetime classes of the TRT-internal allocations
+        # (derive_alloc_classes.py rule over the VERIFIED DRAM-only
+        # evidence run(s) run_L7_gpu0_1792816639984298719 under
+        # artifacts/g9_intprec/evidence/campaign:
+        # read-only = every restore_check `exact`); bindings (TENSOR:*)
+        # are engine-written by definition.
+        "cache_alloc_classes": {
+            "read_only": ('trt-internal-0', 'trt-internal-1', 'trt-internal-10', 'trt-internal-11', 'trt-internal-12', 'trt-internal-13', 'trt-internal-14', 'trt-internal-15', 'trt-internal-16', 'trt-internal-17', 'trt-internal-18', 'trt-internal-19', 'trt-internal-2', 'trt-internal-20', 'trt-internal-21', 'trt-internal-22', 'trt-internal-23', 'trt-internal-24', 'trt-internal-25', 'trt-internal-26', 'trt-internal-27', 'trt-internal-28', 'trt-internal-29', 'trt-internal-3', 'trt-internal-30', 'trt-internal-31', 'trt-internal-32', 'trt-internal-33', 'trt-internal-34', 'trt-internal-4', 'trt-internal-5', 'trt-internal-6', 'trt-internal-7', 'trt-internal-8', 'trt-internal-9'),
+            "engine_written": ('trt-internal-35',),
+        },
+        "resident_bytes_nominal": 44_325_800,
         "levels": [
-            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
-            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L1", "ber": 1e-07, "bits": 35, "s": 13, "d": 5, "t": 4},
+            {"level": "L2", "ber": 5e-07, "bits": 177, "s": 67, "d": 22,
+             "t": 22},
+            {"level": "L3", "ber": 1e-06, "bits": 355, "s": 133, "d": 45,
+             "t": 44},
+            {"level": "L4", "ber": 3e-06, "bits": 1064, "s": 399, "d": 133,
+             "t": 133},
+            {"level": "L5", "ber": 5e-06, "bits": 1773, "s": 665, "d": 221,
+             "t": 222},
+            {"level": "L6", "ber": 7e-06, "bits": 2482, "s": 932, "d": 310,
+             "t": 310},
+            {"level": "L7", "ber": 1e-05, "bits": 3546, "s": 1331, "d": 443,
+             "t": 443},
         ],
     },
     # G9 integer-precision study (user decision 2026-10-23): resnet50
