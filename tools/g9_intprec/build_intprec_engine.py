@@ -10,12 +10,16 @@ Dequantize in the parsed network) is replaced by an M2DPackedWeight
 plugin (libm2d_packed_weight.so) holding the weight PACKED in device
 memory:
   w4a8   INT4, symmetric scales per GROUP of --group consecutive weights
-         inside an output channel (default 128); the expanded weights are
-         re-quantized per output channel to INT8 (new scale max|w|/127)
-         and run on TensorRT's INT8 kernels, as in the INT8 engine
-  w16a8  INT16, per-output-channel scales; the expanded weights feed the
-         layer directly (no INT8 Q/DQ), so TensorRT computes in FP32 --
-         exact for INT16 x INT8 products (< 2^24)
+         inside an output channel (default 128, MSE-optimal clipping);
+         --keep8-json leaves the listed layers exactly as the INT8 engine
+         has them (mixed precision, ResNet-50: int4_sensitivity.py)
+  w16a8  INT16, per-output-channel scales
+--compute fp32 (default, user decision 2026-10-23): the expanded weights
+feed the layer directly, so TensorRT computes in FP32 -- exact for
+INT16/INT4 x INT8 products (< 2^24), and INT4 group scales survive.
+--compute int8 re-quantizes them per output channel to INT8 (TensorRT's
+INT8 kernels); that erases small INT4 groups and is not the default.
+Activations keep the INT8 engine's Q/DQ in both.
 A weight MatMul (ViT-B linear layers, both classifier heads) is rewritten
 as a 1x1 convolution over the tokens: TensorRT 8.6 has no INT8 MatMul
 kernel for runtime per-channel weights (feasibility test), and a 1x1
@@ -69,8 +73,14 @@ PRECISIONS = {"w4a8": 4, "w16a8": 16}
 WORKSPACE_BYTES = 4 * 1024**3
 
 
-def quantize(w: np.ndarray, bits: int, group: int) -> tuple[np.ndarray, np.ndarray, int]:
-    """w [C, ...] channel-major -> (q int32 [C, ...], scales [C * G], group)."""
+CLIP_RATIOS = np.linspace(1.0, 0.3, 15)
+
+
+def quantize(w: np.ndarray, bits: int, group: int,
+             clip: str = "max") -> tuple[np.ndarray, np.ndarray, int]:
+    """w [C, ...] channel-major -> (q int32 [C, ...], scales [C * G], group).
+    clip "max": scale = max|w| / qmax per group; "mse": the scale of
+    CLIP_RATIOS x max|w| / qmax with the least squared error per group."""
     c = w.shape[0]
     inner = int(np.prod(w.shape[1:]))
     g = inner if group <= 0 or group > inner else group
@@ -79,8 +89,21 @@ def quantize(w: np.ndarray, bits: int, group: int) -> tuple[np.ndarray, np.ndarr
     pad = groups * g - inner
     padded = np.pad(flat, ((0, 0), (0, pad))).reshape(c, groups, g)
     qmax = 2 ** (bits - 1) - 1
-    scale = np.abs(padded).max(axis=2) / qmax
-    scale[scale == 0] = 1.0
+    amax = np.abs(padded).max(axis=2)
+    amax[amax == 0] = 1.0
+    scale = amax / qmax
+    if clip == "mse":
+        best = None
+        for ratio in CLIP_RATIOS:
+            s_r = amax * ratio / qmax
+            q_r = np.clip(np.round(padded / s_r[:, :, None]), -qmax - 1, qmax)
+            err = ((q_r * s_r[:, :, None] - padded) ** 2).sum(axis=2)
+            if best is None:
+                best, scale = err, s_r
+            else:
+                better = err < best
+                best = np.where(better, err, best)
+                scale = np.where(better, s_r, scale)
     q = np.clip(np.round(padded / scale[:, :, None]), -qmax - 1, qmax)
     q = q.reshape(c, groups * g)[:, :inner].astype(np.int32).reshape(w.shape)
     return q, scale.astype(np.float32).reshape(-1), g
@@ -111,10 +134,11 @@ def as_(layer, cls):
 
 class Surgery:
     def __init__(self, net, bits: int, group: int, onnx_path: Path,
-                 compute: str = "int8", keep8: tuple[str, ...] = ()):
+                 compute: str = "int8", keep8: tuple[str, ...] = (), clip: str = "max"):
         self.net = net
         self.requant = compute == "int8"    # expanded weights -> INT8 Q/DQ
         self.keep8 = keep8                  # layer names left as the INT8 engine has them
+        self.clip = clip
         graph = onnx.load(str(onnx_path)).graph
         inits = {i.name: i for i in graph.initializer}
         self.weights = {n.name: inits[n.input[0]] for n in graph.node
@@ -146,7 +170,7 @@ class Surgery:
     def plugin(self, w_cm: np.ndarray, bits: int):
         """Packed plugin for a channel-major weight [C, ...] -> (FP32 tensor, dequantized)."""
         group = self.group if bits == 4 else 0
-        q, scales, g = quantize(w_cm, bits, group)
+        q, scales, g = quantize(w_cm, bits, group, self.clip if bits == 4 else "max")
         packed = pack(q, bits).view(np.int8)
         held = [np.array([bits], np.int32), np.array(w_cm.shape, np.int32),
                 np.array([0], np.int32), np.array([g], np.int32),
@@ -293,7 +317,8 @@ class Surgery:
         return self.stats
 
 
-def build(name: str, precision: str, group: int, physical_gpu: int) -> Path:
+def build(name: str, precision: str, group: int, physical_gpu: int, compute: str = "fp32",
+          clip: str = "mse", keep8_json: Path | None = None) -> Path:
     if os.environ.get("CUDA_VISIBLE_DEVICES") != str(physical_gpu):
         raise RuntimeError("CUDA_VISIBLE_DEVICES must contain exactly the requested physical GPU")
     ctypes.CDLL(str(PLUGIN_LIB), mode=ctypes.RTLD_GLOBAL)
@@ -310,8 +335,16 @@ def build(name: str, precision: str, group: int, physical_gpu: int) -> Path:
     if not parser.parse(onnx_path.read_bytes()):
         raise RuntimeError("ONNX parse failed: " + "; ".join(
             str(parser.get_error(i)) for i in range(parser.num_errors)))
-    surgery = Surgery(net, bits, group, onnx_path)
+    keep8: tuple[str, ...] = ()
+    if keep8_json is not None:
+        keep8 = tuple(json.loads(keep8_json.read_text())["keep8_trt_names"])
+        names = {net.get_layer(i).name for i in range(net.num_layers)}
+        missing = [k for k in keep8 if k not in names]
+        if missing:
+            raise RuntimeError(f"--keep8-json layers not in the network: {missing}")
+    surgery = Surgery(net, bits, group, onnx_path, compute=compute, keep8=keep8, clip=clip)
     stats = surgery.run()
+    stats["kept_int8"] = list(keep8)
     if stats["weights"] == 0:
         raise RuntimeError("no weight was replaced")
 
@@ -332,7 +365,8 @@ def build(name: str, precision: str, group: int, physical_gpu: int) -> Path:
         raise RuntimeError(f"engine binding order changed: {contract}")
     smoke = zero_input_smoke(engine_bytes, logger)
     identity_source = {"onnx_sha256": sha256_file(onnx_path), "precision": precision,
-                       "group": group if bits == 4 else 0,
+                       "group": group if bits == 4 else 0, "compute": compute,
+                       "clip": clip if bits == 4 else "max", "keep8": list(keep8),
                        "plugin_sha256": sha256_file(PLUGIN_LIB),
                        "plugin_source_sha256": sha256_file(
                            PROJECT / "tools/g9_intprec/m2d_packed_weight_plugin.cu"),
@@ -341,6 +375,8 @@ def build(name: str, precision: str, group: int, physical_gpu: int) -> Path:
         "schema_version": 1, "status": "PASS", "stage": "g9_intprec", "model_key": name,
         "precision": precision, "weight_bits": bits,
         "weight_group": group if bits == 4 else "per-channel",
+        "weight_clip": clip if bits == 4 else "max", "compute": compute,
+        "kept_int8_layers": list(keep8),
         "onnx_path": str(onnx_path), "plugin_lib": str(PLUGIN_LIB),
         "surgery": stats,
         "preprocessing": {"mean": meta["mean"], "std": meta["std"],
@@ -358,7 +394,8 @@ def build(name: str, precision: str, group: int, physical_gpu: int) -> Path:
     print(f"{name}: {precision}_engine_build=PASS size_bytes={len(engine_bytes)} "
           f"weights={stats['weights']} (conv {stats['conv']}, matmul->conv "
           f"{stats['matmul_as_conv']}) packed={stats['packed_bytes']} "
-          f"scales={stats['scale_bytes']} smoke_prob={smoke['prob']:.6f}", flush=True)
+          f"scales={stats['scale_bytes']} kept_int8={len(keep8)} compute={compute} "
+          f"smoke_prob={smoke['prob']:.6f}", flush=True)
     return summary_path
 
 
@@ -368,10 +405,18 @@ def main() -> int:
     parser.add_argument("--precision", required=True, choices=sorted(PRECISIONS))
     parser.add_argument("--group", type=int, default=128,
                         help="INT4 weights per scale group inside a channel (w4a8)")
+    parser.add_argument("--compute", choices=("fp32", "int8"), default="fp32",
+                        help="fp32: expanded weights feed the layer (exact); int8: "
+                             "re-quantized per output channel to INT8")
+    parser.add_argument("--clip", choices=("mse", "max"), default="mse",
+                        help="INT4 group scale: MSE-optimal clipping or max|w|")
+    parser.add_argument("--keep8-json", type=Path, default=None,
+                        help="int4_sensitivity.py output: layers left INT8")
     parser.add_argument("--device", type=int, required=True, choices=(0, 1, 2))
     args = parser.parse_args()
     for name in args.models:
-        build(name, args.precision, args.group, args.device)
+        build(name, args.precision, args.group, args.device, args.compute, args.clip,
+              args.keep8_json)
     return 0
 
 
