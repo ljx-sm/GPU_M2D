@@ -1139,6 +1139,10 @@ def parse_args() -> argparse.Namespace:
                              "runner key-checks the cache fail-closed and "
                              "falls back to fresh preprocessing on any "
                              "mismatch; the first run populates it")
+    parser.add_argument("--plugin-lib", type=Path, default=None,
+                        help="G9 integer-precision study: TensorRT plugin "
+                             "library the runner dlopens before deserializing "
+                             "the engine (M2DPackedWeight); unset = not passed")
     parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
     parser.add_argument("--output-root", type=Path,
                         default=PROJECT / "artifacts/g5/campaign")
@@ -1397,6 +1401,8 @@ def execute_segment(args: argparse.Namespace, contract: dict,
         runner_passthrough += ["--std", args.std]
     if args.image_cache_dir is not None:
         runner_passthrough += ["--image-cache-dir", str(args.image_cache_dir)]
+    if getattr(args, "plugin_lib", None) is not None:
+        runner_passthrough += ["--plugin-lib", str(args.plugin_lib.resolve())]
     g8_runner_args: list[str] = []
     if cache_mode:
         g8_runner_args = [

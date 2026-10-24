@@ -35,12 +35,19 @@
 # Precision runs pass --timeout-seconds 43200 (an FP32 ViT-B level runs
 # far past the 3600 s default inside one segment). Orchestrated end to end
 # by scripts/run_g8_precision.sh.
+# --precision w4a8|w16a8 (user, 2026-10-23): the G9 integer-precision study
+# -- workload g9i_imagenet1k_<model>_<precision> (INT4 / INT16 weights
+# packed by the M2DPackedWeight plugin), the same protocol; the runner is
+# build-g9/gpu_m2d_resnet50_int8_g1_5 (opt-in --plugin-lib, carried by the
+# bootstrap's runner passthrough), roots under artifacts/g9_intprec:
+#   --mode dram_sram -> artifacts/g9_intprec/rho10/campaign/
+#   --mode dram_only -> artifacts/g9_intprec/evidence/campaign/
 #
 # Usage (from the repo root, in tmux; needs passwordless sudo like the
 # other campaign entry points):
 #   scripts/run_g8_t4.sh resnet50 [--mode dram_sram|sram_only|all]
 #                        [--levels "L3 L4"] [--trials 100] [--rho 1|10|300|5000]
-#                        [--precision fp32|fp16] [--dry-run]
+#                        [--precision fp32|fp16|w4a8|w16a8] [--dry-run]
 #
 # --dry-run prints the resolved levels and campaign commands only.
 #
@@ -85,8 +92,8 @@ BOOT_ROOT="artifacts/g7/campaign"
 EXTRA_ARGS=()
 if [[ -n "$PRECISION" ]]; then
     case "$PRECISION" in
-        fp32|fp16) ;;
-        *) echo "unknown --precision $PRECISION (fp32|fp16)" >&2; exit 2 ;;
+        fp32|fp16|w4a8|w16a8) ;;
+        *) echo "unknown --precision $PRECISION (fp32|fp16|w4a8|w16a8)" >&2; exit 2 ;;
     esac
     [[ "$RHO" == 10 ]] || { echo "--precision runs use --rho 10 only" >&2; exit 2; }
     case "$MODE" in
@@ -97,6 +104,11 @@ if [[ -n "$PRECISION" ]]; then
     NAME="${NAME}_${PRECISION}"
     BOOT_ROOT="artifacts/g8/precision/bootstrap"
     EXTRA_ARGS=(--timeout-seconds 43200)
+    if [[ "$PRECISION" == w4a8 || "$PRECISION" == w16a8 ]]; then
+        WORKLOAD="g9i_${WORKLOAD#g8p_}"
+        BOOT_ROOT="artifacts/g9_intprec/bootstrap"
+        EXTRA_ARGS+=(--runner "$PROJECT/build-g9/gpu_m2d_resnet50_int8_g1_5")
+    fi
 fi
 case "$RHO" in
     1) BASE_ROOT="$PROJECT/artifacts/g8/t4"; RHO_ARGS=(); RHO_PY=1.0 ;;
@@ -113,6 +125,13 @@ if [[ -n "$PRECISION" ]]; then
         BASE_ROOT="$PROJECT/artifacts/g8/precision/evidence"
     else
         BASE_ROOT="$PROJECT/artifacts/g8/rho10/precision"
+    fi
+    if [[ "$WORKLOAD" == g9i_* ]]; then
+        if [[ "$MODE" == dram_only ]]; then
+            BASE_ROOT="$PROJECT/artifacts/g9_intprec/evidence"
+        else
+            BASE_ROOT="$PROJECT/artifacts/g9_intprec/rho10"
+        fi
     fi
 fi
 
@@ -190,6 +209,10 @@ mapfile -t CFG < <(python3 -c "$PY" "$WORKLOAD" "$LEVELS" "$RHO" "$BOOT_ROOT") |
 [[ ${#CFG[@]} -eq 2 ]] || { echo "config lookup failed for $WORKLOAD" >&2; exit 2; }
 read -r -a RUN_LEVELS <<<"${CFG[0]}"
 read -r -a PASSTHROUGH <<<"${CFG[1]}"
+if [[ "$WORKLOAD" == g9i_* && " ${PASSTHROUGH[*]} " != *" --plugin-lib "* ]]; then
+    echo "$WORKLOAD: the bootstrap's runner passthrough has no --plugin-lib" >&2
+    exit 2
+fi
 
 verified() {  # $1 = level -> exit 0 if a complete frozen-cache run exists
     python3 - "$OUTPUT_ROOT" "$WORKLOAD" "$1" "$TRIALS" "$MODE" "$RHO_PY" <<'EOF'

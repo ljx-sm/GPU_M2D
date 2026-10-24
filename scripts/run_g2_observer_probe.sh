@@ -96,6 +96,8 @@
 #   [--class-count N] [--preprocess legacy|canonical] [--resize-scale N]
 #   [--interp bicubic|bilinear] [--mean R,G,B] [--std R,G,B]
 #   [--prelude-seconds N]   host-preprocessing budget (G7 10K needs more)
+#   [--plugin-lib PATH]     G9: TensorRT plugin library for the runner
+#                           (with --runner build-g9/gpu_m2d_resnet50_int8_g1_5)
 #   [--image-cache-dir DIR] host preprocessed-image cache (default
 #                           <output-root>/../image_cache; the first run
 #                           populates it, restart segments reload it in
@@ -135,7 +137,7 @@ while [[ $# -gt 0 ]]; do
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --engine|--sample-csv|--workload|--class-count|\
         --preprocess|--resize-scale|--interp|--mean|--std|\
-        --prelude-seconds|--image-cache-dir) \
+        --prelude-seconds|--image-cache-dir|--plugin-lib) \
             EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --output-root) CUSTOM_OUTPUT_ROOT="$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
         --bootstrap|--cache-faults|--no-dram-faults|--require-idle-gpu) EXTRA_ARGS+=("$1"); shift 1 ;;

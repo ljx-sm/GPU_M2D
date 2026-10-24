@@ -110,8 +110,17 @@ PRECISION_MODELS = {
                            ("vit_base_patch16_224", "ViT-Base/16"))
     for precision in ("fp32", "fp16")
 }
+# G9 integer-precision study (user decision 2026-10-23): INT4 / INT16
+# weight engines (M2DPackedWeight plugin), same freeze path
+PRECISION_MODELS.update({
+    f"g9i_imagenet1k_{model}_{precision}": (model, display, precision)
+    for model, display in (("resnet50", "ResNet-50"),
+                           ("vit_base_patch16_224", "ViT-Base/16"))
+    for precision in ("w4a8", "w16a8")
+})
 MODELS.update({w: (m, d) for w, (m, d, _) in PRECISION_MODELS.items()})
 PRECISION_BOOTSTRAP_ROOT = PROJECT / "artifacts/g8/precision/bootstrap"
+G9_BOOTSTRAP_ROOT = PROJECT / "artifacts/g9_intprec/bootstrap"
 
 REGRESSION_WORKLOAD = "g7v2_imagenet1k_resnet50"
 SCHEMA = "gpu-m2d.g5.bootstrap.v1"
@@ -185,6 +194,8 @@ def read_bootstrap(path: Path) -> dict:
 
 
 def bootstrap_root(workload: str) -> Path:
+    if workload.startswith("g9i_"):
+        return G9_BOOTSTRAP_ROOT
     return PRECISION_BOOTSTRAP_ROOT if workload in PRECISION_MODELS \
         else CAMPAIGN_ROOT
 
@@ -335,13 +346,19 @@ def render_entry(workload: str, display: str, r_bytes: int, levels: list[dict],
                  r_full: int = 0, excluded_bytes: int = 0) -> str:
     if workload in PRECISION_MODELS:
         precision = PRECISION_MODELS[workload][2].upper()
-        out = [
-            f'    # G8 precision study (user decision 2026-10-22): {display}',
-            f'    # as a {precision} TensorRT engine (build_g7_float_engine.py),',
+        g9 = workload.startswith("g9i_")
+        head = ([f'    # G9 integer-precision study (user decision 2026-10-23): {display}',
+                 f'    # {precision} engine, weights packed by the M2DPackedWeight',
+                 f'    # plugin (tools/g9_intprec/build_intprec_engine.py),']
+                if g9 else
+                [f'    # G8 precision study (user decision 2026-10-22): {display}',
+                 f'    # as a {precision} TensorRT engine (build_g7_float_engine.py),'])
+        root = "artifacts/g9_intprec/bootstrap" if g9 else "artifacts/g8/precision/bootstrap"
+        out = head + [
             f'    # DRAM + SRAM at rho = 10 on the G7-v2 seven-level ladder',
             f'    # L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5.',
             f'    # R was MEASURED by the bootstrap run',
-            f'    # artifacts/g8/precision/bootstrap/{run_id}',
+            f'    # {root}/{run_id}',
             f'    # (engine {engine_path},',
             f'    # sha256 {engine_sha[:12]}...,',
             f'    #{note_extra})',

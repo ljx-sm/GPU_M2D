@@ -475,6 +475,86 @@ WORKLOADS = {
             {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
         ],
     },
+    # G9 integer-precision study (user decision 2026-10-23): resnet50
+    # W4A8 engine, INT4 weights (group 128, MSE clip, 23 sensitive layers INT8), packed by
+    # the M2DPackedWeight plugin (tools/g9_intprec/build_intprec_engine.py,
+    # /data1/luojx/g7_models/resnet50/w4a8.engine), DRAM + SRAM at
+    # rho = 10 on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0):
+    # accepts only --bootstrap until tools/g7_prep/freeze_g7v2_workload.py
+    # freezes R and the levels and adds cache_alloc_classes from the
+    # DRAM-only evidence run (scripts/run_g8_precision.sh).
+    "g9i_imagenet1k_resnet50_w4a8": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # G9 integer-precision study (user decision 2026-10-23): resnet50
+    # W16A8 engine, INT16 weights (per channel), packed by
+    # the M2DPackedWeight plugin (tools/g9_intprec/build_intprec_engine.py,
+    # /data1/luojx/g7_models/resnet50/w16a8.engine), DRAM + SRAM at
+    # rho = 10 on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0):
+    # accepts only --bootstrap until tools/g7_prep/freeze_g7v2_workload.py
+    # freezes R and the levels and adds cache_alloc_classes from the
+    # DRAM-only evidence run (scripts/run_g8_precision.sh).
+    "g9i_imagenet1k_resnet50_w16a8": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # G9 integer-precision study (user decision 2026-10-23): vit_base_patch16_224
+    # W4A8 engine, INT4 weights (group 128, MSE clip), packed by
+    # the M2DPackedWeight plugin (tools/g9_intprec/build_intprec_engine.py,
+    # /data1/luojx/g7_models/vit_base_patch16_224/w4a8.engine), DRAM + SRAM at
+    # rho = 10 on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0):
+    # accepts only --bootstrap until tools/g7_prep/freeze_g7v2_workload.py
+    # freezes R and the levels and adds cache_alloc_classes from the
+    # DRAM-only evidence run (scripts/run_g8_precision.sh).
+    "g9i_imagenet1k_vit_base_patch16_224_w4a8": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # G9 integer-precision study (user decision 2026-10-23): vit_base_patch16_224
+    # W16A8 engine, INT16 weights (per channel), packed by
+    # the M2DPackedWeight plugin (tools/g9_intprec/build_intprec_engine.py,
+    # /data1/luojx/g7_models/vit_base_patch16_224/w16a8.engine), DRAM + SRAM at
+    # rho = 10 on the G7-v2 seven-level ladder. PLACEHOLDER (R = 0):
+    # accepts only --bootstrap until tools/g7_prep/freeze_g7v2_workload.py
+    # freezes R and the levels and adds cache_alloc_classes from the
+    # DRAM-only evidence run (scripts/run_g8_precision.sh).
+    "g9i_imagenet1k_vit_base_patch16_224_w16a8": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
 }
 
 DEFAULT_WORKLOAD = "g5_resisc45_resnet50"

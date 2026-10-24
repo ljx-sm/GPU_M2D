@@ -9,6 +9,7 @@
 #include <cuda_runtime_api.h>
 #include <opencv2/opencv.hpp>
 
+#include <dlfcn.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -520,6 +521,11 @@ struct Options {
     // segment skips the ~3 min CPU re-preprocessing of the 10K pass.
     // Pure optimization -- any mismatch falls back to fresh work.
     std::string image_cache_dir;
+    // G9 integer-precision study: TensorRT plugin libraries to dlopen
+    // (RTLD_GLOBAL, so their REGISTER_TENSORRT_PLUGIN creators enter the
+    // global plugin registry) before the engine is deserialized. Opt-in:
+    // without --plugin-lib nothing is loaded and the run is unchanged.
+    std::vector<std::string> plugin_libs;
     // G8 L2 residency probe pass (docs/G8_CACHE_FAULT_PLAN.md §4; T0 hook):
     // after the full strict clean pass, a second FAULTLESS pass probes the
     // L2 residency of every registered allocation at image boundaries
@@ -796,6 +802,11 @@ Options parse_options(int argc, char** argv) {
             if (value.empty()) {
                 throw std::invalid_argument("--image-cache-dir needs a path");
             }
+        } else if (key == "--plugin-lib") {
+            if (value.empty()) {
+                throw std::invalid_argument("--plugin-lib needs a path");
+            }
+            options.plugin_libs.push_back(value);
         } else {
             throw std::invalid_argument("unknown argument: " + key);
         }
@@ -814,7 +825,7 @@ Options parse_options(int argc, char** argv) {
             "[--class-count N --preprocess legacy|canonical --resize-scale N "
             "--interp bicubic|bilinear --mean R,G,B --std R,G,B "
             "--dump-preprocessed PATH] "
-            "[--image-cache-dir DIR] "
+            "[--image-cache-dir DIR] [--plugin-lib PATH] "
             "[--l2-probe-out PREFIX --l2-probe-threshold CYCLES "
             "--l2-probe-every N --l2-probe-unit 32|128 "
             "--l2-probe-per-sm N --l2-probe-stride N "
@@ -2765,6 +2776,12 @@ int main(int argc, char** argv) {
                    "cudaDeviceGetPCIBusId");
         observer.event("CONTEXT_READY");
 
+        for (const std::string& library : options.plugin_libs) {
+            if (dlopen(library.c_str(), RTLD_NOW | RTLD_GLOBAL) == nullptr) {
+                throw std::runtime_error("--plugin-lib " + library + ": " + dlerror());
+            }
+            std::cout << "plugin library loaded: " << library << "\n";
+        }
         observer.event("RUNTIME_BEGIN");
         TrtLogger logger;
         gpu_m2d::AllocationRegistry allocation_registry(run_id);

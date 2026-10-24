@@ -71,6 +71,8 @@ except ModuleNotFoundError:
 PLUGIN_LIB = PROJECT / "artifacts/g9_intprec/libm2d_packed_weight.so"
 PRECISIONS = {"w4a8": 4, "w16a8": 16}
 WORKSPACE_BYTES = 4 * 1024**3
+TACTIC_SOURCES = (1 << int(trt.TacticSource.EDGE_MASK_CONVOLUTIONS)) | \
+    (1 << int(trt.TacticSource.JIT_CONVOLUTIONS))
 
 
 CLIP_RATIOS = np.linspace(1.0, 0.3, 15)
@@ -167,8 +169,12 @@ class Surgery:
         self.held.append(arr)
         return self.net.add_constant(arr.shape, arr).get_output(0)
 
-    def plugin(self, w_cm: np.ndarray, bits: int):
-        """Packed plugin for a channel-major weight [C, ...] -> (FP32 tensor, dequantized)."""
+    def plugin(self, w_cm: np.ndarray, bits: int, anchor):
+        """Packed plugin for a channel-major weight [C, ...] -> (FP32 tensor, dequantized).
+        `anchor` is the consuming layer's activation input: the expansion then runs
+        right before that layer and TensorRT reuses its output memory, so only one
+        layer's expanded FP32 weights exist at a time (anchored on the network input,
+        every expansion ran at the start and ResNet-50 held ~100 MB of FP32 copies)."""
         group = self.group if bits == 4 else 0
         q, scales, g = quantize(w_cm, bits, group, self.clip if bits == 4 else "max")
         packed = pack(q, bits).view(np.int8)
@@ -185,7 +191,7 @@ class Surgery:
             trt.PluginField("packed", held[5], trt.PluginFieldType.INT8),
         ])
         plugin = self.creator.create_plugin(f"packed_{self.stats['weights']}", fields)
-        layer = self.net.add_plugin_v2([self.anchor], plugin)
+        layer = self.net.add_plugin_v2([anchor], plugin)
         layer.name = f"M2DPackedWeight_{self.stats['weights']}"
         self.stats["weights"] += 1
         self.stats["params"] += int(q.size)
@@ -240,7 +246,7 @@ class Surgery:
         if layer.name in self.keep8:
             return
         w = self.weight_of(chain)
-        out, w_deq = self.plugin(w, self.bits)
+        out, w_deq = self.plugin(w, self.bits, layer.get_input(0))
         if self.requant:
             chain["q"].set_input(0, out)
             self.int8_route(chain, w_deq, 0)
@@ -260,7 +266,7 @@ class Surgery:
             raise RuntimeError(f"{layer.name}: transposed activation operand")
         wc = np.ascontiguousarray(b.T)[:, :, None, None]                      # [N, K, 1, 1]
         n_out, k_in = wc.shape[:2]
-        out, w_deq = self.plugin(wc, self.bits)
+        out, w_deq = self.plugin(wc, self.bits, layer.get_input(0))
         if self.requant:
             # a fresh Q/DQ pair on the expanded [N, K, 1, 1] weights
             s8 = (np.abs(w_deq).max(axis=(1, 2, 3)) / 127).astype(np.float32)
@@ -352,6 +358,10 @@ def build(name: str, precision: str, group: int, physical_gpu: int, compute: str
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, WORKSPACE_BYTES)
     config.set_flag(trt.BuilderFlag.INT8)
     config.clear_flag(trt.BuilderFlag.TF32)
+    # TensorRT-native kernels only: the campaign runner ships no cuDNN /
+    # cuBLAS (the G7-v2 INT8 engines need none), and their handles' device
+    # memory would sit outside the allocation registry
+    config.set_tactic_sources(TACTIC_SOURCES)
     started = time.time()
     serialized = builder.build_serialized_network(net, config)
     if serialized is None:
@@ -368,6 +378,7 @@ def build(name: str, precision: str, group: int, physical_gpu: int, compute: str
                        "group": group if bits == 4 else 0, "compute": compute,
                        "clip": clip if bits == 4 else "max", "keep8": list(keep8),
                        "plugin_sha256": sha256_file(PLUGIN_LIB),
+                       "tactic_sources": ["EDGE_MASK_CONVOLUTIONS", "JIT_CONVOLUTIONS"],
                        "plugin_source_sha256": sha256_file(
                            PROJECT / "tools/g9_intprec/m2d_packed_weight_plugin.cu"),
                        "tensorrt": trt.__version__}
