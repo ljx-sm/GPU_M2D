@@ -41,7 +41,16 @@ namespace l2probe
 {
 
 inline constexpr std::uint64_t kLineBytes = 128;
-inline constexpr int kMaxRanges = 32;
+// Ranges per probe (one per live allocation). Default 32, which covers
+// the INT8 / FP engines; the G9 packed-weight engines register one buffer
+// per plugin layer (up to ~62) and are built with
+// -DGPU_M2D_L2_PROBE_MAX_RANGES=96 (CMake cache variable of the same name,
+// build-g9 only). ProbeRanges must stay within the 4 KiB kernel-parameter
+// limit (static_assert below).
+#ifndef GPU_M2D_L2_PROBE_MAX_RANGES
+#define GPU_M2D_L2_PROBE_MAX_RANGES 32
+#endif
+inline constexpr int kMaxRanges = GPU_M2D_L2_PROBE_MAX_RANGES;
 
 // Probe unit: a 128-B L2 line or a 32-B L2 sector. T0 measured that L2
 // fills per 32-B sector, so a 128-B "line" probe observes only the sector
@@ -79,6 +88,9 @@ struct ProbeRanges
   // the warp-max effect only).
   int lanes;
 };
+
+static_assert (sizeof (ProbeRanges) + sizeof (void *) <= 4096,
+               "ProbeRanges exceeds the 4 KiB kernel-parameter limit");
 
 __forceinline__ __device__ std::uint64_t
 read_clock64 ()

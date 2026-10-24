@@ -46,6 +46,12 @@ add_library(gpu_m2d_injector STATIC
 )
 target_include_directories(gpu_m2d_injector PUBLIC include)
 target_link_libraries(gpu_m2d_injector PUBLIC CUDA::cudart)
+# Max ranges of one L2 probe (include/gpu_m2d/l2_probe_kernels.cuh). 32 for
+# every existing build; the G9 packed-weight runner (build-g9) uses 96.
+set(GPU_M2D_L2_PROBE_MAX_RANGES 32 CACHE STRING "Max ranges of one L2 probe")
+target_compile_definitions(gpu_m2d_injector PRIVATE
+    GPU_M2D_L2_PROBE_MAX_RANGES=${GPU_M2D_L2_PROBE_MAX_RANGES}
+)
 set_target_properties(gpu_m2d_injector PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON

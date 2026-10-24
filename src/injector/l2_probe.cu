@@ -51,7 +51,8 @@ L2Prober::L2Prober(std::vector<L2ProbeRange> ranges, std::size_t unit_bytes,
     }
     if (ranges_.empty() ||
         ranges_.size() > static_cast<std::size_t>(l2probe::kMaxRanges)) {
-        throw std::invalid_argument("L2 probe needs 1..32 ranges");
+        throw std::invalid_argument("L2 probe needs 1.." +
+                                    std::to_string(l2probe::kMaxRanges) + " ranges");
     }
     if (threshold_ == 0 || probes_per_sm <= 0) {
         throw std::invalid_argument("L2 probe threshold/parallelism must be > 0");
