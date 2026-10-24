@@ -118,9 +118,19 @@ PRECISION_MODELS.update({
                            ("vit_base_patch16_224", "ViT-Base/16"))
     for precision in ("w4a8", "w16a8")
 })
+# G9 native-equivalent surface (user decision 2026-10-24): the SAME G9
+# engines, injection surface without the regions that exist only because
+# TensorRT 8.6 computes the packed weights in FP32 (NATIVE_SURFACE below)
+PRECISION_MODELS.update({
+    f"g9n_imagenet1k_{model}_{precision}": (model, display, precision)
+    for model, display in (("resnet50", "ResNet-50"),
+                           ("vit_base_patch16_224", "ViT-Base/16"))
+    for precision in ("w4a8", "w16a8")
+})
 MODELS.update({w: (m, d) for w, (m, d, _) in PRECISION_MODELS.items()})
 PRECISION_BOOTSTRAP_ROOT = PROJECT / "artifacts/g8/precision/bootstrap"
 G9_BOOTSTRAP_ROOT = PROJECT / "artifacts/g9_intprec/bootstrap"
+G9N_BOOTSTRAP_ROOT = PROJECT / "artifacts/g9_intprec/native/bootstrap"
 
 REGRESSION_WORKLOAD = "g7v2_imagenet1k_resnet50"
 SCHEMA = "gpu-m2d.g5.bootstrap.v1"
@@ -165,6 +175,61 @@ EXCLUDES: dict[str, tuple[str, ...]] = {
         ("trt-internal-5", "trt-internal-6"),
 }
 
+# G9 native-equivalent surface (user decision 2026-10-24), PER ENGINE: a
+# native INT4/INT16 kernel dequantizes in registers, so the regions that
+# exist only because TensorRT 8.6 has no such kernel and the plugin's
+# expanded weights are computed in FP32 are NOT injected; every region a
+# native engine also has (INT4/INT16 words AND their FP32 scales, the INT8
+# layers' weights/biases, TensorRT's control block, the bindings) stays.
+# Each entry is bound to its engine's sha256 and the allocation sizes of
+# its bootstrap registry (fail-closed: allocation ids are engine-specific).
+# keep_prefix: allocation -> (kept bytes N, full size): only [0, N) stays.
+#
+# ResNet-50 W4A8 (2026-10-24; artifacts/g9_intprec analysis on GPU 1):
+#   trt-internal-35 (27,824,640 B) execution scratch: FP32 expanded
+#     weights (one copy per plugin layer), FP32 activations and the
+#     extra Q/DQ/reformat tensors of the FP32-compute path (the native
+#     INT8 engine's scratch is 2,207,744 B);
+#   trt-internal-2 [22,528, 41,472): the FP32 convolution tactic's data
+#     appended to the control block -- bytes [0, 22,528) are
+#     byte-identical to the INT8 engine's 22,528 B control block and to
+#     the same model's --compute int8 build, which has no tail; the tail
+#     holds the 3,136-entry int32 pixel-index table, the source of every
+#     crash of the as-built (g9i) runs;
+#   trt-internal-1 (18,944 B, deserialize phase): byte-identical copy of
+#     that tail (absent from the INT8 and --compute int8 engines; not
+#     read at inference).
+NATIVE_SURFACE: dict[str, dict] = {
+    "g9n_imagenet1k_resnet50_w4a8": {
+        "engine_sha256":
+            "ec71322b25d60cb3bd13e53c392d9df95b6d14b3efafd4fa0213aee9622f8860",
+        "excludes": {"trt-internal-1": 18_944,
+                     "trt-internal-35": 27_824_640},
+        "keep_prefix": {"trt-internal-2": (22_528, 41_472)},
+    },
+}
+
+
+def surface_scoping(workload: str, engine_sha: str,
+                    ) -> tuple[tuple[str, ...], dict[str, int], dict[str, int]]:
+    """(surface_excludes, surface_keep_prefix, expected registry sizes) of
+    a workload; a g9n workload must have its own NATIVE_SURFACE entry for
+    exactly this engine."""
+    if not workload.startswith("g9n_"):
+        return EXCLUDES.get(workload, ()), {}, {}
+    spec = NATIVE_SURFACE.get(workload)
+    if spec is None:
+        die(f"{workload}: no NATIVE_SURFACE entry -- identify this engine's "
+            "FP32-compute-only regions first")
+    if spec["engine_sha256"] != engine_sha:
+        die(f"{workload}: NATIVE_SURFACE was derived for engine "
+            f"{spec['engine_sha256'][:12]}..., the current engine is "
+            f"{engine_sha[:12]}... -- re-derive it")
+    sizes = dict(spec["excludes"])
+    sizes.update({a: full for a, (_, full) in spec["keep_prefix"].items()})
+    return (tuple(sorted(spec["excludes"])),
+            {a: n for a, (n, _) in spec["keep_prefix"].items()}, sizes)
+
 
 def die(message: str) -> None:
     print(f"freeze_g7v2_workload: FAIL: {message}", file=sys.stderr)
@@ -194,6 +259,8 @@ def read_bootstrap(path: Path) -> dict:
 
 
 def bootstrap_root(workload: str) -> Path:
+    if workload.startswith("g9n_"):
+        return G9N_BOOTSTRAP_ROOT
     if workload.startswith("g9i_"):
         return G9_BOOTSTRAP_ROOT
     return PRECISION_BOOTSTRAP_ROOT if workload in PRECISION_MODELS \
@@ -226,15 +293,21 @@ def newest_bootstrap(workload: str) -> Path:
 
 
 def effective_r(boot: dict, boot_path: Path,
-                excludes: tuple[str, ...]) -> tuple[int, int, int]:
+                excludes: tuple[str, ...],
+                keep_prefix: dict[str, int] | None = None,
+                expected_sizes: dict[str, int] | None = None,
+                ) -> tuple[int, int, int]:
     """(R_eff, R_full, excluded_bytes): the workload's INJECTION-SURFACE
     residency -- the bootstrap's FULL measured R minus the excluded
     allocations' sizes, read from the bootstrap run's own
     g1_5_allocations.csv so the subtraction uses the same measurement the
     bootstrap recorded. Fail-closed: the registry must exist, its sizes
-    must sum to the measured R, and every excluded id must be present."""
+    must sum to the measured R, and every excluded id must be present.
+    keep_prefix allocations contribute only their kept [0, N) bytes;
+    expected_sizes (NATIVE_SURFACE) must match the registry exactly."""
     r_full = boot["resident_bytes"]
-    if not excludes:
+    keep_prefix = keep_prefix or {}
+    if not excludes and not keep_prefix:
         return r_full, r_full, 0
     registry = boot_path.parent / "g1_5_allocations.csv"
     if not registry.is_file():
@@ -249,10 +322,18 @@ def effective_r(boot: dict, boot_path: Path,
         die(f"allocation registry {registry} sums to {total:,} B but the "
             f"bootstrap measured {r_full:,} B -- per-allocation sizes "
             "cannot be subtracted fail-closed")
-    missing = [alloc for alloc in excludes if alloc not in sizes]
+    missing = [alloc for alloc in (*excludes, *keep_prefix) if alloc not in sizes]
     if missing:
         die(f"excluded allocation(s) {missing} absent from {registry}")
-    excluded = sum(sizes[alloc] for alloc in excludes)
+    for alloc, size in (expected_sizes or {}).items():
+        if sizes[alloc] != size:
+            die(f"{alloc} is {sizes[alloc]:,} B in {registry}, the surface "
+                f"scoping was derived for {size:,} B -- re-derive it")
+    for alloc, n in keep_prefix.items():
+        if not 0 < n < sizes[alloc]:
+            die(f"keep_prefix {alloc}:{n} is not inside its {sizes[alloc]:,} B")
+    excluded = sum(sizes[alloc] for alloc in excludes) + \
+        sum(sizes[alloc] - n for alloc, n in keep_prefix.items())
     if excluded <= 0 or r_full - excluded <= 0:
         die(f"exclusions ({excluded:,} B) leave no positive residency")
     return r_full - excluded, r_full, excluded
@@ -343,17 +424,19 @@ def level_lines(levels: list[dict]) -> list[str]:
 def render_entry(workload: str, display: str, r_bytes: int, levels: list[dict],
                  run_id: str, engine_path: Path, engine_sha: str,
                  note_extra: str, excludes: tuple[str, ...] = (),
-                 r_full: int = 0, excluded_bytes: int = 0) -> str:
+                 r_full: int = 0, excluded_bytes: int = 0,
+                 keep_prefix: dict[str, int] | None = None) -> str:
+    keep_prefix = keep_prefix or {}
     if workload in PRECISION_MODELS:
         precision = PRECISION_MODELS[workload][2].upper()
-        g9 = workload.startswith("g9i_")
+        g9 = workload.startswith(("g9i_", "g9n_"))
         head = ([f'    # G9 integer-precision study (user decision 2026-10-23): {display}',
                  f'    # {precision} engine, weights packed by the M2DPackedWeight',
                  f'    # plugin (tools/g9_intprec/build_intprec_engine.py),']
                 if g9 else
                 [f'    # G8 precision study (user decision 2026-10-22): {display}',
                  f'    # as a {precision} TensorRT engine (build_g7_float_engine.py),'])
-        root = "artifacts/g9_intprec/bootstrap" if g9 else "artifacts/g8/precision/bootstrap"
+        root = str(bootstrap_root(workload).relative_to(PROJECT))
         out = head + [
             f'    # DRAM + SRAM at rho = 10 on the G7-v2 seven-level ladder',
             f'    # L1..L7 = 1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 7e-6, 1e-5.',
@@ -366,10 +449,29 @@ def render_entry(workload: str, display: str, r_bytes: int, levels: list[dict],
             f'    # EXHAUSTIVE-solver literal. Frozen in place by',
             f'    # tools/g7_prep/freeze_g7v2_workload.py; cache_alloc_classes',
             f'    # are added by its --alloc-classes-root mode.',
+        ]
+        if excludes or keep_prefix:
+            cut = ", ".join(list(excludes) + [f"{a} beyond byte {n:,}"
+                                               for a, n in sorted(keep_prefix.items())])
+            out += [
+                f'    # NATIVE-EQUIVALENT SURFACE (user decision 2026-10-24): the',
+                f'    # measured FULL residency R={r_full:,} B minus the',
+                f'    # FP32-compute-only regions ({excluded_bytes:,} B,',
+                f'    # freeze_g7v2_workload.py NATIVE_SURFACE:',
+                f'    # {cut}) = {r_bytes:,} B.',
+            ]
+        out += [
             f'    "{workload}": {{',
             f'        "resident_bytes_nominal": {r_bytes:,}'.replace(",", "_") + ",",
-            '        "levels": [',
         ]
+        if excludes:
+            out.append('        "surface_excludes": ('
+                       + ", ".join(f'"{alloc}"' for alloc in excludes) + "),")
+        if keep_prefix:
+            out.append('        "surface_keep_prefix": {'
+                       + ", ".join(f'"{a}": {n:_}' for a, n in sorted(keep_prefix.items()))
+                       + "},")
+        out.append('        "levels": [')
         out += level_lines(levels)
         out += ["        ],", "    },"]
         return "\n".join(out) + "\n"
@@ -574,11 +676,13 @@ def main() -> int:
     note = (f" snapshot allocations={snap.get('allocations')}, "
             f"pa_pages={snap.get('pa_pages')}, rows={snap.get('rows')}")
 
-    excludes = EXCLUDES.get(workload, ())
-    r_eff, r_full, excluded_bytes = effective_r(boot, boot_path, excludes)
-    if excludes:
+    excludes, keep_prefix, expected_sizes = surface_scoping(workload, engine_sha)
+    r_eff, r_full, excluded_bytes = effective_r(boot, boot_path, excludes,
+                                                keep_prefix, expected_sizes)
+    if excludes or keep_prefix:
+        cut = list(excludes) + [f"{a}[{n}:]" for a, n in sorted(keep_prefix.items())]
         print(f"fault-surface scoping: full R={r_full:,} B minus "
-              f"{excluded_bytes:,} B ({', '.join(excludes)}) -> injection "
+              f"{excluded_bytes:,} B ({', '.join(cut)}) -> injection "
               f"surface R_eff={r_eff:,} B")
 
     levels = derive_levels(r_eff, fm)
@@ -590,6 +694,10 @@ def main() -> int:
             die(f"already-frozen surface_excludes "
                 f"{frozen_now.get('surface_excludes', ())} != required "
                 f"{excludes} -- re-derive and re-confirm manually")
+        if dict(frozen_now.get("surface_keep_prefix", {})) != keep_prefix:
+            die(f"already-frozen surface_keep_prefix "
+                f"{frozen_now.get('surface_keep_prefix', {})} != required "
+                f"{keep_prefix} -- re-derive and re-confirm manually")
         frozen_levels = frozen_now["levels"]
         if (len(frozen_levels) != len(levels) or
                 [e["level"] for e in frozen_levels] != [e["level"] for e in levels] or
@@ -615,8 +723,9 @@ def main() -> int:
             print(f"--check: entry still a placeholder (R=0); would freeze "
                   f"R={r_eff:,} B"
                   + (f" (injection surface: full {r_full:,} B minus "
-                     f"{excluded_bytes:,} B excluded {list(excludes)})"
-                     if excludes else "") + ", levels:")
+                     f"{excluded_bytes:,} B excluded {list(excludes)}"
+                     + (f", kept prefixes {keep_prefix}" if keep_prefix else "") + ")"
+                     if excludes or keep_prefix else "") + ", levels:")
             for row in levels:
                 print(f'  {row["level"]}: ber={row["ber"]:g} bits={row["bits"]}'
                       f' s={row["s"]} d={row["d"]} t={row["t"]}')
@@ -625,7 +734,7 @@ def main() -> int:
         start, end = entry_block(source, workload)
         block = render_entry(workload, display, r_eff, levels, run_id,
                              engine, engine_sha, note, excludes, r_full,
-                             excluded_bytes)
+                             excluded_bytes, keep_prefix)
         lines = source.splitlines(keepends=True)
         new_source = "".join(lines[:start]) + block + "".join(lines[end + 1:])
         # atomic replace: a crash mid-write can never leave a truncated
@@ -646,11 +755,14 @@ def main() -> int:
         die("frozen R does not match the bootstrap measurement")
     if tuple(entry.get("surface_excludes", ())) != excludes:
         die("frozen surface_excludes does not match the EXCLUDES table")
+    if dict(entry.get("surface_keep_prefix", {})) != keep_prefix:
+        die("frozen surface_keep_prefix does not match the NATIVE_SURFACE table")
     print(f"freeze VERIFIED: workload={workload} R={r_eff:,} B "
           f"({r_eff * 8:,} bits)"
           + (f" -- injection surface of the full {r_full:,} B residency "
-             f"(excluded {excluded_bytes:,} B: {', '.join(excludes)})"
-             if excludes else ""))
+             f"(excluded {excluded_bytes:,} B: "
+             f"{', '.join(list(excludes) + [f'{a}[{n}:]' for a, n in sorted(keep_prefix.items())])})"
+             if excludes or keep_prefix else ""))
     for row in entry["levels"]:
         print(f'  {row["level"]}: ber={row["ber"]:g} bits={row["bits"]} '
               f's={row["s"]} d={row["d"]} t={row["t"]}')

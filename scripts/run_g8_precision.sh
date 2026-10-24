@@ -30,10 +30,17 @@
 # artifacts/g9_intprec/libm2d_packed_weight.so; every root under
 # artifacts/g9_intprec/ (bootstrap, evidence/campaign, rho10/campaign).
 #
+# G9 native-equivalent surface (user, 2026-10-24): a third argument
+# `native` runs the same engine as workload g9n_imagenet1k_<model>_<precision>
+# -- injection surface without the FP32-compute-only regions
+# (freeze_g7v2_workload.py NATIVE_SURFACE; an engine without an entry is
+# refused at the freeze step), every root under artifacts/g9_intprec/native/.
+#
 # Usage (repo root, in tmux; passwordless sudo like the other campaigns):
 #   scripts/run_g8_precision.sh all               # the four FP ones, in order
 #   scripts/run_g8_precision.sh all-int           # the four G9 ones, in order
 #   scripts/run_g8_precision.sh resnet50 fp16     # one workload
+#   scripts/run_g8_precision.sh resnet50 w4a8 native   # native-equivalent surface
 # Order of "all": resnet50 fp16, resnet50 fp32, vit fp16, vit fp32.
 # Order of "all-int": resnet50 w4a8, resnet50 w16a8, vit w4a8, vit w16a8.
 # Stops at the first failure; rerunning resumes.
@@ -67,6 +74,12 @@ case "$MODEL" in resnet50|vit_base_patch16_224) ;;
     *) echo "model must be resnet50 or vit_base_patch16_224" >&2; exit 2 ;; esac
 case "$PRECISION" in fp32|fp16|w4a8|w16a8) ;;
     *) echo "precision must be fp32, fp16, w4a8 or w16a8" >&2; exit 2 ;; esac
+SURFACE="${3:-}"
+case "$SURFACE" in "") ;;
+    native) [[ "$PRECISION" == w4a8 || "$PRECISION" == w16a8 ]] || {
+                echo "native surface is for w4a8 / w16a8 only" >&2; exit 2; } ;;
+    *) echo "third argument must be 'native' (or nothing)" >&2; exit 2 ;; esac
+T4_SURFACE=()
 
 WORKLOAD="g8p_imagenet1k_${MODEL}_${PRECISION}"
 ENGINE="/data1/luojx/g7_models/${MODEL}/${PRECISION}.engine"
@@ -88,6 +101,14 @@ if [[ "$PRECISION" == w4a8 || "$PRECISION" == w16a8 ]]; then
     [[ -f "$PLUGIN_LIB" && -x "$G9_RUNNER" ]] || {
         echo "missing $PLUGIN_LIB or $G9_RUNNER" >&2; exit 2; }
     BOOT_EXTRA=(--runner "$G9_RUNNER" --plugin-lib "$PLUGIN_LIB")
+    if [[ "$SURFACE" == native ]]; then
+        WORKLOAD="g9n_imagenet1k_${MODEL}_${PRECISION}"
+        BOOT_ROOT="$PROJECT/artifacts/g9_intprec/native/bootstrap"
+        EVIDENCE_ROOT="$PROJECT/artifacts/g9_intprec/native/evidence/campaign"
+        FREEZE=(/usr/bin/python3 tools/g7_prep/freeze_g7v2_workload.py --workload "$WORKLOAD")
+        DRIVER_LOG="$PROJECT/artifacts/g9_intprec/native/drivers/${MODEL}_${PRECISION}.log"
+        T4_SURFACE=(--surface native)
+    fi
 fi
 mkdir -p "$BOOT_ROOT" "$(dirname "$DRIVER_LOG")"
 exec > >(tee -a "$DRIVER_LOG") 2>&1
@@ -137,7 +158,7 @@ fi
 
 # 3. DRAM-only evidence run for the cache lifetime classes
 scripts/run_g8_t4.sh "$MODEL" --precision "$PRECISION" --rho 10 \
-    --mode dram_only --levels L7 || exit 1
+    --mode dram_only --levels L7 "${T4_SURFACE[@]+"${T4_SURFACE[@]}"}" || exit 1
 
 # 4. cache_alloc_classes (idempotent)
 "${FREEZE[@]}" --alloc-classes-root "$EVIDENCE_ROOT" \
@@ -145,5 +166,5 @@ scripts/run_g8_t4.sh "$MODEL" --precision "$PRECISION" --rho 10 \
 
 # 5. DRAM + SRAM, seven levels
 scripts/run_g8_t4.sh "$MODEL" --precision "$PRECISION" --rho 10 \
-    --mode dram_sram || exit 1
+    --mode dram_sram "${T4_SURFACE[@]+"${T4_SURFACE[@]}"}" || exit 1
 echo "== G8 precision $WORKLOAD done $(date '+%F %T')"

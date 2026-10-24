@@ -559,6 +559,9 @@ struct Options {
     // expected surface the pass refuses unless the probed allocations sum
     // to exactly the workload's frozen R.
     std::vector<std::string> l2_probe_exclude;
+    // fault_model surface_keep_prefix (G9 native-equivalent surface): of
+    // these allocations only bytes [0, N) are probed and mapped.
+    std::vector<std::pair<std::string, std::uint64_t>> l2_probe_keep_prefix;
     std::uint64_t l2_probe_expect_surface_bytes{0};
 };
 
@@ -786,6 +789,31 @@ Options parse_options(int argc, char** argv) {
                 }
                 position = comma + 1;
             }
+        } else if (key == "--l2-probe-keep-prefix") {
+            std::size_t position = 0;
+            while (position <= value.size()) {
+                const std::size_t comma = value.find(',', position);
+                const std::string item = value.substr(
+                    position, comma == std::string::npos ? std::string::npos
+                                                         : comma - position);
+                const std::size_t colon = item.rfind(':');
+                if (colon == std::string::npos || colon == 0 ||
+                    colon + 1 == item.size() ||
+                    item.find_first_not_of("0123456789", colon + 1) !=
+                        std::string::npos) {
+                    throw std::invalid_argument(
+                        "--l2-probe-keep-prefix expects ID:BYTES[,ID:BYTES...]: " + value);
+                }
+                const std::uint64_t bytes = std::stoull(item.substr(colon + 1));
+                if (bytes == 0) {
+                    throw std::invalid_argument("--l2-probe-keep-prefix: BYTES must be > 0");
+                }
+                options.l2_probe_keep_prefix.emplace_back(item.substr(0, colon), bytes);
+                if (comma == std::string::npos) {
+                    break;
+                }
+                position = comma + 1;
+            }
         } else if (key == "--l2-probe-expect-surface-bytes") {
             options.l2_probe_expect_surface_bytes = std::stoull(value);
             if (options.l2_probe_expect_surface_bytes == 0) {
@@ -831,7 +859,8 @@ Options parse_options(int argc, char** argv) {
             "--l2-probe-per-sm N --l2-probe-stride N "
             "--l2-probe-reverse 0|1 --l2-probe-alternate 0|1 "
             "--l2-probe-map 0|1 --l2-probe-passes N "
-            "--l2-probe-exclude ID[,ID] --l2-probe-expect-surface-bytes N]");
+            "--l2-probe-exclude ID[,ID] --l2-probe-keep-prefix ID:BYTES[,...] "
+            "--l2-probe-expect-surface-bytes N]");
     }
     if (options.injection_work.empty() != options.injection_release.empty()) {
         throw std::invalid_argument(
@@ -2293,6 +2322,22 @@ int run_l2_probe_pass(const Options& options,
         if (!found) {
             throw std::runtime_error("--l2-probe-exclude: no active allocation " + id);
         }
+    }
+    // Kept prefixes: the allocation stays probed, truncated to [0, N);
+    // every id must be an active (not excluded) allocation and N must lie
+    // inside it. The range keeps the allocation's base VA, so map units
+    // and cache-site byte offsets stay allocation-relative.
+    for (const auto& [id, bytes] : options.l2_probe_keep_prefix) {
+        const auto it = std::find_if(active.begin(), active.end(),
+                                     [&](const auto& d) { return d.allocation_id == id; });
+        if (it == active.end()) {
+            throw std::runtime_error("--l2-probe-keep-prefix: no active probed allocation " + id);
+        }
+        if (bytes > it->size_bytes) {
+            throw std::runtime_error("--l2-probe-keep-prefix: " + id + " has only " +
+                                     std::to_string(it->size_bytes) + " B");
+        }
+        it->size_bytes = bytes;
     }
     std::uint64_t surface_bytes = 0;
     for (const gpu_m2d::AllocationDescriptor& d : active) {

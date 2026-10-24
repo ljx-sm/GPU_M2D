@@ -1414,6 +1414,10 @@ def execute_segment(args: argparse.Namespace, contract: dict,
         excludes_g8 = workload_entry.get("surface_excludes", ())
         if excludes_g8:
             g8_runner_args += ["--l2-probe-exclude", ",".join(excludes_g8)]
+        prefix_g8 = workload_entry.get("surface_keep_prefix", {})
+        if prefix_g8:
+            g8_runner_args += ["--l2-probe-keep-prefix", ",".join(
+                f"{alloc}:{n}" for alloc, n in sorted(prefix_g8.items()))]
     if getattr(args, "no_dram_faults", False) or \
             (level is not None and level["bits"] == 0):
         # SRAM-only, or a B = 0 level (G8 rho = 5000 ladder): every trial
@@ -1563,13 +1567,18 @@ def execute_segment(args: argparse.Namespace, contract: dict,
                                                     result.rows)
         surface_bytes = resident_bytes_of(surface_rows)
         excludes = workload_entry.get("surface_excludes", ())
-        if excludes:
+        keep_prefix = workload_entry.get("surface_keep_prefix", {})
+        if excludes or keep_prefix:
             extra.update({
                 "surface_excludes": list(excludes),
                 "surface_resident_bytes": surface_bytes,
                 "excluded_resident_bytes": resident_bytes - surface_bytes,
             })
-            print(f"fault surface: excluding {', '.join(excludes)} "
+            if keep_prefix:
+                extra["surface_keep_prefix"] = dict(keep_prefix)
+            cut = ", ".join(list(excludes) + [f"{a}[{n}:]" for a, n
+                                               in sorted(keep_prefix.items())])
+            print(f"fault surface: excluding {cut} "
                   f"({resident_bytes - surface_bytes:,} B of "
                   f"{resident_bytes:,} B); injection surface "
                   f"{surface_bytes:,} B")
@@ -1672,9 +1681,11 @@ def execute_segment(args: argparse.Namespace, contract: dict,
             "snapshot_manifest": result.manifest,
             "sites": [site for sites in campaign for site in sites],
         }
-        if excludes:
+        if excludes or keep_prefix:
             work_detail["surface_excludes"] = list(excludes)
             work_detail["surface_resident_bytes"] = surface_bytes
+        if keep_prefix:
+            work_detail["surface_keep_prefix"] = dict(keep_prefix)
         work_detail_output.write_text(json.dumps(
             work_detail, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.chmod(work_output, 0o644)
@@ -2218,6 +2229,7 @@ def run_once(args: argparse.Namespace) -> int:
         * (0 if getattr(args, "no_dram_faults", False) else 1),
         "fault_mode": fault_mode(args),
         "surface_excludes": first.get("surface_excludes", []),
+        "surface_keep_prefix": first.get("surface_keep_prefix", {}),
         # G8 cache mode summary (per-segment detail in segment_details)
         "g8_cache_ber": getattr(args, "cache_ber", None),
         "g8_cache_ber_frozen": getattr(args, "cache_ber_frozen", False)

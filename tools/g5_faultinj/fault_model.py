@@ -48,7 +48,12 @@ from pathlib import Path
 # injection surface after diagnostic runs proved their corruption is
 # process-fatal, not output-observable); its frozen R is then the
 # EXCLUSION-FILTERED total and sampling/guards go through
-# surface_rows_for below.
+# surface_rows_for below. A workload may also declare surface_keep_prefix
+# ({allocation_id: N}): only bytes [0, N) of that allocation are on the
+# surface (G9 native-equivalent surface, user decision 2026-10-24: the
+# FP32-compute emulation APPENDS its tactic data to TensorRT's control
+# block, while the first N bytes are byte-identical to the native INT8
+# engine's block); the frozen R then also excludes the cut tail.
 # ---------------------------------------------------------------------------
 
 WORKLOADS = {
@@ -577,6 +582,82 @@ WORKLOADS = {
             {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
         ],
     },
+    # G9 native-equivalent surface (user decision 2026-10-24): the SAME
+    # resnet50 W4A8 engine as g9i_imagenet1k_resnet50_w4a8, injection
+    # surface WITHOUT the regions that exist only because TensorRT 8.6
+    # computes the packed weights in FP32 (execution scratch, FP32-tactic
+    # control data); freeze_g7v2_workload.py writes the per-engine
+    # surface_excludes / surface_keep_prefix from its NATIVE_SURFACE
+    # table. PLACEHOLDER (R = 0): accepts only --bootstrap.
+    "g9n_imagenet1k_resnet50_w4a8": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # G9 native-equivalent surface (user decision 2026-10-24): the SAME
+    # resnet50 W16A8 engine as g9i_imagenet1k_resnet50_w16a8, injection
+    # surface WITHOUT the regions that exist only because TensorRT 8.6
+    # computes the packed weights in FP32 (execution scratch, FP32-tactic
+    # control data); freeze_g7v2_workload.py writes the per-engine
+    # surface_excludes / surface_keep_prefix from its NATIVE_SURFACE
+    # table. PLACEHOLDER (R = 0): accepts only --bootstrap.
+    "g9n_imagenet1k_resnet50_w16a8": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # G9 native-equivalent surface (user decision 2026-10-24): the SAME
+    # vit_base_patch16_224 W4A8 engine as g9i_imagenet1k_vit_base_patch16_224_w4a8, injection
+    # surface WITHOUT the regions that exist only because TensorRT 8.6
+    # computes the packed weights in FP32 (execution scratch, FP32-tactic
+    # control data); freeze_g7v2_workload.py writes the per-engine
+    # surface_excludes / surface_keep_prefix from its NATIVE_SURFACE
+    # table. PLACEHOLDER (R = 0): accepts only --bootstrap.
+    "g9n_imagenet1k_vit_base_patch16_224_w4a8": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
+    # G9 native-equivalent surface (user decision 2026-10-24): the SAME
+    # vit_base_patch16_224 W16A8 engine as g9i_imagenet1k_vit_base_patch16_224_w16a8, injection
+    # surface WITHOUT the regions that exist only because TensorRT 8.6
+    # computes the packed weights in FP32 (execution scratch, FP32-tactic
+    # control data); freeze_g7v2_workload.py writes the per-engine
+    # surface_excludes / surface_keep_prefix from its NATIVE_SURFACE
+    # table. PLACEHOLDER (R = 0): accepts only --bootstrap.
+    "g9n_imagenet1k_vit_base_patch16_224_w16a8": {
+        "resident_bytes_nominal": 0,
+        "levels": [
+            {"level": "L1", "ber": 1e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L2", "ber": 5e-07, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L3", "ber": 1e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L4", "ber": 3e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L5", "ber": 5e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L6", "ber": 7e-06, "bits": 0, "s": 0, "d": 0, "t": 0},
+            {"level": "L7", "ber": 1e-05, "bits": 0, "s": 0, "d": 0, "t": 0},
+        ],
+    },
 }
 
 DEFAULT_WORKLOAD = "g5_resisc45_resnet50"
@@ -814,9 +895,32 @@ def surface_rows_for(workload: str, snapshot_rows: list[dict]) -> list[dict]:
            for row in snapshot_rows):
         rows = [row for row in snapshot_rows
                 if row.get("semantic_label") != INSTRUMENTATION_LABEL]
-    if not excludes:
+    prefix = workload_by_name(workload).get("surface_keep_prefix", {})
+    if not excludes and not prefix:
         return rows
-    return [row for row in rows if row["allocation_id"] not in excludes]
+    rows = [row for row in rows if row["allocation_id"] not in excludes]
+    return [clipped for row in rows
+            for clipped in _clip_to_prefix(row, prefix)]
+
+
+def _clip_to_prefix(row: dict, prefix: dict[str, int]) -> list[dict]:
+    """The row itself, or its part inside the allocation's kept prefix
+    [0, N) (surface_keep_prefix), or nothing. A row covers PA in-page
+    bytes [start, end); in-page byte x is allocation byte
+    va_page + x - allocation_va_base (the snapshot's 1:1 VA/PA page
+    map, as in _make_site)."""
+    keep = prefix.get(row["allocation_id"])
+    if keep is None:
+        return [row]
+    start = int(str(row["byte_start_in_page"]), 16)
+    end = int(str(row["byte_end_in_page"]), 16)
+    limit = keep + int(str(row["allocation_va_base"]), 16) \
+        - int(str(row["va_page_base"]), 16)
+    if limit >= end:
+        return [row]
+    if limit <= start:
+        return []
+    return [{**row, "byte_end_in_page": f"{limit:#x}"}]
 
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +1441,35 @@ def self_test() -> int:
             [r["allocation_id"] for r in fake_rows
              if r["allocation_id"] not in excludes]
         assert (scoped is fake_rows) == (not excludes)
+
+    # surface_keep_prefix: rows clip to the kept prefix [0, N) of their
+    # allocation (row in-page bytes map to allocation bytes through
+    # va_page + x - base), rows past it drop, other allocations untouched
+    def _row(alloc, base, va_page, start, end):
+        return {"allocation_id": alloc, "allocation_va_base": f"{base:#x}",
+                "va_page_base": f"{va_page:#x}",
+                "byte_start_in_page": f"{start:#x}",
+                "byte_end_in_page": f"{end:#x}"}
+    keep = {"c": 0x5800}
+    whole = _row("c", 0x10_0400, 0x10_0000, 0x400, 0x1400)    # [0, 0x1000)
+    cut = _row("c", 0x10_0400, 0x10_0000, 0x1400, 0xa600)     # [0x1000, 0xa200)
+    past = _row("c", 0x10_0400, 0x20_0000, 0x0, 0x1000)       # beyond N
+    other = _row("w", 0x30_0000, 0x30_0000, 0x0, 0x8000)
+    assert _clip_to_prefix(whole, keep) == [whole]
+    assert _clip_to_prefix(past, keep) == []
+    assert _clip_to_prefix(other, keep) == [other]
+    (clipped,) = _clip_to_prefix(cut, keep)
+    assert clipped["byte_end_in_page"] == "0x5c00" and \
+        cut["byte_end_in_page"] == "0xa600"
+    kept = sum(int(r["byte_end_in_page"], 16) - int(r["byte_start_in_page"], 16)
+               for r in (whole, clipped))
+    assert kept == keep["c"]
+    for workload_name, entry in WORKLOADS.items():
+        prefix = entry.get("surface_keep_prefix", {})
+        assert all(isinstance(n, int) and n > 0 for n in prefix.values()), \
+            workload_name
+        assert not set(prefix) & set(entry.get("surface_excludes", ())), \
+            workload_name
 
     print("g5 fault model self-test: PASS")
     return 0

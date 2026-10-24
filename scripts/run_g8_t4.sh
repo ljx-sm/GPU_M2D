@@ -42,12 +42,18 @@
 # bootstrap's runner passthrough), roots under artifacts/g9_intprec:
 #   --mode dram_sram -> artifacts/g9_intprec/rho10/campaign/
 #   --mode dram_only -> artifacts/g9_intprec/evidence/campaign/
+# --surface native (user, 2026-10-24; with --precision w4a8|w16a8): the same
+# engines on the NATIVE-EQUIVALENT injection surface -- workload
+# g9n_imagenet1k_<model>_<precision> (FP32-compute-only regions excluded,
+# freeze_g7v2_workload.py NATIVE_SURFACE), roots under
+# artifacts/g9_intprec/native/{bootstrap,evidence,rho10}.
 #
 # Usage (from the repo root, in tmux; needs passwordless sudo like the
 # other campaign entry points):
 #   scripts/run_g8_t4.sh resnet50 [--mode dram_sram|sram_only|all]
 #                        [--levels "L3 L4"] [--trials 100] [--rho 1|10|300|5000]
-#                        [--precision fp32|fp16|w4a8|w16a8] [--dry-run]
+#                        [--precision fp32|fp16|w4a8|w16a8]
+#                        [--surface native] [--dry-run]
 #
 # --dry-run prints the resolved levels and campaign commands only.
 #
@@ -75,6 +81,7 @@ DRY_RUN=0
 MODE=dram_sram
 RHO=1
 PRECISION=""
+SURFACE=""
 while (($#)); do
     case "$1" in
         --levels) LEVELS="$2"; shift 2 ;;
@@ -83,6 +90,7 @@ while (($#)); do
         --mode) MODE="$2"; shift 2 ;;
         --rho) RHO="$2"; shift 2 ;;
         --precision) PRECISION="$2"; shift 2 ;;
+        --surface) SURFACE="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -108,8 +116,19 @@ if [[ -n "$PRECISION" ]]; then
         WORKLOAD="g9i_${WORKLOAD#g8p_}"
         BOOT_ROOT="artifacts/g9_intprec/bootstrap"
         EXTRA_ARGS+=(--runner "$PROJECT/build-g9/gpu_m2d_resnet50_int8_g1_5")
+        if [[ "$SURFACE" == native ]]; then
+            WORKLOAD="g9n_${WORKLOAD#g9i_}"
+            NAME="${NAME}_native"
+            BOOT_ROOT="artifacts/g9_intprec/native/bootstrap"
+        fi
     fi
 fi
+case "$SURFACE" in
+    "") ;;
+    native) [[ "$WORKLOAD" == g9n_* ]] || {
+                echo "--surface native needs --precision w4a8|w16a8" >&2; exit 2; } ;;
+    *) echo "unknown --surface $SURFACE (native)" >&2; exit 2 ;;
+esac
 case "$RHO" in
     1) BASE_ROOT="$PROJECT/artifacts/g8/t4"; RHO_ARGS=(); RHO_PY=1.0 ;;
     10) BASE_ROOT="$PROJECT/artifacts/g8/rho10"; RHO_ARGS=(--cache-rho 10)
@@ -126,11 +145,13 @@ if [[ -n "$PRECISION" ]]; then
     else
         BASE_ROOT="$PROJECT/artifacts/g8/rho10/precision"
     fi
-    if [[ "$WORKLOAD" == g9i_* ]]; then
+    if [[ "$WORKLOAD" == g9i_* || "$WORKLOAD" == g9n_* ]]; then
+        G9_ROOT="$PROJECT/artifacts/g9_intprec"
+        [[ "$WORKLOAD" == g9n_* ]] && G9_ROOT="$G9_ROOT/native"
         if [[ "$MODE" == dram_only ]]; then
-            BASE_ROOT="$PROJECT/artifacts/g9_intprec/evidence"
+            BASE_ROOT="$G9_ROOT/evidence"
         else
-            BASE_ROOT="$PROJECT/artifacts/g9_intprec/rho10"
+            BASE_ROOT="$G9_ROOT/rho10"
         fi
     fi
 fi
@@ -209,7 +230,7 @@ mapfile -t CFG < <(python3 -c "$PY" "$WORKLOAD" "$LEVELS" "$RHO" "$BOOT_ROOT") |
 [[ ${#CFG[@]} -eq 2 ]] || { echo "config lookup failed for $WORKLOAD" >&2; exit 2; }
 read -r -a RUN_LEVELS <<<"${CFG[0]}"
 read -r -a PASSTHROUGH <<<"${CFG[1]}"
-if [[ "$WORKLOAD" == g9i_* && " ${PASSTHROUGH[*]} " != *" --plugin-lib "* ]]; then
+if [[ "$WORKLOAD" == g9[in]_* && " ${PASSTHROUGH[*]} " != *" --plugin-lib "* ]]; then
     echo "$WORKLOAD: the bootstrap's runner passthrough has no --plugin-lib" >&2
     exit 2
 fi
